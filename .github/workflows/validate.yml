@@ -1,0 +1,22 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Validate package and unit tests
+        working-directory: skills/beefapi-provider-certifier
+        run: |
+          python3 scripts/provider_certifier.py validate
+          python3 -m unittest scripts/test_certify.py -v

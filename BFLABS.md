@@ -88,3 +88,13 @@ Agents execute scoped work, keep evidence, and surface uncertainty. Humans own p
 
 A handoff is complete only when another teammate can identify the outcome, changed files, verification performed, remaining risks, and next authorized action without reconstructing the chat history.
 
+## 9. Maintain this contract without bloat
+
+- The canonical source is `Sunnyender-org/bflabs/BFLABS.md`; repository copies are synchronized distribution artifacts.
+- Add a rule here only when it applies across BF Labs repositories. Put repository-specific rules in `PROJECT_RULES.md` and tool-specific mechanics in their owning adapters or runbooks.
+- Keep one concept in one clause. Prefer rewriting or deleting superseded text over appending another exception.
+- Keep this file at or below 200 lines and 16 KiB. If it cannot stay within those limits, move details to the correct project document instead of creating a larger shared playbook.
+- Bump `bflabs_governance_version` for material semantic changes. Editorial clarification may retain the version.
+- Roll out canonical changes to every active BF Labs repository in one coordinated batch, then verify byte-for-byte equality and record the resulting SHA-256 in the PR evidence.
+- Audit the contract when a repository joins or leaves the active set and at least once per quarter. Remove obsolete rules, duplicated guidance, stale tool assumptions, and examples that no longer change a decision.
+

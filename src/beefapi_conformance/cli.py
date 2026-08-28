@@ -14,7 +14,11 @@ from .manifest import load_inventory
 from .matrix import compile_matrix
 from .model import ContractError
 from .report import build_report, write_report
-from .runner import run_cell
+from .runner import (
+    finalize_batch_server_evidence,
+    prepare_batch_server_evidence,
+    run_cell,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -126,13 +130,20 @@ def command_run(args: argparse.Namespace) -> int:
         raise ContractError(
             f"matrix has {len(cells)} cells, exceeding --max-cells={args.max_cells}"
         )
+    require_server_evidence = args.require_server_evidence or args.tier in {
+        "nightly",
+        "release",
+    }
+    batch_evidence = (
+        prepare_batch_server_evidence(cells) if require_server_evidence else {}
+    )
     for cell in cells:
         print(f"RUN {cell.id}", file=sys.stderr)
         result = run_cell(
             cell,
             allow_local_tools=args.allow_local_tools,
-            require_server_evidence=args.require_server_evidence
-            or args.tier in {"nightly", "release"},
+            require_server_evidence=require_server_evidence,
+            defer_server_evidence=bool(batch_evidence),
         )
         results.append(result)
         print(
@@ -140,6 +151,8 @@ def command_run(args: argparse.Namespace) -> int:
         )
         if args.fail_fast and result.status == "fail":
             break
+    if batch_evidence:
+        finalize_batch_server_evidence(cells[: len(results)], results, batch_evidence)
     report = build_report(results)
     write_report(report, Path(args.output))
     print(json.dumps(report["summary"], indent=2))

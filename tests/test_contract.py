@@ -16,6 +16,7 @@ from beefapi_conformance.inventory import build_live_inventory
 from beefapi_conformance.manifest import Inventory, load_inventory
 from beefapi_conformance.matrix import compile_matrix
 from beefapi_conformance.model import (
+    CellResult,
     Client,
     ContractError,
     MatrixCell,
@@ -33,6 +34,8 @@ from beefapi_conformance.runner import (
     _matching_usage_logs,
     _request_token,
     _usage_log_payload,
+    finalize_batch_server_evidence,
+    prepare_batch_server_evidence,
     run_cell,
 )
 
@@ -464,6 +467,225 @@ class ContractTests(unittest.TestCase):
             return_value=FakeResponse({"success": False, "data": []}),
         ):
             self.assertIsNone(_evidence_fence(cell, "token"))
+
+    def test_batch_evidence_uses_two_log_reads_for_multiple_cells(self):
+        native = CommandTests().cell("codex")
+        raw = CommandTests().cell("raw-http")
+        route = replace(
+            native.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+        )
+        native = MatrixCell(native.client, route, native.model, native.scenario)
+        raw = MatrixCell(raw.client, route, raw.model, raw.scenario)
+        native = MatrixCell(
+            replace(native.client, id="codex-cli"),
+            native.route,
+            native.model,
+            native.scenario,
+        )
+        raw = MatrixCell(
+            replace(raw.client, id="raw-http"), raw.route, raw.model, raw.scenario
+        )
+        receipt = {
+            "usage_receipt_provider": "cursor-sdk-bridge",
+            "usage_receipt_state": "final",
+        }
+        old_log = {
+            "created_at": 100,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": "old",
+            "other": json.dumps({**receipt, "usage_receipt_id": "old"}),
+        }
+        native_log = {
+            **old_log,
+            "created_at": 200,
+            "request_id": "native-new",
+            "other": json.dumps({**receipt, "usage_receipt_id": "native"}),
+        }
+        raw_log = {
+            **old_log,
+            "created_at": 201,
+            "request_id": "raw-new",
+            "other": json.dumps({**receipt, "usage_receipt_id": "raw"}),
+        }
+        responses = [
+            FakeResponse(
+                {"success": True, "data": [old_log]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {"success": True, "data": [raw_log, native_log, old_log]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+        ]
+        results = [
+            CellResult(
+                native.id,
+                "pass",
+                "client",
+                "now",
+                1,
+                route.id,
+                native.model.id,
+                native.scenario.id,
+                [],
+                {
+                    "server_evidence": {"status": "deferred"},
+                    "_server_window": {
+                        "started_epoch": 199,
+                        "finished_epoch": 200,
+                    },
+                },
+            ),
+            CellResult(
+                raw.id,
+                "pass",
+                "client",
+                "now",
+                1,
+                route.id,
+                raw.model.id,
+                raw.scenario.id,
+                [],
+                {
+                    "server_evidence": {"status": "deferred"},
+                    "_response_request_id": "raw-new",
+                    "_server_window": {
+                        "started_epoch": 201,
+                        "finished_epoch": 201,
+                    },
+                },
+            ),
+        ]
+        with (
+            patch.dict(os.environ, {"TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=responses) as urlopen,
+        ):
+            sessions = prepare_batch_server_evidence([native, raw])
+            finalize_batch_server_evidence([native, raw], results, sessions)
+        self.assertEqual(2, urlopen.call_count)
+        self.assertEqual(["pass", "pass"], [item.status for item in results])
+        self.assertTrue(
+            all(
+                item.evidence["server_evidence"]["status"] == "pass" for item in results
+            )
+        )
+
+    def test_batch_evidence_keeps_native_tool_logs_in_their_time_window(self):
+        first = CommandTests().cell("codex")
+        second = CommandTests().cell("grok-build")
+        route = replace(
+            first.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+        )
+        first = MatrixCell(
+            replace(first.client, id="codex-cli"),
+            route,
+            first.model,
+            first.scenario,
+        )
+        second = MatrixCell(
+            replace(second.client, id="grok-build"),
+            route,
+            second.model,
+            second.scenario,
+        )
+        receipt = {
+            "usage_receipt_provider": "cursor-sdk-bridge",
+            "usage_receipt_state": "final",
+        }
+
+        def log(request_id: str, created_at: int):
+            return {
+                "created_at": created_at,
+                "type": 2,
+                "model_name": "model",
+                "channel": 252,
+                "group": "cursor-acceptance",
+                "request_id": request_id,
+                "other": json.dumps({**receipt, "usage_receipt_id": request_id}),
+            }
+
+        old = log("old", 100)
+        responses = [
+            FakeResponse(
+                {"success": True, "data": [old]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {
+                    "success": True,
+                    "data": [
+                        log("second-only", 211),
+                        log("first-followup", 200),
+                        log("first-tool", 199),
+                        old,
+                    ],
+                },
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+        ]
+        results = [
+            CellResult(
+                first.id,
+                "pass",
+                "client",
+                "now",
+                1,
+                route.id,
+                first.model.id,
+                first.scenario.id,
+                [],
+                {
+                    "server_evidence": {"status": "deferred"},
+                    "_server_window": {
+                        "started_epoch": 199,
+                        "finished_epoch": 200,
+                    },
+                },
+            ),
+            CellResult(
+                second.id,
+                "pass",
+                "client",
+                "now",
+                1,
+                route.id,
+                second.model.id,
+                second.scenario.id,
+                [],
+                {
+                    "server_evidence": {"status": "deferred"},
+                    "_server_window": {
+                        "started_epoch": 210,
+                        "finished_epoch": 211,
+                    },
+                },
+            ),
+        ]
+        with (
+            patch.dict(os.environ, {"TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=responses),
+        ):
+            sessions = prepare_batch_server_evidence([first, second])
+            finalize_batch_server_evidence([first, second], results, sessions)
+        first_ids = {
+            item["terminal"]["request_id"]
+            for item in results[0].evidence["server_evidence"]["requests"]
+        }
+        second_id = results[1].evidence["server_evidence"]["terminal"]["request_id"]
+        self.assertEqual({"first-tool", "first-followup"}, first_ids)
+        self.assertEqual("second-only", second_id)
+        self.assertNotIn(second_id, first_ids)
 
 
 class CommandTests(unittest.TestCase):

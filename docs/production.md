@@ -29,9 +29,11 @@ matrix process. Package managers and client installers never inherit it.
 
 ## Evidence
 
-Every live cell fences the token-log request IDs before calling the model. After
-the terminal client event, it accepts only a newly created consume log matching
-the exact model, group, and pinned channel. Release evidence requires:
+The runner takes one token-log fence before the serialized matrix and one
+bounded final snapshot after it. It accepts only newly created consume logs
+matching the exact model, group, and pinned channel. This avoids the production
+critical-read limit while still keeping old rows outside the run. Release
+evidence requires:
 
 - current `X-New-Api-Commit`;
 - expected channel id and group;

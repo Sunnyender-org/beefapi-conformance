@@ -26,6 +26,7 @@ def run_cell(
     cell: MatrixCell,
     allow_local_tools: bool = False,
     require_server_evidence: bool = False,
+    defer_server_evidence: bool = False,
 ) -> CellResult:
     started = time.monotonic()
     started_epoch = int(time.time())
@@ -33,7 +34,9 @@ def run_cell(
     base_token = (
         os.environ.get(cell.route.token_env or "") if cell.route.token_env else None
     )
-    evidence_fence = _evidence_fence(cell, base_token)
+    evidence_fence = (
+        set() if defer_server_evidence else _evidence_fence(cell, base_token)
+    )
     if cell.client.adapter == "raw-http":
         return _run_http_cell(
             cell,
@@ -43,6 +46,7 @@ def run_cell(
             base_token,
             evidence_fence,
             require_server_evidence,
+            defer_server_evidence,
         )
     binary = resolve_binary(cell.client)
     if not binary:
@@ -169,17 +173,25 @@ def run_cell(
             and all(item.status == "pass" for item in turn_results)
             else "fail"
         )
-        server_evidence = _server_evidence(
-            cell, base_token, started_epoch, evidence_fence, None
+        server_evidence = (
+            {"status": "deferred"}
+            if defer_server_evidence
+            else _server_evidence(cell, base_token, started_epoch, evidence_fence, None)
         )
         evidence = {
             "workspace_marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
             "route_auth_mode": cell.route.auth_mode,
             "server_evidence": server_evidence,
         }
+        if defer_server_evidence:
+            evidence["_server_window"] = {
+                "started_epoch": started_epoch,
+                "finished_epoch": int(time.time()),
+            }
         detail = ""
         if (
             require_server_evidence
+            and not defer_server_evidence
             and cell.route.release_evidence_required
             and server_evidence.get("status") != "pass"
         ):
@@ -198,6 +210,7 @@ def _run_http_cell(
     base_token: str | None,
     evidence_fence: set[str] | None,
     require_server_evidence: bool,
+    defer_server_evidence: bool,
 ) -> CellResult:
     base_url = (
         os.environ.get(cell.route.base_url_env or "")
@@ -296,21 +309,32 @@ def _run_http_cell(
         missing,
         sanitized[-4000:],
     )
-    server_evidence = _server_evidence(
-        cell,
-        base_token,
-        started_epoch,
-        evidence_fence,
-        response_request_id,
+    server_evidence = (
+        {"status": "deferred"}
+        if defer_server_evidence
+        else _server_evidence(
+            cell,
+            base_token,
+            started_epoch,
+            evidence_fence,
+            response_request_id,
+        )
     )
     evidence = {
         "http_status": status_code,
         "route_auth_mode": cell.route.auth_mode,
         "server_evidence": server_evidence,
     }
+    if defer_server_evidence:
+        evidence["_response_request_id"] = response_request_id
+        evidence["_server_window"] = {
+            "started_epoch": started_epoch,
+            "finished_epoch": int(time.time()),
+        }
     detail = ""
     if (
         require_server_evidence
+        and not defer_server_evidence
         and cell.route.release_evidence_required
         and server_evidence.get("status") != "pass"
     ):
@@ -578,6 +602,205 @@ def _evidence_fence(cell: MatrixCell, token: str | None) -> set[str] | None:
         }
     except (OSError, TimeoutError, json.JSONDecodeError):
         return None
+
+
+def prepare_batch_server_evidence(
+    cells: list[MatrixCell],
+) -> dict[tuple[str, str], dict[str, object]]:
+    """Take one pre-run token-log snapshot per credential/base URL pair."""
+    sessions: dict[tuple[str, str], dict[str, object]] = {}
+    for cell in cells:
+        if cell.route.evidence_provider != "beefapi_token_log":
+            continue
+        token_env = cell.route.token_env or ""
+        token = os.environ.get(token_env, "")
+        base_url = (
+            os.environ.get(cell.route.base_url_env or "")
+            if cell.route.base_url_env
+            else cell.route.base_url
+        ).rstrip("/")
+        if not token or not base_url:
+            raise RuntimeError(
+                f"batch evidence lacks token or base URL for route {cell.route.id}"
+            )
+        key = (base_url, token_env)
+        if key in sessions:
+            continue
+        logs, commit = _fetch_token_logs(base_url, token)
+        sessions[key] = {
+            "token": token,
+            "commit": commit,
+            "fence": {
+                str(item.get("request_id", "")).strip()
+                for item in logs
+                if isinstance(item, dict) and str(item.get("request_id", "")).strip()
+            },
+        }
+    return sessions
+
+
+def finalize_batch_server_evidence(
+    cells: list[MatrixCell],
+    results: list[CellResult],
+    sessions: dict[tuple[str, str], dict[str, object]],
+) -> None:
+    """Resolve a serialized production run with one bounded post-run snapshot."""
+    final_logs: dict[tuple[str, str], list[dict[str, object]]] = {}
+    final_commits: dict[tuple[str, str], str] = {}
+    last_error = "batch token-log evidence was unavailable"
+    for attempt in range(8):
+        try:
+            all_final = True
+            for key, session in sessions.items():
+                logs, commit = _fetch_token_logs(key[0], str(session["token"]))
+                typed_logs = [item for item in logs if isinstance(item, dict)]
+                final_logs[key] = typed_logs
+                final_commits[key] = commit
+                fence = session["fence"]
+                new_consumes = [
+                    item
+                    for item in typed_logs
+                    if int(item.get("type", 0) or 0) == 2
+                    and str(item.get("request_id", "")).strip()
+                    and str(item.get("request_id", "")).strip() not in fence
+                ]
+                if any(
+                    _usage_log_payload(cells[0], item, commit).get("status") != "pass"
+                    for item in new_consumes
+                ):
+                    all_final = False
+            if all_final:
+                break
+            last_error = "one or more batch usage receipts are not final"
+        except (OSError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
+            last_error = redact(str(exc))
+        if attempt < 7:
+            time.sleep(1)
+    else:
+        for result in results:
+            _set_batch_evidence_failure(result, last_error)
+        return
+
+    result_by_id = {result.cell_id: result for result in results}
+    used_request_ids: dict[tuple[str, str], set[str]] = {key: set() for key in sessions}
+
+    # Allocate in serialized execution order. Every row in a native cell's
+    # execution window is reserved, including rows from failed cells, so a tool
+    # loop cannot leak leftover evidence into the following cell.
+    for cell in cells:
+        result = result_by_id[cell.id]
+        if cell.route.evidence_provider != "beefapi_token_log":
+            continue
+        key = _batch_session_key(cell)
+        window = result.evidence.pop("_server_window", {})
+        started_epoch = int(window.get("started_epoch", 0) or 0)
+        finished_epoch = int(window.get("finished_epoch", 0) or 0)
+        request_id = str(result.evidence.pop("_response_request_id", "") or "")
+
+        if cell.client.adapter == "raw-http":
+            matches = (
+                _matching_usage_logs(
+                    cell,
+                    final_logs[key],
+                    0,
+                    sessions[key]["fence"],
+                    request_id,
+                )
+                if request_id
+                else []
+            )
+            used_request_ids[key].update(
+                str(item.get("request_id", "")) for item in matches
+            )
+            if result.status != "pass":
+                continue
+            if not request_id:
+                _set_batch_evidence_failure(
+                    result, "raw HTTP response did not expose X-Oneapi-Request-Id"
+                )
+                continue
+            if len(matches) != 1:
+                _set_batch_evidence_failure(
+                    result,
+                    "raw HTTP request id did not resolve to exactly one consume log",
+                )
+                continue
+            payload = _usage_log_payload(cell, matches[0], final_commits[key])
+            result.evidence["server_evidence"] = payload
+            if payload.get("status") != "pass":
+                _set_batch_evidence_failure(result, str(payload.get("detail", "")))
+            continue
+
+        candidates = _matching_usage_logs(
+            cell,
+            final_logs[key],
+            started_epoch,
+            sessions[key]["fence"],
+        )
+        candidates = [
+            item
+            for item in candidates
+            if str(item.get("request_id", "")) not in used_request_ids[key]
+            and int(item.get("created_at", 0) or 0) <= finished_epoch
+        ]
+        candidates.sort(key=lambda item: int(item.get("created_at", 0) or 0))
+        used_request_ids[key].update(
+            str(item.get("request_id", "")) for item in candidates
+        )
+        if result.status != "pass":
+            continue
+        required = len(cell.scenario.turns)
+        if len(candidates) < required:
+            _set_batch_evidence_failure(
+                result,
+                f"batch evidence found {len(candidates)} consume logs; {required} required",
+            )
+            continue
+        payloads = [
+            _usage_log_payload(cell, item, final_commits[key]) for item in candidates
+        ]
+        if not all(item.get("status") == "pass" for item in payloads):
+            _set_batch_evidence_failure(result, "batch usage receipt is not final")
+            continue
+        payload = dict(payloads[0])
+        if len(payloads) > 1:
+            payload["requests"] = payloads
+        result.evidence["server_evidence"] = payload
+
+
+def _batch_session_key(cell: MatrixCell) -> tuple[str, str]:
+    base_url = (
+        os.environ.get(cell.route.base_url_env or "")
+        if cell.route.base_url_env
+        else cell.route.base_url
+    ).rstrip("/")
+    return base_url, cell.route.token_env or ""
+
+
+def _fetch_token_logs(base_url: str, token: str) -> tuple[list[dict[str, object]], str]:
+    request = urllib.request.Request(
+        base_url.rstrip("/") + "/api/log/token",
+        headers={"authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        commit = response.headers.get("X-New-Api-Commit", "")
+        body = json.loads(response.read())
+    if not isinstance(body, dict) or body.get("success") is not True:
+        message = body.get("message", "") if isinstance(body, dict) else ""
+        raise RuntimeError(f"token-log API failed: {message or 'success was not true'}")
+    logs = body.get("data", [])
+    if not isinstance(logs, list):
+        raise TypeError("token-log API data is not an array")
+    return [item for item in logs if isinstance(item, dict)], commit
+
+
+def _set_batch_evidence_failure(result: CellResult, detail: str) -> None:
+    result.evidence.pop("_response_request_id", None)
+    result.evidence.pop("_server_window", None)
+    result.evidence["server_evidence"] = {"status": "fail", "detail": detail}
+    if result.status == "pass":
+        result.status = "fail"
+        result.detail = "nightly/release tier requires passing server evidence"
 
 
 def _usage_log_payload(

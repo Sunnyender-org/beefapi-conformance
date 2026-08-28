@@ -1,0 +1,40 @@
+{
+  "scenarios": [
+    {
+      "id": "responses-text",
+      "name": "OpenAI Responses non-stream text",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "responses",
+      "http_endpoint": "/v1/responses",
+      "required_capabilities": ["responses", "text"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "turns": [{"prompt": "Reply exactly BEEFAPI_RESPONSES_OK.", "marker": "BEEFAPI_RESPONSES_OK", "expected_events": []}]
+    },
+    {
+      "id": "messages-text",
+      "name": "Anthropic Messages non-stream text",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["messages", "text"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "turns": [{"prompt": "Reply exactly BEEFAPI_MESSAGES_OK.", "marker": "BEEFAPI_MESSAGES_OK", "expected_events": []}]
+    },
+    {
+      "id": "chat-text",
+      "name": "OpenAI Chat Completions non-stream text",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "chat",
+      "http_endpoint": "/v1/chat/completions",
+      "required_capabilities": ["chat", "text"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "turns": [{"prompt": "Reply exactly BEEFAPI_CHAT_OK.", "marker": "BEEFAPI_CHAT_OK", "expected_events": []}]
+    }
+  ]
+}

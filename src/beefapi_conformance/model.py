@@ -1,0 +1,251 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+TIERS = {"pr": 0, "merge": 1, "nightly": 2, "release": 3}
+
+
+class ContractError(ValueError):
+    pass
+
+
+def _strings(value: Any, field_name: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(
+        isinstance(item, str) and item for item in value
+    ):
+        raise ContractError(f"{field_name} must be a non-empty string array")
+    return tuple(value)
+
+
+def _required(raw: dict[str, Any], key: str) -> str:
+    value = raw.get(key)
+    if not isinstance(value, str) or not value:
+        raise ContractError(f"{key} is required")
+    return value
+
+
+@dataclass(frozen=True)
+class Client:
+    id: str
+    name: str
+    adapter: str
+    binary_candidates: tuple[str, ...]
+    version_args: tuple[str, ...]
+    capabilities: frozenset[str]
+    platforms: frozenset[str]
+
+    @classmethod
+    def parse(cls, raw: dict[str, Any]) -> Client:
+        return cls(
+            id=_required(raw, "id"),
+            name=_required(raw, "name"),
+            adapter=_required(raw, "adapter"),
+            binary_candidates=_strings(
+                raw.get("binary_candidates"), "client.binary_candidates"
+            ),
+            version_args=tuple(raw.get("version_args", ["--version"])),
+            capabilities=frozenset(
+                _strings(raw.get("capabilities"), "client.capabilities")
+            ),
+            platforms=frozenset(_strings(raw.get("platforms"), "client.platforms")),
+        )
+
+
+@dataclass(frozen=True)
+class Route:
+    id: str
+    name: str
+    auth_mode: str
+    base_url: str | None
+    base_url_env: str | None
+    token_env: str | None
+    clients: frozenset[str]
+    protocols: frozenset[str]
+    capabilities: frozenset[str]
+    evidence_command_env: str | None
+    release_evidence_required: bool = True
+
+    @classmethod
+    def parse(cls, raw: dict[str, Any]) -> Route:
+        auth_mode = _required(raw, "auth_mode")
+        if auth_mode not in {"gateway_token", "managed_session"}:
+            raise ContractError(f"route.auth_mode invalid: {auth_mode}")
+        token_env = raw.get("token_env")
+        if auth_mode == "gateway_token" and not token_env:
+            raise ContractError("gateway_token route requires token_env")
+        if token_env and (not isinstance(token_env, str) or "sk-" in token_env.lower()):
+            raise ContractError(
+                "route.token_env must name an environment variable, not contain a token"
+            )
+        return cls(
+            id=_required(raw, "id"),
+            name=_required(raw, "name"),
+            auth_mode=auth_mode,
+            base_url=raw.get("base_url"),
+            base_url_env=raw.get("base_url_env"),
+            token_env=token_env,
+            clients=frozenset(_strings(raw.get("clients"), "route.clients")),
+            protocols=frozenset(_strings(raw.get("protocols"), "route.protocols")),
+            capabilities=frozenset(
+                _strings(raw.get("capabilities"), "route.capabilities")
+            ),
+            evidence_command_env=raw.get("evidence_command_env"),
+            release_evidence_required=bool(raw.get("release_evidence_required", True)),
+        )
+
+
+@dataclass(frozen=True)
+class Model:
+    id: str
+    name: str
+    routes: frozenset[str]
+    clients: frozenset[str]
+    capabilities: frozenset[str]
+    aliases: dict[str, str]
+
+    @classmethod
+    def parse(cls, raw: dict[str, Any]) -> Model:
+        aliases = raw.get("aliases", {})
+        if not isinstance(aliases, dict) or not all(
+            isinstance(k, str) and isinstance(v, str) for k, v in aliases.items()
+        ):
+            raise ContractError("model.aliases must be a string map")
+        return cls(
+            id=_required(raw, "id"),
+            name=_required(raw, "name"),
+            routes=frozenset(_strings(raw.get("routes"), "model.routes")),
+            clients=frozenset(_strings(raw.get("clients"), "model.clients")),
+            capabilities=frozenset(
+                _strings(raw.get("capabilities"), "model.capabilities")
+            ),
+            aliases=aliases,
+        )
+
+    def client_model(self, client_id: str) -> str:
+        return self.aliases.get(client_id, self.id)
+
+
+@dataclass(frozen=True)
+class Turn:
+    prompt: str
+    marker: str
+    expected_events: tuple[str, ...]
+    expected_any_events: tuple[tuple[str, ...], ...] = ()
+
+    @classmethod
+    def parse(cls, raw: dict[str, Any]) -> Turn:
+        events = raw.get("expected_events", [])
+        if not isinstance(events, list) or not all(
+            isinstance(item, str) for item in events
+        ):
+            raise ContractError("turn.expected_events must be a string array")
+        any_events = raw.get("expected_any_events", [])
+        if not isinstance(any_events, list) or not all(
+            isinstance(group, list)
+            and group
+            and all(isinstance(item, str) for item in group)
+            for group in any_events
+        ):
+            raise ContractError(
+                "turn.expected_any_events must be an array of string arrays"
+            )
+        return cls(
+            _required(raw, "prompt"),
+            _required(raw, "marker"),
+            tuple(events),
+            tuple(tuple(group) for group in any_events),
+        )
+
+
+@dataclass(frozen=True)
+class Scenario:
+    id: str
+    name: str
+    tier: str
+    kind: str
+    protocol: str | None
+    required_capabilities: frozenset[str]
+    timeout_seconds: int
+    requires_local_tools: bool
+    turns: tuple[Turn, ...]
+    http_endpoint: str | None = None
+
+    @classmethod
+    def parse(cls, raw: dict[str, Any]) -> Scenario:
+        tier = _required(raw, "tier")
+        if tier not in TIERS:
+            raise ContractError(f"scenario.tier invalid: {tier}")
+        kind = _required(raw, "kind")
+        if kind not in {"client", "http"}:
+            raise ContractError(f"scenario.kind invalid: {kind}")
+        turns_raw = raw.get("turns")
+        if not isinstance(turns_raw, list) or not turns_raw:
+            raise ContractError("scenario.turns must be a non-empty array")
+        endpoint = raw.get("http_endpoint")
+        if kind == "http" and (
+            not isinstance(endpoint, str) or not endpoint.startswith("/")
+        ):
+            raise ContractError("http scenario requires an absolute http_endpoint path")
+        return cls(
+            id=_required(raw, "id"),
+            name=_required(raw, "name"),
+            tier=tier,
+            kind=kind,
+            protocol=raw.get("protocol"),
+            required_capabilities=frozenset(
+                _strings(
+                    raw.get("required_capabilities"), "scenario.required_capabilities"
+                )
+            ),
+            timeout_seconds=int(raw.get("timeout_seconds", 180)),
+            requires_local_tools=bool(raw.get("requires_local_tools", False)),
+            turns=tuple(Turn.parse(item) for item in turns_raw),
+            http_endpoint=endpoint,
+        )
+
+
+@dataclass(frozen=True)
+class MatrixCell:
+    client: Client
+    route: Route
+    model: Model
+    scenario: Scenario
+
+    @property
+    def id(self) -> str:
+        return f"{self.client.id}/{self.route.id}/{self.model.id}/{self.scenario.id}"
+
+
+@dataclass
+class TurnResult:
+    index: int
+    status: str
+    duration_ms: int
+    returncode: int | None
+    marker: str
+    missing_events: list[str]
+    output_tail: str
+
+
+@dataclass
+class CellResult:
+    cell_id: str
+    status: str
+    client_version: str | None
+    started_at: str
+    duration_ms: int
+    route_id: str
+    model_id: str
+    scenario_id: str
+    turns: list[TurnResult]
+    evidence: dict[str, Any] = field(default_factory=dict)
+    detail: str = ""
+
+
+def unique_ids(items: list[Any], source: Path) -> None:
+    ids = [item.id for item in items]
+    duplicates = sorted({item for item in ids if ids.count(item) > 1})
+    if duplicates:
+        raise ContractError(f"duplicate ids in {source}: {', '.join(duplicates)}")

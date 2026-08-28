@@ -1,0 +1,57 @@
+{
+  "scenarios": [
+    {
+      "id": "text-turn",
+      "name": "One native client text turn",
+      "tier": "pr",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["text"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "turns": [
+        {"prompt": "Reply exactly BEEFAPI_CONFORMANCE_TEXT_OK.", "marker": "BEEFAPI_CONFORMANCE_TEXT_OK", "expected_events": []}
+      ]
+    },
+    {
+      "id": "local-tool-read",
+      "name": "Read a fixture through the native shell tool",
+      "tier": "merge",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["tool.shell"],
+      "timeout_seconds": 180,
+      "requires_local_tools": true,
+      "turns": [
+        {"prompt": "Use your shell tool to read marker.txt, then reply exactly BEEFAPI_CONFORMANCE_TOOL_OK.", "marker": "BEEFAPI_CONFORMANCE_TOOL_OK", "expected_events": ["BEEFAPI_CONFORMANCE_FILE_OK"]}
+      ]
+    },
+    {
+      "id": "session-resume",
+      "name": "Two-turn native session continuation",
+      "tier": "nightly",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["session.resume"],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "turns": [
+        {"prompt": "Remember nonce BLUE-CATTLE-742 and reply exactly BEEFAPI_CONFORMANCE_RESUME_1_OK.", "marker": "BEEFAPI_CONFORMANCE_RESUME_1_OK", "expected_events": []},
+        {"prompt": "Reply with the nonce from the previous turn followed by BEEFAPI_CONFORMANCE_RESUME_2_OK.", "marker": "BEEFAPI_CONFORMANCE_RESUME_2_OK", "expected_events": ["BLUE-CATTLE-742"]}
+      ]
+    },
+    {
+      "id": "native-web-search",
+      "name": "Native web search tool",
+      "tier": "nightly",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["tool.web"],
+      "timeout_seconds": 240,
+      "requires_local_tools": false,
+      "turns": [
+        {"prompt": "Use your native web search tool to find the title of example.com, cite the source, then end with BEEFAPI_CONFORMANCE_WEB_OK.", "marker": "BEEFAPI_CONFORMANCE_WEB_OK", "expected_events": [], "expected_any_events": [["WebSearch", "web_search", "webSearch"]]}
+      ]
+    }
+  ]
+}

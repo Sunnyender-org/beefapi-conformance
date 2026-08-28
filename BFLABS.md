@@ -1,33 +1,46 @@
-# BeefAPI Provider Certifier Repository Rules
+# BeefAPI Conformance Repository Rules
 
-## Purpose and evidence boundary
+## Purpose and boundary
 
-This repository certifies one upstream model/channel across OpenAI Responses, Anthropic Messages, Codex CLI, and Claude Code. A result is `certified`, `limited`, `experimental`, or `blocked`; API-only or client-only evidence must never be presented as complete certification.
+This repository owns black-box conformance across clients, protocols, routes,
+models, tools, lifecycle behavior, and server-side acceptance evidence. It does
+not replace BeefAPI white-box tests, mutate production configuration, create
+credentials, deploy code, or certify a route from HTTP success alone.
 
-## Start here
+## Sources of truth
 
-- `README.md`: installation, execution, requirements, and security overview.
-- `skills/beefapi-provider-certifier/SKILL.md`: agent-facing operating contract.
-- `skills/beefapi-provider-certifier/references/certification-matrix.md`: required evidence matrix.
-- `.github/workflows/validate.yml`: package validation used by CI.
+- `manifests/clients.json`: released client invocation and discovery contract.
+- `manifests/routes*.json`: route capabilities and authentication mode.
+- `manifests/models*.json`: model availability and capability declarations.
+- `scenarios/*.json`: reusable behavioral cases and expected evidence.
+- `docs/matrix-contract.md`: classification and tier policy.
+- current client binaries and live server evidence outrank committed examples.
 
-## Safety and execution rules
+Do not duplicate production channel inventory or credentials here. Local/live
+route and model manifests are ignored. The BeefAPI database and model catalog
+remain authoritative.
 
-- Use a disposable, model-limited credential supplied through `BEEFAPI_PROVIDER_TEST_KEY`.
-- Never write credentials to reports, issues, fixtures, logs, shell history, or committed files.
-- `--pin-channel` requires BeefAPI's admin-key channel suffix contract; do not use it with an ordinary end-user key.
-- Full certification requires isolated, resumable Codex and Claude Code sessions with real local tool use.
-- Preserve temporary-home isolation and cleanup for both clients.
-- A live gateway run, real credential use, channel mutation, or paid model call requires explicit authorization.
+## Safety
+
+- Credentials are supplied only by referenced environment variable.
+- Never print or persist credential values, cookies, auth profiles, or raw
+  production database rows.
+- Use dedicated, model-limited test credentials and pinned test routes.
+- Client tool execution requires `--allow-local-tools` and an isolated temporary
+  workspace. Do not point it at a user's repository.
+- Production calls, route/channel mutation, and paid acceptance require explicit
+  authorization.
+- Managed-session clients may use an existing login, but the harness must not
+  copy or export that login state.
 
 ## Verification
 
-Run from `skills/beefapi-provider-certifier`:
-
 ```bash
-python3 scripts/provider_certifier.py validate
-python3 -m unittest scripts/test_certify.py -v
+python3 -m unittest discover -s tests -v
+python3 -m beefapi_conformance validate
+python3 -m beefapi_conformance plan --tier release --json >/tmp/conformance-plan.json
 ```
 
-Report which certification surfaces actually ran. Passing local validation does not certify a live provider.
-
+Report separately: local validation, real client execution, live gateway
+execution, and server evidence read-back. Push or CI success is not production
+acceptance.

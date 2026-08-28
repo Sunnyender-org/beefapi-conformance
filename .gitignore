@@ -3,3 +3,15 @@ __pycache__/
 .tmp/
 certification.json
 certification.md
+.venv/
+__pycache__/
+*.pyc
+.coverage
+.grok-companion/
+.ruff_cache/
+*.egg-info/
+.tmp/
+reports/
+manifests/routes.local.json
+manifests/models.local.json
+manifests/*.private.json

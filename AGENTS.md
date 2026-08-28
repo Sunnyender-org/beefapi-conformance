@@ -1,10 +1,10 @@
 # BF Labs Agent Bootstrap
 
-This file is intentionally thin.
+1. Read `BFLABS.md` completely before non-trivial work.
+2. Read `README.md` for setup and repository boundaries.
+3. Use `docs/matrix-contract.md` for acceptance semantics.
+4. Treat local/live manifests and current client binaries as fresher than
+   example inventory.
 
-1. Read `BFLABS.md` completely before any task. It contains this repository's rules.
-2. Use `README.md` for product and setup orientation.
-3. Use `docs/INDEX.md` when it exists and the owning module, specification, test, or runbook is not already known.
-4. Use the active issue, specification, task packet, and pull request for change-specific scope and acceptance.
-
-Do not expand this file into another engineering playbook. Keep `BFLABS.md` concise: repository invariants, reading paths, safety boundaries, and verification. Move detailed designs and task history to their owning documents.
+Keep credentials out of files, output, fixtures, and reports. Do not turn this
+repository into a second copy of BeefAPI production configuration.

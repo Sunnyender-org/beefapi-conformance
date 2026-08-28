@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from beefapi_conformance.clients import ClientCommand, assistant_text, resolve_binary
@@ -296,6 +297,15 @@ class RunnerTests(unittest.TestCase):
             item
             for item in compile_matrix(inventory, "merge")
             if item.scenario.id == "local-tool-read"
+        )
+        cell = MatrixCell(
+            replace(
+                cell.client,
+                binary_candidates=(str(ROOT / "tests/fixtures/mock_agent.py"),),
+            ),
+            cell.route,
+            cell.model,
+            cell.scenario,
         )
         result = run_cell(cell, allow_local_tools=False)
         self.assertEqual("skip", result.status)

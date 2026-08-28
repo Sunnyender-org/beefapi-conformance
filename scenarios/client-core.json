@@ -23,7 +23,7 @@
       "timeout_seconds": 180,
       "requires_local_tools": true,
       "turns": [
-        {"prompt": "Use your shell tool to read marker.txt, then reply exactly BEEFAPI_CONFORMANCE_TOOL_OK.", "marker": "BEEFAPI_CONFORMANCE_TOOL_OK", "expected_events": ["BEEFAPI_CONFORMANCE_FILE_OK"]}
+        {"prompt": "Use your shell tool to read exactly {{workspace}}/marker.txt without searching other directories, then reply exactly BEEFAPI_CONFORMANCE_TOOL_OK.", "marker": "BEEFAPI_CONFORMANCE_TOOL_OK", "expected_events": ["BEEFAPI_CONFORMANCE_FILE_OK"]}
       ]
     },
     {

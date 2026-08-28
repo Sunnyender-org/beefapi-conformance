@@ -11,6 +11,7 @@ def compile_matrix(
     routes: set[str] | None = None,
     models: set[str] | None = None,
     scenarios: set[str] | None = None,
+    coverage: str = "full",
 ) -> list[MatrixCell]:
     if tier not in TIERS:
         raise ValueError(f"unknown tier: {tier}")
@@ -45,4 +46,61 @@ def compile_matrix(
                     if not scenario.required_capabilities.issubset(capabilities):
                         continue
                     cells.append(MatrixCell(client, route, model, scenario))
-    return sorted(cells, key=lambda item: item.id)
+    cells = sorted(cells, key=lambda item: item.id)
+    if coverage == "full":
+        return cells
+    if coverage == "representative":
+        return representative_matrix(cells)
+    raise ValueError(f"unknown coverage: {coverage}")
+
+
+def representative_matrix(cells: list[MatrixCell]) -> list[MatrixCell]:
+    """Deterministic pairwise-like coverage without the full Cartesian cost."""
+    if not cells:
+        return []
+    routes = sorted(
+        {cell.route.id: cell.route for cell in cells}.values(), key=lambda item: item.id
+    )
+    models = sorted(
+        {cell.model.id: cell.model for cell in cells}.values(), key=lambda item: item.id
+    )
+    native_clients = sorted(
+        {
+            cell.client.id: cell.client
+            for cell in cells
+            if cell.client.adapter != "raw-http"
+        }.values(),
+        key=lambda item: item.id,
+    )
+    route_index = {route.id: index for index, route in enumerate(routes)}
+    model_index = {model.id: index for index, model in enumerate(models)}
+    client_ids = [client.id for client in native_clients]
+    deep_scenarios = ["local-tool-read", "session-resume", "native-web-search"]
+    selected: dict[str, MatrixCell] = {}
+    for cell in cells:
+        scenario_id = cell.scenario.id
+        if cell.client.adapter == "raw-http":
+            if (
+                scenario_id == "responses-text"
+                or cell.model.id == cell.route.test_model
+            ):
+                selected[cell.id] = cell
+            continue
+        if not client_ids:
+            continue
+        if scenario_id == "text-turn":
+            assigned_client = client_ids[model_index[cell.model.id] % len(client_ids)]
+            first_route = min(cell.model.routes)
+            if cell.model.id == cell.route.test_model or (
+                cell.route.id == first_route and cell.client.id == assigned_client
+            ):
+                selected[cell.id] = cell
+            continue
+        if scenario_id in deep_scenarios and cell.model.id == cell.route.test_model:
+            scenario_index = deep_scenarios.index(scenario_id)
+            assigned_client = client_ids[
+                (route_index[cell.route.id] + scenario_index) % len(client_ids)
+            ]
+            if cell.client.id == assigned_client:
+                selected[cell.id] = cell
+    return sorted(selected.values(), key=lambda item: item.id)

@@ -106,7 +106,9 @@ and normalized trajectories. See [architecture](docs/architecture.md).
   systems, with server receipt and usage read-back.
 
 See [matrix contract](docs/matrix-contract.md) and
-[adding a client](docs/adding-a-client.md).
+[adding a client](docs/adding-a-client.md). Production inventory, exact-channel
+pinning, scheduled CI, and receipt evidence are documented in
+[production conformance](docs/production.md).
 
 ## License
 

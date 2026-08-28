@@ -1,0 +1,94 @@
+name: Production conformance
+
+on:
+  schedule:
+    - cron: "17 17 * * *"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: Acceptance tier
+        required: true
+        default: nightly
+        type: choice
+        options: [nightly, release]
+      coverage:
+        description: Matrix coverage
+        required: true
+        default: representative
+        type: choice
+        options: [representative, full]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-conformance
+  cancel-in-progress: false
+
+jobs:
+  production:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      TIER: ${{ inputs.tier || 'nightly' }}
+      COVERAGE: ${{ inputs.coverage || 'representative' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Validate protected inputs
+        env:
+          BEEFAPI_CONFORMANCE_TOKEN: ${{ secrets.BEEFAPI_CONFORMANCE_TOKEN }}
+          BEEFAPI_CONFORMANCE_CHANNELS_JSON: ${{ vars.BEEFAPI_CONFORMANCE_CHANNELS_JSON }}
+        run: |
+          test -n "$BEEFAPI_CONFORMANCE_TOKEN"
+          test -n "$BEEFAPI_CONFORMANCE_CHANNELS_JSON"
+          python -c 'import json,os; value=json.loads(os.environ["BEEFAPI_CONFORMANCE_CHANNELS_JSON"]); assert isinstance(value,list) and value'
+
+      - name: Install conformance runner and pinned clients
+        run: |
+          python -m pip install -e '.[dev]'
+          npm install --global \
+            @anthropic-ai/claude-code@2.1.233 \
+            @openai/codex@0.146.0
+          curl -fsSL https://x.ai/cli/install.sh | bash -s 1.0.5
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Generate live inventory
+        env:
+          BEEFAPI_CONFORMANCE_TOKEN: ${{ secrets.BEEFAPI_CONFORMANCE_TOKEN }}
+          BEEFAPI_CONFORMANCE_CHANNELS_JSON: ${{ vars.BEEFAPI_CONFORMANCE_CHANNELS_JSON }}
+        run: |
+          python -m beefapi_conformance sync-inventory \
+            --channels-json-env BEEFAPI_CONFORMANCE_CHANNELS_JSON \
+            --output .tmp/live-inventory
+
+      - name: Run production matrix
+        env:
+          BEEFAPI_CONFORMANCE_TOKEN: ${{ secrets.BEEFAPI_CONFORMANCE_TOKEN }}
+        run: |
+          max_cells=150
+          if [[ "$COVERAGE" == "full" ]]; then max_cells=500; fi
+          python -m beefapi_conformance run \
+            --routes .tmp/live-inventory/routes.live.json \
+            --models .tmp/live-inventory/models.live.json \
+            --tier "$TIER" \
+            --coverage "$COVERAGE" \
+            --max-cells "$max_cells" \
+            --allow-local-tools \
+            --require-server-evidence \
+            --output reports/production
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-conformance-${{ github.run_id }}
+          path: reports/production
+          if-no-files-found: warn

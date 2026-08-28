@@ -28,9 +28,22 @@ def run_cell(
     require_server_evidence: bool = False,
 ) -> CellResult:
     started = time.monotonic()
+    started_epoch = int(time.time())
     started_at = _now()
+    base_token = (
+        os.environ.get(cell.route.token_env or "") if cell.route.token_env else None
+    )
+    evidence_fence = _evidence_fence(cell, base_token)
     if cell.client.adapter == "raw-http":
-        return _run_http_cell(cell, started_at, started, require_server_evidence)
+        return _run_http_cell(
+            cell,
+            started_at,
+            started,
+            started_epoch,
+            base_token,
+            evidence_fence,
+            require_server_evidence,
+        )
     binary = resolve_binary(cell.client)
     if not binary:
         return _result(
@@ -47,8 +60,7 @@ def run_cell(
             [],
             "local tools require --allow-local-tools",
         )
-    token = os.environ.get(cell.route.token_env or "") if cell.route.token_env else None
-    if cell.route.auth_mode == "gateway_token" and not token:
+    if cell.route.auth_mode == "gateway_token" and not base_token:
         return _result(
             cell,
             "skip",
@@ -74,6 +86,7 @@ def run_cell(
         workspace.mkdir()
         marker_bytes = b"BEEFAPI_CONFORMANCE_FILE_OK\n"
         (workspace / "marker.txt").write_bytes(marker_bytes)
+        token = _request_token(cell, base_token)
         command = ClientCommand(cell, binary, root, token, base_url)
         command.prepare()
         env = command.environment()
@@ -81,8 +94,9 @@ def run_cell(
         for index, turn in enumerate(cell.scenario.turns, 1):
             turn_started = time.monotonic()
             try:
+                prompt = turn.prompt.replace("{{workspace}}", str(workspace))
                 completed = subprocess.run(
-                    command.command(turn.prompt, index),
+                    command.command(prompt, index),
                     cwd=workspace,
                     env=env,
                     text=True,
@@ -155,7 +169,9 @@ def run_cell(
             and all(item.status == "pass" for item in turn_results)
             else "fail"
         )
-        server_evidence = _server_evidence(cell, token)
+        server_evidence = _server_evidence(
+            cell, base_token, started_epoch, evidence_fence, None
+        )
         evidence = {
             "workspace_marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
             "route_auth_mode": cell.route.auth_mode,
@@ -178,15 +194,17 @@ def _run_http_cell(
     cell: MatrixCell,
     started_at: str,
     started: float,
+    started_epoch: int,
+    base_token: str | None,
+    evidence_fence: set[str] | None,
     require_server_evidence: bool,
 ) -> CellResult:
-    token = os.environ.get(cell.route.token_env or "") if cell.route.token_env else None
     base_url = (
         os.environ.get(cell.route.base_url_env or "")
         if cell.route.base_url_env
         else cell.route.base_url
     )
-    if cell.route.auth_mode == "gateway_token" and not token:
+    if cell.route.auth_mode == "gateway_token" and not base_token:
         return _result(
             cell,
             "skip",
@@ -207,6 +225,7 @@ def _run_http_cell(
             "HTTP route or endpoint missing",
         )
     turn = cell.scenario.turns[0]
+    token = _request_token(cell, base_token)
     model = cell.model.client_model(cell.client.id)
     if cell.scenario.protocol == "messages":
         payload = {
@@ -243,14 +262,19 @@ def _run_http_cell(
     )
     turn_started = time.monotonic()
     status_code: int | None = None
+    response_request_id: str | None = None
     try:
         with urllib.request.urlopen(
             request, timeout=cell.scenario.timeout_seconds
         ) as response:
             status_code = response.status
+            response_request_id = response.headers.get("X-Oneapi-Request-Id")
             output = response.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         status_code = exc.code
+        response_request_id = (
+            exc.headers.get("X-Oneapi-Request-Id") if exc.headers else None
+        )
         output = exc.read().decode("utf-8", "replace")
     except (OSError, TimeoutError) as exc:
         output = str(exc)
@@ -272,7 +296,13 @@ def _run_http_cell(
         missing,
         sanitized[-4000:],
     )
-    server_evidence = _server_evidence(cell, token)
+    server_evidence = _server_evidence(
+        cell,
+        base_token,
+        started_epoch,
+        evidence_fence,
+        response_request_id,
+    )
     evidence = {
         "http_status": status_code,
         "route_auth_mode": cell.route.auth_mode,
@@ -339,7 +369,21 @@ def _http_response_text(protocol: str | None, output: str) -> str:
     return "\n".join(values)
 
 
-def _server_evidence(cell: MatrixCell, token: str | None) -> dict[str, object]:
+def _server_evidence(
+    cell: MatrixCell,
+    token: str | None,
+    started_epoch: int,
+    evidence_fence: set[str] | None,
+    expected_request_id: str | None,
+) -> dict[str, object]:
+    if cell.route.evidence_provider == "beefapi_token_log":
+        return _beefapi_token_log_evidence(
+            cell,
+            token,
+            started_epoch,
+            evidence_fence,
+            expected_request_id,
+        )
     env_name = cell.route.evidence_command_env
     command = os.environ.get(env_name or "") if env_name else None
     if not command:
@@ -381,6 +425,200 @@ def _server_evidence(cell: MatrixCell, token: str | None) -> dict[str, object]:
         }
     except (ValueError, json.JSONDecodeError, subprocess.SubprocessError) as exc:
         return {"status": "fail", "detail": redact(str(exc))}
+
+
+def _request_token(cell: MatrixCell, token: str | None) -> str | None:
+    if not token or not cell.route.pin_channel or not cell.route.channel_id:
+        return token
+    suffix = f"-{cell.route.channel_id}"
+    if token.endswith(suffix):
+        return token
+    tail = token.rsplit("-", 1)
+    if len(tail) == 2 and tail[1].isdigit():
+        raise RuntimeError(
+            f"credential is already pinned to channel {tail[1]}, requested {cell.route.channel_id}"
+        )
+    return token + suffix
+
+
+def _beefapi_token_log_evidence(
+    cell: MatrixCell,
+    token: str | None,
+    started_epoch: int,
+    evidence_fence: set[str] | None,
+    expected_request_id: str | None = None,
+) -> dict[str, object]:
+    if not token or not cell.route.base_url:
+        return {
+            "status": "fail",
+            "detail": "token-log evidence lacks token or base URL",
+        }
+    if evidence_fence is None:
+        return {"status": "fail", "detail": "pre-call token-log fence was unavailable"}
+    if cell.client.adapter == "raw-http" and not expected_request_id:
+        return {
+            "status": "fail",
+            "detail": "raw HTTP response did not expose X-Oneapi-Request-Id",
+        }
+    url = cell.route.base_url.rstrip("/") + "/api/log/token"
+    last_detail = "matching usage log not found"
+    for attempt in range(8):
+        try:
+            request = urllib.request.Request(
+                url, headers={"authorization": f"Bearer {token}"}
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                commit = response.headers.get("X-New-Api-Commit", "")
+                body = json.loads(response.read())
+            if not isinstance(body, dict) or body.get("success") is not True:
+                last_detail = "token-log API did not return success=true"
+                continue
+            logs = body.get("data", []) if isinstance(body, dict) else []
+            matches = _matching_usage_logs(
+                cell,
+                logs,
+                started_epoch,
+                evidence_fence,
+                expected_request_id,
+            )
+            minimum_count = 1 if expected_request_id else len(cell.scenario.turns)
+            if len(matches) >= minimum_count:
+                payloads = [_usage_log_payload(cell, item, commit) for item in matches]
+                if all(item.get("status") == "pass" for item in payloads):
+                    result = dict(payloads[0])
+                    if len(payloads) > 1:
+                        result["requests"] = payloads
+                    return result
+                last_detail = "matching usage receipt is not final"
+        except (OSError, TimeoutError, json.JSONDecodeError) as exc:
+            last_detail = redact(str(exc), (token,))
+        if attempt < 7:
+            time.sleep(1)
+    return {"status": "fail", "detail": last_detail}
+
+
+def _matching_usage_logs(
+    cell: MatrixCell,
+    logs: object,
+    started_epoch: int,
+    excluded_request_ids: set[str] | None = None,
+    expected_request_id: str | None = None,
+) -> list[dict[str, object]]:
+    if not isinstance(logs, list):
+        return []
+    model_names = {cell.model.id, cell.model.client_model(cell.client.id)}
+    matches: list[dict[str, object]] = []
+    seen_request_ids: set[str] = set()
+    for log in logs:
+        if not isinstance(log, dict):
+            continue
+        if int(log.get("created_at", 0) or 0) < started_epoch - 3:
+            continue
+        request_id = str(log.get("request_id", "")).strip()
+        if not request_id or request_id in (excluded_request_ids or set()):
+            continue
+        if expected_request_id and request_id != expected_request_id:
+            continue
+        if int(log.get("type", 0) or 0) != 2:
+            continue
+        if str(log.get("model_name", "")) not in model_names:
+            continue
+        if (
+            cell.route.channel_id
+            and int(log.get("channel", 0) or 0) != cell.route.channel_id
+        ):
+            continue
+        if cell.route.group and str(log.get("group", "")) != cell.route.group:
+            continue
+        if request_id in seen_request_ids:
+            continue
+        seen_request_ids.add(request_id)
+        matches.append(log)
+    return matches
+
+
+def _matching_usage_log(
+    cell: MatrixCell,
+    logs: object,
+    started_epoch: int,
+    excluded_request_ids: set[str] | None = None,
+    expected_request_id: str | None = None,
+) -> dict[str, object] | None:
+    matches = _matching_usage_logs(
+        cell,
+        logs,
+        started_epoch,
+        excluded_request_ids,
+        expected_request_id,
+    )
+    return matches[0] if matches else None
+
+
+def _evidence_fence(cell: MatrixCell, token: str | None) -> set[str] | None:
+    if cell.route.evidence_provider != "beefapi_token_log":
+        return set()
+    if not token or not cell.route.base_url:
+        return None
+    try:
+        request = urllib.request.Request(
+            cell.route.base_url.rstrip("/") + "/api/log/token",
+            headers={"authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = json.loads(response.read())
+        if not isinstance(body, dict) or body.get("success") is not True:
+            return None
+        logs = body.get("data", []) if isinstance(body, dict) else []
+        if not isinstance(logs, list):
+            return None
+        return {
+            str(log.get("request_id", ""))
+            for log in logs
+            if isinstance(log, dict) and log.get("request_id")
+        }
+    except (OSError, TimeoutError, json.JSONDecodeError):
+        return None
+
+
+def _usage_log_payload(
+    cell: MatrixCell, log: dict[str, object], commit: str
+) -> dict[str, object]:
+    try:
+        other = json.loads(str(log.get("other", "{}")))
+    except json.JSONDecodeError:
+        other = {}
+    receipt_id = other.get("usage_receipt_id") if isinstance(other, dict) else None
+    receipt_state = (
+        other.get("usage_receipt_state") if isinstance(other, dict) else None
+    )
+    valid = bool(commit and receipt_id and receipt_state == "final")
+    return {
+        "status": "pass" if valid else "fail",
+        "commit": commit,
+        "route": {
+            "id": cell.route.id,
+            "channel_id": int(log.get("channel", 0) or 0),
+            "group": str(log.get("group", "")),
+        },
+        "terminal": {
+            "status": "completed" if int(log.get("type", 0) or 0) == 2 else "failed",
+            "request_id": str(log.get("request_id", "")),
+        },
+        "receipt": {
+            "id": str(receipt_id or ""),
+            "provider": str(other.get("usage_receipt_provider", ""))
+            if isinstance(other, dict)
+            else "",
+            "state": str(receipt_state or ""),
+        },
+        "usage": {
+            "prompt_tokens": int(log.get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(log.get("completion_tokens", 0) or 0),
+            "quota": int(log.get("quota", 0) or 0),
+            "use_time": int(log.get("use_time", 0) or 0),
+        },
+        "detail": "" if valid else "usage receipt is missing or not final",
+    }
 
 
 def _version(binary: str, cell: MatrixCell) -> str | None:

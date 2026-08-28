@@ -9,8 +9,10 @@ import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from beefapi_conformance.clients import ClientCommand, assistant_text, resolve_binary
+from beefapi_conformance.inventory import build_live_inventory
 from beefapi_conformance.manifest import Inventory, load_inventory
 from beefapi_conformance.matrix import compile_matrix
 from beefapi_conformance.model import (
@@ -24,9 +26,32 @@ from beefapi_conformance.model import (
 )
 from beefapi_conformance.redact import redact
 from beefapi_conformance.report import build_report
-from beefapi_conformance.runner import run_cell
+from beefapi_conformance.runner import (
+    _beefapi_token_log_evidence,
+    _evidence_fence,
+    _matching_usage_log,
+    _matching_usage_logs,
+    _request_token,
+    _usage_log_payload,
+    run_cell,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class FakeResponse:
+    def __init__(self, body: dict, headers: dict[str, str] | None = None):
+        self.body = json.dumps(body).encode()
+        self.headers = headers or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return self.body
 
 
 class ContractTests(unittest.TestCase):
@@ -90,6 +115,355 @@ class ContractTests(unittest.TestCase):
         )
         if app_binary.exists():
             self.assertEqual(str(app_binary), resolve_binary(workbuddy))
+
+    def test_live_inventory_uses_sanitized_channel_snapshot(self):
+        routes, models = build_live_inventory(
+            channels=[
+                {
+                    "id": 252,
+                    "type": 62,
+                    "status": 1,
+                    "models": "grok-4.6,hidden-model",
+                    "test_model": "grok-4.6",
+                },
+                {"id": 57, "type": 57, "status": 1, "models": "gpt-5.4"},
+            ],
+            public_models={"grok-4.6"},
+            base_url="https://beefapi.example",
+            token_env="TEST_TOKEN",
+            group="cursor-acceptance",
+        )
+        self.assertEqual(1, len(routes["routes"]))
+        route = routes["routes"][0]
+        self.assertEqual(252, route["channel_id"])
+        self.assertTrue(route["pin_channel"])
+        self.assertEqual("beefapi_token_log", route["evidence_provider"])
+        self.assertEqual(["grok-4.6"], [item["id"] for item in models["models"]])
+
+    def test_live_inventory_rejects_stale_channel_test_model(self):
+        with self.assertRaisesRegex(ContractError, "not in its public model inventory"):
+            build_live_inventory(
+                channels=[
+                    {
+                        "id": 271,
+                        "type": 62,
+                        "status": 1,
+                        "models": "claude-sonnet-4-6,retired-model",
+                        "test_model": "retired-model",
+                    }
+                ],
+                public_models={"claude-sonnet-4-6"},
+                base_url="https://beefapi.example",
+                token_env="TEST_TOKEN",
+                group="cursor-acceptance",
+            )
+
+    def test_representative_matrix_covers_routes_models_clients_and_deep_cases(self):
+        routes, models = build_live_inventory(
+            channels=[
+                {
+                    "id": 252,
+                    "type": 62,
+                    "status": 1,
+                    "models": "grok-4.6,composer-2.5",
+                    "test_model": "grok-4.6",
+                },
+                {
+                    "id": 272,
+                    "type": 62,
+                    "status": 1,
+                    "models": "glm-5.2",
+                    "test_model": "glm-5.2",
+                },
+            ],
+            public_models={"grok-4.6", "composer-2.5", "glm-5.2"},
+            base_url="https://beefapi.example",
+            token_env="TEST_TOKEN",
+            group="cursor-acceptance",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            routes_path = Path(tmp) / "routes.json"
+            models_path = Path(tmp) / "models.json"
+            routes_path.write_text(json.dumps(routes))
+            models_path.write_text(json.dumps(models))
+            inventory = load_inventory(ROOT, routes_path, models_path)
+        cells = compile_matrix(inventory, "release", coverage="representative")
+        raw_responses = {
+            (cell.route.id, cell.model.id)
+            for cell in cells
+            if cell.client.id == "raw-http" and cell.scenario.id == "responses-text"
+        }
+        self.assertEqual(
+            {
+                (route.id, model.id)
+                for route in inventory.routes
+                for model in inventory.models
+                if route.id in model.routes
+            },
+            raw_responses,
+        )
+        for route in inventory.routes:
+            route_cells = [cell for cell in cells if cell.route.id == route.id]
+            self.assertTrue(
+                {"responses-text", "messages-text", "chat-text"}.issubset(
+                    {
+                        cell.scenario.id
+                        for cell in route_cells
+                        if cell.client.id == "raw-http"
+                    }
+                )
+            )
+            for client_id in ("claude-code", "codex-cli", "grok-build"):
+                self.assertTrue(
+                    any(
+                        cell.client.id == client_id
+                        and cell.model.id == route.test_model
+                        and cell.scenario.id == "text-turn"
+                        for cell in route_cells
+                    )
+                )
+            self.assertEqual(
+                {"local-tool-read", "session-resume", "native-web-search"},
+                {
+                    cell.scenario.id
+                    for cell in route_cells
+                    if cell.scenario.id
+                    in {"local-tool-read", "session-resume", "native-web-search"}
+                },
+            )
+        for model in inventory.models:
+            self.assertTrue(
+                any(
+                    cell.model.id == model.id
+                    and cell.client.id != "raw-http"
+                    and cell.scenario.id == "text-turn"
+                    for cell in cells
+                )
+            )
+
+    def test_production_shaped_representative_matrix_stays_bounded(self):
+        channels = [
+            {
+                "id": 250 + route_index,
+                "type": 62,
+                "status": 1,
+                "models": ",".join(
+                    f"route-{route_index}-model-{model_index}"
+                    for model_index in range(4)
+                ),
+                "test_model": f"route-{route_index}-model-0",
+            }
+            for route_index in range(6)
+        ]
+        public_models = {
+            f"route-{route_index}-model-{model_index}"
+            for route_index in range(6)
+            for model_index in range(4)
+        }
+        routes, models = build_live_inventory(
+            channels,
+            public_models,
+            "https://beefapi.example",
+            "TEST_TOKEN",
+            "cursor-acceptance",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            routes_path = Path(tmp) / "routes.json"
+            models_path = Path(tmp) / "models.json"
+            routes_path.write_text(json.dumps(routes))
+            models_path.write_text(json.dumps(models))
+            inventory = load_inventory(ROOT, routes_path, models_path)
+        cells = compile_matrix(inventory, "nightly", coverage="representative")
+        self.assertLessEqual(len(cells), 150)
+
+    def test_channel_pin_is_explicit_and_conflict_safe(self):
+        cell = CommandTests().cell("codex")
+        route = replace(cell.route, channel_id=252, pin_channel=True)
+        pinned = MatrixCell(cell.client, route, cell.model, cell.scenario)
+        self.assertEqual("test-token-252", _request_token(pinned, "test-token"))
+        self.assertEqual("test-token-252", _request_token(pinned, "test-token-252"))
+        with self.assertRaisesRegex(RuntimeError, "already pinned to channel 271"):
+            _request_token(pinned, "test-token-271")
+
+    def test_token_log_evidence_requires_exact_route_and_final_receipt(self):
+        cell = CommandTests().cell("codex")
+        route = replace(
+            cell.route,
+            id="cursor-channel-252",
+            channel_id=252,
+            pin_channel=True,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+        )
+        cell = MatrixCell(cell.client, route, cell.model, cell.scenario)
+        log = {
+            "created_at": 200,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": "req-252",
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "quota": 3,
+            "use_time": 1,
+            "other": json.dumps(
+                {
+                    "usage_receipt_id": "cursor-sdk-bridge:receipt",
+                    "usage_receipt_provider": "cursor-sdk-bridge",
+                    "usage_receipt_state": "final",
+                }
+            ),
+        }
+        self.assertIs(log, _matching_usage_log(cell, [log], 200))
+        self.assertIsNone(_matching_usage_log(cell, [log], 200, {"req-252"}))
+        payload = _usage_log_payload(cell, log, "commit-sha")
+        self.assertEqual("pass", payload["status"])
+        self.assertEqual(252, payload["route"]["channel_id"])
+        self.assertEqual("final", payload["receipt"]["state"])
+
+    def test_token_log_matching_rejects_empty_and_ambiguous_request_ids(self):
+        cell = CommandTests().cell("codex")
+        route = replace(
+            cell.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+        )
+        cell = MatrixCell(cell.client, route, cell.model, cell.scenario)
+        base = {
+            "created_at": 200,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+        }
+        self.assertEqual(
+            [], _matching_usage_logs(cell, [{**base, "request_id": ""}], 200)
+        )
+        matches = _matching_usage_logs(
+            cell,
+            [
+                {**base, "request_id": "req-a"},
+                {**base, "request_id": "req-b"},
+            ],
+            200,
+        )
+        self.assertEqual(["req-a", "req-b"], [item["request_id"] for item in matches])
+        exact = _matching_usage_logs(
+            cell,
+            matches,
+            200,
+            expected_request_id="req-b",
+        )
+        self.assertEqual(["req-b"], [item["request_id"] for item in exact])
+
+    def test_native_tool_loop_accepts_multiple_final_request_ids(self):
+        cell = CommandTests().cell("codex")
+        route = replace(
+            cell.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+        )
+        cell = MatrixCell(cell.client, route, cell.model, cell.scenario)
+        logs = []
+        for request_id in ("tool-call", "tool-result"):
+            logs.append(
+                {
+                    "created_at": 200,
+                    "type": 2,
+                    "model_name": "model",
+                    "channel": 252,
+                    "group": "cursor-acceptance",
+                    "request_id": request_id,
+                    "other": json.dumps(
+                        {
+                            "usage_receipt_id": request_id,
+                            "usage_receipt_provider": "cursor-sdk-bridge",
+                            "usage_receipt_state": "final",
+                        }
+                    ),
+                }
+            )
+        response = FakeResponse(
+            {"success": True, "data": logs},
+            {"X-New-Api-Commit": "commit-sha"},
+        )
+        with patch("urllib.request.urlopen", return_value=response):
+            payload = _beefapi_token_log_evidence(cell, "token", 200, set())
+        self.assertEqual("pass", payload["status"])
+        self.assertEqual(2, len(payload["requests"]))
+
+    def test_token_log_evidence_waits_for_final_receipt(self):
+        cell = CommandTests().cell("codex")
+        route = replace(
+            cell.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+        )
+        cell = MatrixCell(cell.client, route, cell.model, cell.scenario)
+        base_log = {
+            "created_at": 200,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": "req-252",
+        }
+        provisional = {
+            **base_log,
+            "other": json.dumps(
+                {
+                    "usage_receipt_id": "receipt",
+                    "usage_receipt_state": "provisional",
+                }
+            ),
+        }
+        final = {
+            **base_log,
+            "other": json.dumps(
+                {
+                    "usage_receipt_id": "receipt",
+                    "usage_receipt_provider": "cursor-sdk-bridge",
+                    "usage_receipt_state": "final",
+                }
+            ),
+        }
+        responses = [
+            FakeResponse(
+                {"success": True, "data": [provisional]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {"success": True, "data": [final]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+        ]
+        with (
+            patch("urllib.request.urlopen", side_effect=responses) as urlopen,
+            patch("time.sleep"),
+        ):
+            payload = _beefapi_token_log_evidence(
+                cell,
+                "token",
+                200,
+                set(),
+                "req-252",
+            )
+        self.assertEqual("pass", payload["status"])
+        self.assertEqual(2, urlopen.call_count)
+
+    def test_token_log_fence_requires_success_true(self):
+        cell = CommandTests().cell("codex")
+        route = replace(cell.route, evidence_provider="beefapi_token_log")
+        cell = MatrixCell(cell.client, route, cell.model, cell.scenario)
+        with patch(
+            "urllib.request.urlopen",
+            return_value=FakeResponse({"success": False, "data": []}),
+        ):
+            self.assertIsNone(_evidence_fence(cell, "token"))
 
 
 class CommandTests(unittest.TestCase):

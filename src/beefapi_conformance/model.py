@@ -66,6 +66,11 @@ class Route:
     capabilities: frozenset[str]
     evidence_command_env: str | None
     release_evidence_required: bool = True
+    group: str | None = None
+    channel_id: int | None = None
+    pin_channel: bool = False
+    evidence_provider: str | None = None
+    test_model: str | None = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Route:
@@ -79,6 +84,15 @@ class Route:
             raise ContractError(
                 "route.token_env must name an environment variable, not contain a token"
             )
+        channel_id = (
+            int(raw["channel_id"]) if raw.get("channel_id") is not None else None
+        )
+        pin_channel = bool(raw.get("pin_channel", False))
+        if pin_channel and (channel_id is None or channel_id <= 0):
+            raise ContractError("pinned route requires a positive channel_id")
+        evidence_provider = raw.get("evidence_provider")
+        if evidence_provider not in {None, "beefapi_token_log"}:
+            raise ContractError(f"route.evidence_provider invalid: {evidence_provider}")
         return cls(
             id=_required(raw, "id"),
             name=_required(raw, "name"),
@@ -93,6 +107,11 @@ class Route:
             ),
             evidence_command_env=raw.get("evidence_command_env"),
             release_evidence_required=bool(raw.get("release_evidence_required", True)),
+            group=raw.get("group"),
+            channel_id=channel_id,
+            pin_channel=pin_channel,
+            evidence_provider=evidence_provider,
+            test_model=raw.get("test_model"),
         )
 
 

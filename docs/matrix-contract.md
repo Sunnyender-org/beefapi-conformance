@@ -27,6 +27,14 @@ the authoritative BeefAPI catalog or a controlled acceptance inventory.
 
 The compiler runs scenarios from the selected tier and every lower tier.
 
+`--coverage full` keeps the complete Cartesian matrix. Scheduled production
+runs use `--coverage representative`: every route/model gets raw Responses,
+every route gets all three protocols and all three native clients on its test
+model, every model gets a native-client text turn, and deep tool/resume/web
+cases rotate across clients. `--max-cells` fails closed on accidental expansion.
+The scheduled representative bound is 150 cells; an explicitly requested full
+run uses 500. Growing beyond either bound stops before sending model requests.
+
 ## Classification
 
 - `passed`: every scheduled cell ran and passed.

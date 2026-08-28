@@ -45,7 +45,9 @@ This prevents a recent earlier request from satisfying a new cell.
 Raw HTTP cells additionally bind the response `X-Oneapi-Request-Id` exactly.
 Native tool loops may legitimately create several requests per turn, so their
 isolation boundary is the dedicated Key plus serialized workflow concurrency;
-all new matching consumes in the fenced window must have final receipts.
+all rows in the fenced window are assigned to that cell, and it must contain at
+least one final receipt per client turn. Intermediate provisional rows are
+counted as evidence but never substitute for a final receipt.
 
 ## WorkBuddy boundary
 

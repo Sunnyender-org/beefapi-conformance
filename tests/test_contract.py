@@ -628,6 +628,15 @@ class ContractTests(unittest.TestCase):
                         log("second-only", 211),
                         log("first-followup", 200),
                         log("first-tool", 199),
+                        {
+                            **log("first-provisional", 199),
+                            "other": json.dumps(
+                                {
+                                    "usage_receipt_id": "first-provisional",
+                                    "usage_receipt_state": "provisional",
+                                }
+                            ),
+                        },
                         old,
                     ],
                 },
@@ -684,6 +693,7 @@ class ContractTests(unittest.TestCase):
         }
         second_id = results[1].evidence["server_evidence"]["terminal"]["request_id"]
         self.assertEqual({"first-tool", "first-followup"}, first_ids)
+        self.assertEqual(1, results[0].evidence["server_evidence"]["provisional_count"])
         self.assertEqual("second-only", second_id)
         self.assertNotIn(second_id, first_ids)
 

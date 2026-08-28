@@ -650,28 +650,12 @@ def finalize_batch_server_evidence(
     last_error = "batch token-log evidence was unavailable"
     for attempt in range(8):
         try:
-            all_final = True
             for key, session in sessions.items():
                 logs, commit = _fetch_token_logs(key[0], str(session["token"]))
                 typed_logs = [item for item in logs if isinstance(item, dict)]
                 final_logs[key] = typed_logs
                 final_commits[key] = commit
-                fence = session["fence"]
-                new_consumes = [
-                    item
-                    for item in typed_logs
-                    if int(item.get("type", 0) or 0) == 2
-                    and str(item.get("request_id", "")).strip()
-                    and str(item.get("request_id", "")).strip() not in fence
-                ]
-                if any(
-                    _usage_log_payload(cells[0], item, commit).get("status") != "pass"
-                    for item in new_consumes
-                ):
-                    all_final = False
-            if all_final:
-                break
-            last_error = "one or more batch usage receipts are not final"
+            break
         except (OSError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
             last_error = redact(str(exc))
         if attempt < 7:
@@ -759,12 +743,17 @@ def finalize_batch_server_evidence(
         payloads = [
             _usage_log_payload(cell, item, final_commits[key]) for item in candidates
         ]
-        if not all(item.get("status") == "pass" for item in payloads):
-            _set_batch_evidence_failure(result, "batch usage receipt is not final")
+        final_payloads = [item for item in payloads if item.get("status") == "pass"]
+        if len(final_payloads) < required:
+            _set_batch_evidence_failure(
+                result,
+                f"batch evidence found {len(final_payloads)} final receipts; {required} required",
+            )
             continue
-        payload = dict(payloads[0])
-        if len(payloads) > 1:
-            payload["requests"] = payloads
+        payload = dict(final_payloads[0])
+        if len(final_payloads) > 1:
+            payload["requests"] = final_payloads
+        payload["provisional_count"] = len(payloads) - len(final_payloads)
         result.evidence["server_evidence"] = payload
 
 

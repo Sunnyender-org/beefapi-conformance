@@ -2,7 +2,8 @@
 
 Stage A asks the model to select a declared canary tool. Stage B sends the
 exact assistant history plus real tool_result blocks. Stage C repeats Stage B
-after a delay. HTTP request ids may change; billing receipt identity must not.
+after a delay. HTTP request ids may change. Stage B settles one consume log and one final
+receipt; Stage C exact duplicate request ids must add zero consume logs.
 """
 
 from __future__ import annotations
@@ -319,42 +320,114 @@ def evaluate_replay_identity(
                 f"completed tool_result retry at +{item.get('offset_seconds')}s "
                 f"was not idempotent HTTP {status}",
             )
-    terminals = {
+    terminals = [
         str(item.get("terminal_hash") or "")
         for item in replay
         if item.get("terminal_hash")
-    }
-    if terminals and len(terminals) != 1:
+    ]
+    if terminals and len(set(terminals)) != 1:
         return Evaluation("fail", "terminal semantics drifted across replay")
-    receipts = [str(item.get("receipt_hash") or "") for item in replay]
-    present = [item for item in receipts if item]
+    stage_b = [item for item in replay if item.get("stage") == "b"]
+    stage_c = [item for item in replay if item.get("stage") == "c"]
+    if not stage_b:
+        return Evaluation("fail", "stage B completion is missing")
     if require_receipts:
-        for item in replay:
-            stage = item.get("stage")
-            offset = item.get("offset_seconds")
-            matches = item.get("consume_match_count")
-            if matches is not None and matches != 1:
-                return Evaluation(
-                    "fail",
-                    f"stage {stage} at +{offset}s request id did not resolve to "
-                    "exactly one consume log",
-                )
-            if not item.get("receipt_hash"):
-                return Evaluation(
-                    "fail",
-                    f"stage {stage} at +{offset}s lacks a final usage receipt",
-                )
-        if len(set(present)) != 1:
+        if any(not item.get("terminal_hash") for item in replay):
+            return Evaluation("fail", "terminal semantics drifted across replay")
+        settled = _release_stage_b_receipts(stage_b)
+        if not settled.ok:
+            return settled
+    extra = _stage_c_consume_violation(stage_c, require_receipts=require_receipts)
+    if extra is not None:
+        return extra
+    header = _response_receipt_header_violation(stage_b, replay)
+    if header is not None:
+        return header
+    if not require_receipts:
+        present = [
+            str(item.get("receipt_hash") or "")
+            for item in stage_b
+            if item.get("receipt_hash")
+        ]
+        if present and len(set(present)) != 1:
             return Evaluation(
                 "fail",
-                "billing receipt identity drifted across replay; HTTP request ids are not receipts",
+                "billing receipt identity drifted across replay; "
+                "HTTP request ids are not receipts",
             )
-    elif present and len(set(present)) != 1:
+    return Evaluation("pass")
+
+
+def _stage_c_consume_violation(
+    stage_c: list[dict[str, Any]], *, require_receipts: bool
+) -> Evaluation | None:
+    for item in stage_c:
+        offset = item.get("offset_seconds")
+        matches = item.get("consume_match_count")
+        if require_receipts and matches is None:
+            return Evaluation(
+                "fail",
+                f"stage C at +{offset}s request id was not resolved against consume logs",
+            )
+        if require_receipts and matches != 0:
+            return Evaluation(
+                "fail",
+                f"stage C at +{offset}s created a new consume log",
+            )
+        if not require_receipts and isinstance(matches, int) and matches > 0:
+            return Evaluation(
+                "fail",
+                f"stage C at +{offset}s created a new consume log",
+            )
+        if item.get("receipt_hash"):
+            return Evaluation(
+                "fail",
+                f"stage C at +{offset}s has a new or copied usage receipt",
+            )
+    return None
+
+
+def _release_stage_b_receipts(stage_b: list[dict[str, Any]]) -> Evaluation:
+    for item in stage_b:
+        offset = item.get("offset_seconds")
+        matches = item.get("consume_match_count")
+        if matches != 1:
+            return Evaluation(
+                "fail",
+                f"stage B at +{offset}s request id did not resolve to "
+                "exactly one consume log",
+            )
+        if not item.get("receipt_hash"):
+            return Evaluation(
+                "fail",
+                f"stage B at +{offset}s lacks a final usage receipt",
+            )
+    receipts = {str(item.get("receipt_hash") or "") for item in stage_b}
+    if len(receipts) != 1 or "" in receipts:
         return Evaluation(
             "fail",
-            "billing receipt identity drifted across replay; HTTP request ids are not receipts",
+            "billing receipt identity drifted across replay; "
+            "HTTP request ids are not receipts",
         )
     return Evaluation("pass")
+
+
+def _response_receipt_header_violation(
+    stage_b: list[dict[str, Any]], replay: list[dict[str, Any]]
+) -> Evaluation | None:
+    expected = str(stage_b[0].get("receipt_hash") or "") or str(
+        stage_b[0].get("response_receipt_hash") or ""
+    )
+    if not expected:
+        return None
+    for item in replay:
+        header = str(item.get("response_receipt_hash") or "")
+        if header and header != expected:
+            return Evaluation(
+                "fail",
+                "response receipt header hash drifted from stage B",
+            )
+    return None
 
 
 def evaluate_mcp_spans(
@@ -424,6 +497,7 @@ def execute_tool_replay(
             status_a,
             output_a,
             req_a,
+            stream_a,
         )
     ]
     if mode == "custom" and marker in parse_assistant_text(output_a) and not uses:
@@ -485,7 +559,7 @@ def execute_tool_replay(
         )
     stage_b = stage_b_payload(stage_a, assistant, uses, spec, prompt, marker)
     status_b, output_b, req_b, stream_b = exchange(stage_b)
-    attempts.append(_attempt("b", 0, stage_b, status_b, output_b, req_b))
+    attempts.append(_attempt("b", 0, stage_b, status_b, output_b, req_b, stream_b))
     last_status = status_b
     last_output = output_b
     stream = stream_b
@@ -494,7 +568,9 @@ def execute_tool_replay(
         for offset, delta in zip(offsets, sleep_deltas(offsets), strict=True):
             pause(delta)
             status_c, output_c, req_c, stream_c = exchange(stage_b)
-            attempts.append(_attempt("c", offset, stage_b, status_c, output_c, req_c))
+            attempts.append(
+                _attempt("c", offset, stage_b, status_c, output_c, req_c, stream_c)
+            )
             last_status = status_c
             last_output = output_c
             stream = stream_c
@@ -547,8 +623,12 @@ def _attempt(
     status: int | None,
     output: str,
     request_id: str | None,
+    stream: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     semantics = terminal_semantics(output, status)
+    response_receipt_hash = ""
+    if isinstance(stream, dict):
+        response_receipt_hash = str(stream.pop("response_receipt_hash", "") or "")
     return {
         "stage": stage,
         "offset_seconds": offset,
@@ -557,7 +637,10 @@ def _attempt(
         "http_request_id_hash": correlate_id(request_id or ""),
         "_http_request_id": request_id or "",
         "receipt_hash": "",
+        "response_receipt_hash": response_receipt_hash,
         "consume_match_count": None,
+        "replay_without_consume": False,
+        "no_new_charge": False,
         "terminal_hash": correlate_id(json.dumps(semantics, sort_keys=True)),
         "stop_reason": semantics["stop_reason"],
         "aborted": False,

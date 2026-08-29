@@ -46,6 +46,12 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _route_base_url(cell: MatrixCell) -> str | None:
+    if cell.route.base_url_env:
+        return os.environ.get(cell.route.base_url_env or "")
+    return cell.route.base_url
+
+
 def run_cell(
     cell: MatrixCell,
     allow_local_tools: bool = False,
@@ -98,11 +104,7 @@ def run_cell(
             [],
             f"missing {cell.route.token_env}",
         )
-    base_url = (
-        os.environ.get(cell.route.base_url_env or "")
-        if cell.route.base_url_env
-        else cell.route.base_url
-    )
+    base_url = _route_base_url(cell)
     if cell.route.auth_mode == "gateway_token" and not base_url:
         return _result(
             cell, "skip", started_at, started, version, [], "route base URL is missing"
@@ -258,11 +260,7 @@ def _run_http_cell(
     require_server_evidence: bool,
     defer_server_evidence: bool,
 ) -> CellResult:
-    base_url = (
-        os.environ.get(cell.route.base_url_env or "")
-        if cell.route.base_url_env
-        else cell.route.base_url
-    )
+    base_url = _route_base_url(cell)
     if cell.route.auth_mode == "gateway_token" and not base_token:
         return _result(
             cell,
@@ -659,9 +657,11 @@ def bind_replay_attempt_receipts(
     started_epoch: int = 0,
     fence: set[str] | None = None,
 ) -> None:
-    """Attach per-attempt receipts from exact request-id log matches.
+    """Attach the Stage B receipt from an exact request-id log match.
 
-    Does not copy one receipt onto every retry. Stage B/C each resolve independently.
+    Stage C duplicate request ids must resolve to zero consume logs. Do not copy
+    Stage B's receipt onto C; mark C as replay_without_consume / no_new_charge.
+    Stage A provisional rows are ignored for this replay assertion.
     """
     for attempt in attempts:
         if not isinstance(attempt, dict) or attempt.get("stage") not in {"b", "c"}:
@@ -670,11 +670,19 @@ def bind_replay_attempt_receipts(
         if not raw_id:
             attempt["consume_match_count"] = 0
             attempt["receipt_hash"] = ""
+            attempt.pop("_bound_payload", None)
+            _mark_stage_c_replay(attempt, zero_consume=True)
             continue
         matches = _matching_usage_logs(cell, logs, started_epoch, fence, raw_id)
         attempt["consume_match_count"] = len(matches)
+        if attempt.get("stage") == "c":
+            attempt["receipt_hash"] = ""
+            attempt.pop("_bound_payload", None)
+            _mark_stage_c_replay(attempt, zero_consume=len(matches) == 0)
+            continue
         if len(matches) != 1:
             attempt["receipt_hash"] = ""
+            attempt.pop("_bound_payload", None)
             continue
         payload = _usage_log_payload(cell, matches[0], commit)
         receipt = (
@@ -683,10 +691,35 @@ def bind_replay_attempt_receipts(
         if payload.get("status") != "pass":
             attempt["receipt_hash"] = ""
             attempt["receipt_state"] = str(receipt.get("state") or "")
+            attempt.pop("_bound_payload", None)
             continue
         attempt["receipt_hash"] = str(receipt.get("id_hash") or "")
         attempt["receipt_state"] = str(receipt.get("state") or "")
         attempt["_bound_payload"] = payload
+
+
+def _mark_stage_c_replay(attempt: dict[str, object], *, zero_consume: bool) -> None:
+    if attempt.get("stage") != "c":
+        return
+    attempt["replay_without_consume"] = zero_consume
+    attempt["no_new_charge"] = zero_consume
+
+
+def _replay_no_new_charge_evidence(
+    attempts: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "stage_c": [
+            {
+                "http_request_id_hash": item.get("http_request_id_hash"),
+                "consume_match_count": item.get("consume_match_count"),
+                "replay_without_consume": bool(item.get("replay_without_consume")),
+                "no_new_charge": bool(item.get("no_new_charge")),
+            }
+            for item in attempts
+            if isinstance(item, dict) and item.get("stage") == "c"
+        ]
+    }
 
 
 def _bind_replay_server_evidence(
@@ -696,7 +729,8 @@ def _bind_replay_server_evidence(
     started_epoch: int,
     fence: set[str] | None,
 ) -> dict[str, object]:
-    if not token or not cell.route.base_url:
+    base_url = _route_base_url(cell)
+    if not token or not base_url:
         return {
             "status": "fail",
             "detail": "token-log evidence lacks token or base URL",
@@ -706,7 +740,7 @@ def _bind_replay_server_evidence(
     last_detail = "matching usage log not found"
     for attempt in range(8):
         try:
-            logs, commit = _fetch_token_logs(cell.route.base_url.rstrip("/"), token)
+            logs, commit = _fetch_token_logs(base_url.rstrip("/"), token)
             bind_replay_attempt_receipts(
                 cell, attempts, logs, commit, started_epoch, fence
             )
@@ -714,15 +748,16 @@ def _bind_replay_server_evidence(
                 item.get("_bound_payload")
                 for item in attempts
                 if isinstance(item, dict)
-                and item.get("stage") in {"b", "c"}
+                and item.get("stage") == "b"
                 and isinstance(item.get("_bound_payload"), dict)
             ]
             if bound:
                 payload = dict(bound[0])
-                if len(bound) > 1:
-                    payload["requests"] = bound
+                payload["replay"] = _replay_no_new_charge_evidence(attempts)
                 return payload
-            last_detail = "stage B/C request ids did not resolve to final receipts"
+            last_detail = (
+                "stage B request id did not resolve to exactly one final receipt"
+            )
         except (
             OSError,
             TimeoutError,
@@ -809,6 +844,7 @@ def _http_exchange(
             status_code = response.status
             response_request_id = response.headers.get("X-Oneapi-Request-Id")
             output, stream = _read_http_body(response, started, abort_after_bytes)
+            _attach_response_receipt_hash(stream, response.headers)
     except urllib.error.HTTPError as exc:
         status_code = exc.code
         response_request_id = (
@@ -817,10 +853,35 @@ def _http_exchange(
         output = exc.read().decode("utf-8", "replace")
         stream["first_byte_ms"] = int((time.monotonic() - started) * 1000)
         stream["aborted"] = abort_after_bytes is not None
+        _attach_response_receipt_hash(stream, exc.headers)
     except (OSError, TimeoutError) as exc:
         output = str(exc)
         stream["aborted"] = abort_after_bytes is not None
     return status_code, output, response_request_id, stream
+
+
+def _attach_response_receipt_hash(stream: dict[str, object], headers: object) -> None:
+    hashed = _header_receipt_hash(headers)
+    if hashed:
+        stream["response_receipt_hash"] = hashed
+
+
+def _header_receipt_hash(headers: object) -> str:
+    """Hash a client-visible receipt header only when the gateway actually sent one.
+
+    Absence is not failure; BeefAPI's external response is not assumed to expose
+    a receipt id. Do not persist the raw value.
+    """
+    if headers is None:
+        return ""
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return ""
+    for name in ("X-Usage-Receipt-Id", "X-Beefapi-Usage-Receipt-Id"):
+        raw = getter(name)
+        if isinstance(raw, str) and raw.strip():
+            return correlate_id(raw.strip())
+    return ""
 
 
 def _read_http_body(
@@ -1022,7 +1083,8 @@ def _beefapi_token_log_evidence(
     evidence_fence: set[str] | None,
     expected_request_id: str | None = None,
 ) -> dict[str, object]:
-    if not token or not cell.route.base_url:
+    base_url = _route_base_url(cell)
+    if not token or not base_url:
         return {
             "status": "fail",
             "detail": "token-log evidence lacks token or base URL",
@@ -1034,7 +1096,7 @@ def _beefapi_token_log_evidence(
             "status": "fail",
             "detail": "raw HTTP response did not expose X-Oneapi-Request-Id",
         }
-    url = cell.route.base_url.rstrip("/") + "/api/log/token"
+    url = base_url.rstrip("/") + "/api/log/token"
     last_detail = "matching usage log not found"
     for attempt in range(8):
         try:
@@ -1131,11 +1193,12 @@ def _matching_usage_log(
 def _evidence_fence(cell: MatrixCell, token: str | None) -> set[str] | None:
     if cell.route.evidence_provider != "beefapi_token_log":
         return set()
-    if not token or not cell.route.base_url:
+    base_url = _route_base_url(cell)
+    if not token or not base_url:
         return None
     try:
         request = urllib.request.Request(
-            cell.route.base_url.rstrip("/") + "/api/log/token",
+            base_url.rstrip("/") + "/api/log/token",
             headers={"authorization": f"Bearer {token}"},
         )
         with urllib.request.urlopen(request, timeout=20) as response:
@@ -1164,11 +1227,7 @@ def prepare_batch_server_evidence(
             continue
         token_env = cell.route.token_env or ""
         token = os.environ.get(token_env, "")
-        base_url = (
-            os.environ.get(cell.route.base_url_env or "")
-            if cell.route.base_url_env
-            else cell.route.base_url
-        ).rstrip("/")
+        base_url = (_route_base_url(cell) or "").rstrip("/")
         if not token or not base_url:
             raise RuntimeError(
                 f"batch evidence lacks token or base URL for route {cell.route.id}"
@@ -1361,11 +1420,7 @@ def finalize_batch_server_evidence(
 
 
 def _batch_session_key(cell: MatrixCell) -> tuple[str, str]:
-    base_url = (
-        os.environ.get(cell.route.base_url_env or "")
-        if cell.route.base_url_env
-        else cell.route.base_url
-    ).rstrip("/")
+    base_url = (_route_base_url(cell) or "").rstrip("/")
     return base_url, cell.route.token_env or ""
 
 
@@ -1431,13 +1486,12 @@ def _finalize_replay_batch_evidence(
                 bound = [
                     item.get("_bound_payload")
                     for item in typed_attempts
-                    if item.get("stage") in {"b", "c"}
+                    if item.get("stage") == "b"
                     and isinstance(item.get("_bound_payload"), dict)
                 ]
                 if bound:
                     payload = dict(bound[0])
-                    if len(bound) > 1:
-                        payload["requests"] = bound
+                    payload["replay"] = _replay_no_new_charge_evidence(typed_attempts)
                     result.evidence["server_evidence"] = payload
                 _apply_public_artifact_gate(cell, result, typed_attempts)
     _scrub_private_replay_fields(result.evidence, typed_attempts)
@@ -1446,9 +1500,12 @@ def _finalize_replay_batch_evidence(
 def _evaluate_single_stage_receipts(attempts: list[dict[str, object]]):
     from .cursor_agent_v1 import Evaluation
 
-    for item in attempts:
-        if item.get("stage") != "b":
-            continue
+    stage_b = [
+        item for item in attempts if isinstance(item, dict) and item.get("stage") == "b"
+    ]
+    if not stage_b:
+        return Evaluation("fail", "stage B completion is missing")
+    for item in stage_b:
         if item.get("consume_match_count") != 1 or not item.get("receipt_hash"):
             return Evaluation(
                 "fail",

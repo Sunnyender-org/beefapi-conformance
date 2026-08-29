@@ -42,6 +42,8 @@ from beefapi_conformance.model import (
 )
 from beefapi_conformance.report import build_report
 from beefapi_conformance.runner import (
+    _bind_replay_server_evidence,
+    _evaluate_single_stage_receipts,
     _usage_log_payload,
     bind_replay_attempt_receipts,
     finalize_batch_server_evidence,
@@ -66,6 +68,21 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = json.loads(
     (ROOT / "tests/fixtures/cursor_agent_v1/evidence.json").read_text(encoding="utf-8")
 )
+
+
+class _FakeTokenLogResponse:
+    def __init__(self, body: dict, headers: dict[str, str] | None = None):
+        self.body = json.dumps(body).encode()
+        self.headers = headers or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return self.body
 
 
 def _type64_inventory(*, native_web: bool = True):
@@ -715,44 +732,103 @@ class ToolReplayDriverTests(unittest.TestCase):
             },
         ]
 
-    def test_bind_receipts_from_separate_log_matches_not_a_copy(self):
+    def test_stage_b_one_consume_log_stage_c_zero_passes(self):
         cell = self._retry_cell()
         attempts = self._attempts("req-b-exact", "req-c-exact")
         logs = [
+            self._consume_log(cell, "req-a", "cursor-agent-v1:receipt-a"),
             self._consume_log(cell, "req-b-exact", "cursor-agent-v1:receipt-shared"),
-            self._consume_log(cell, "req-c-exact", "cursor-agent-v1:receipt-shared"),
         ]
         bind_replay_attempt_receipts(cell, attempts, logs, "commit-sha", 0, set())
         self.assertEqual(1, attempts[0]["consume_match_count"])
-        self.assertEqual(1, attempts[1]["consume_match_count"])
+        self.assertEqual(0, attempts[1]["consume_match_count"])
         shared = correlate_id("cursor-agent-v1:receipt-shared")
         self.assertEqual(shared, attempts[0]["receipt_hash"])
-        self.assertEqual(shared, attempts[1]["receipt_hash"])
+        self.assertEqual("", attempts[1]["receipt_hash"])
+        self.assertTrue(attempts[1]["replay_without_consume"])
+        self.assertTrue(attempts[1]["no_new_charge"])
+        self.assertNotIn("_bound_payload", attempts[1])
         self.assertEqual(
             "pass",
             evaluate_replay_identity(attempts, require_receipts=True).status,
         )
 
-    def test_release_fails_when_retry_request_id_does_not_resolve_once(self):
+    def test_stage_c_consume_log_or_copied_receipt_fails_release(self):
         cell = self._retry_cell()
-        missing = self._attempts("req-b-exact", "req-c-missing")
-        logs = [
-            self._consume_log(cell, "req-b-exact", "cursor-agent-v1:receipt-shared"),
-        ]
-        bind_replay_attempt_receipts(cell, missing, logs, "commit-sha", 0, set())
+        same_receipt = self._attempts("req-b-exact", "req-c-exact")
+        bind_replay_attempt_receipts(
+            cell,
+            same_receipt,
+            [
+                self._consume_log(
+                    cell, "req-b-exact", "cursor-agent-v1:receipt-shared"
+                ),
+                self._consume_log(
+                    cell, "req-c-exact", "cursor-agent-v1:receipt-shared"
+                ),
+            ],
+            "commit-sha",
+            0,
+            set(),
+        )
+        self.assertEqual(1, same_receipt[1]["consume_match_count"])
+        self.assertEqual("", same_receipt[1]["receipt_hash"])
+        self.assertFalse(same_receipt[1]["replay_without_consume"])
+        self.assertEqual(
+            "fail",
+            evaluate_replay_identity(same_receipt, require_receipts=True).status,
+        )
+        copied = self._attempts("req-b-exact", "req-c-exact")
+        copied[0]["consume_match_count"] = 1
+        copied[0]["receipt_hash"] = correlate_id("cursor-agent-v1:receipt-shared")
+        copied[1]["consume_match_count"] = 0
+        copied[1]["receipt_hash"] = copied[0]["receipt_hash"]
+        copied[1]["replay_without_consume"] = True
+        copied[1]["no_new_charge"] = True
+        self.assertEqual(
+            "fail",
+            evaluate_replay_identity(copied, require_receipts=True).status,
+        )
+        self.assertIn(
+            "copied usage receipt",
+            evaluate_replay_identity(copied, require_receipts=True).detail,
+        )
+
+    def test_release_fails_when_stage_b_is_missing_or_ambiguous(self):
+        cell = self._retry_cell()
+        missing = self._attempts("req-b-missing", "req-c-exact")
+        bind_replay_attempt_receipts(
+            cell,
+            missing,
+            [self._consume_log(cell, "req-unrelated", "cursor-agent-v1:receipt-other")],
+            "commit-sha",
+            0,
+            set(),
+        )
+        self.assertEqual(0, missing[0]["consume_match_count"])
         self.assertEqual(0, missing[1]["consume_match_count"])
         self.assertEqual(
             "fail",
             evaluate_replay_identity(missing, require_receipts=True).status,
         )
-        ambiguous = self._attempts("req-b-exact", "req-c-dup")
-        dup_logs = [
-            self._consume_log(cell, "req-b-exact", "cursor-agent-v1:receipt-shared"),
-            self._consume_log(cell, "req-c-dup", "cursor-agent-v1:receipt-shared"),
-            self._consume_log(cell, "req-c-dup", "cursor-agent-v1:receipt-other"),
-        ]
-        bind_replay_attempt_receipts(cell, ambiguous, dup_logs, "commit-sha", 0, set())
-        self.assertEqual(2, ambiguous[1]["consume_match_count"])
+        self.assertIn(
+            "stage B",
+            evaluate_replay_identity(missing, require_receipts=True).detail,
+        )
+        ambiguous = self._attempts("req-b-dup", "req-c-exact")
+        bind_replay_attempt_receipts(
+            cell,
+            ambiguous,
+            [
+                self._consume_log(cell, "req-b-dup", "cursor-agent-v1:receipt-shared"),
+                self._consume_log(cell, "req-b-dup", "cursor-agent-v1:receipt-other"),
+            ],
+            "commit-sha",
+            0,
+            set(),
+        )
+        self.assertEqual(2, ambiguous[0]["consume_match_count"])
+        self.assertEqual(0, ambiguous[1]["consume_match_count"])
         self.assertEqual(
             "fail",
             evaluate_replay_identity(ambiguous, require_receipts=True).status,
@@ -767,9 +843,78 @@ class ToolReplayDriverTests(unittest.TestCase):
             "fail", evaluate_replay_identity(attempts, require_receipts=True).status
         )
         self.assertIn(
-            "final usage receipt",
+            "stage B",
             evaluate_replay_identity(attempts, require_receipts=True).detail,
         )
+
+    def test_single_stage_receipts_fail_without_stage_b(self):
+        self.assertEqual(
+            "fail",
+            _evaluate_single_stage_receipts(
+                [{"stage": "a", "consume_match_count": 1, "receipt_hash": "rec"}]
+            ).status,
+        )
+        self.assertEqual("fail", _evaluate_single_stage_receipts([]).status)
+        self.assertEqual(
+            "pass",
+            _evaluate_single_stage_receipts(
+                [{"stage": "b", "consume_match_count": 1, "receipt_hash": "rec"}]
+            ).status,
+        )
+
+    def test_optional_response_receipt_header_hash_must_equal_stage_b(self):
+        shared = correlate_id("cursor-agent-v1:receipt-shared")
+        matching = self._attempts("req-b-exact", "req-c-exact")
+        matching[0]["consume_match_count"] = 1
+        matching[0]["receipt_hash"] = shared
+        matching[0]["response_receipt_hash"] = shared
+        matching[1]["consume_match_count"] = 0
+        matching[1]["receipt_hash"] = ""
+        matching[1]["response_receipt_hash"] = shared
+        matching[1]["replay_without_consume"] = True
+        matching[1]["no_new_charge"] = True
+        self.assertEqual(
+            "pass",
+            evaluate_replay_identity(matching, require_receipts=True).status,
+        )
+        drifted = [dict(item) for item in matching]
+        drifted[1]["response_receipt_hash"] = correlate_id("other-receipt")
+        self.assertEqual(
+            "fail",
+            evaluate_replay_identity(drifted, require_receipts=True).status,
+        )
+
+    def test_bind_replay_resolves_base_url_from_env(self):
+        cell = self._retry_cell()
+        route = replace(cell.route, base_url=None, base_url_env="TEST_BASE_URL")
+        cell = MatrixCell(cell.client, route, cell.model, cell.scenario)
+        attempts = self._attempts("req-b-exact", "req-c-exact")
+        seen_urls: list[str] = []
+
+        def fake_urlopen(request, timeout=0):
+            seen_urls.append(request.full_url)
+            return _FakeTokenLogResponse(
+                {
+                    "success": True,
+                    "data": [
+                        self._consume_log(
+                            cell, "req-b-exact", "cursor-agent-v1:receipt-shared"
+                        )
+                    ],
+                },
+                {"X-New-Api-Commit": "commit-sha"},
+            )
+
+        with (
+            patch.dict(os.environ, {"TEST_BASE_URL": "https://env-only.example"}),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            payload = _bind_replay_server_evidence(cell, attempts, "token", 0, set())
+        self.assertEqual("pass", payload.get("status"), payload)
+        self.assertTrue(any("https://env-only.example" in url for url in seen_urls))
+        self.assertEqual(1, attempts[0]["consume_match_count"])
+        self.assertEqual(0, attempts[1]["consume_match_count"])
+        self.assertTrue(attempts[1]["replay_without_consume"])
 
     def test_deferred_batch_correlates_raw_ids_then_scrubs_them(self):
         cell = self._retry_cell()
@@ -795,31 +940,16 @@ class ToolReplayDriverTests(unittest.TestCase):
                 "tool_replay": {"mode": "retry", "tool_use_id_hashes": []},
             },
         )
-
-        class FakeResponse:
-            def __init__(self, body: dict, headers: dict[str, str] | None = None):
-                self.body = json.dumps(body).encode()
-                self.headers = headers or {}
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                return False
-
-            def read(self):
-                return self.body
-
         responses = [
-            FakeResponse(
+            _FakeTokenLogResponse(
                 {"success": True, "data": [old]},
                 {"X-New-Api-Commit": "commit-sha"},
             ),
-            FakeResponse(
+            _FakeTokenLogResponse(
                 {
                     "success": True,
                     "data": [
-                        self._consume_log(cell, "req-c-exact", receipt),
+                        self._consume_log(cell, "req-a", "cursor-agent-v1:receipt-a"),
                         self._consume_log(cell, "req-b-exact", receipt),
                         old,
                     ],
@@ -835,10 +965,16 @@ class ToolReplayDriverTests(unittest.TestCase):
             finalize_batch_server_evidence([cell], [result], sessions)
         self.assertEqual("pass", result.status, result.detail)
         self.assertEqual(1, attempts[0]["consume_match_count"])
-        self.assertEqual(1, attempts[1]["consume_match_count"])
-        self.assertEqual(attempts[0]["receipt_hash"], attempts[1]["receipt_hash"])
+        self.assertEqual(0, attempts[1]["consume_match_count"])
+        self.assertEqual("", attempts[1]["receipt_hash"])
+        self.assertTrue(attempts[1]["replay_without_consume"])
+        self.assertTrue(attempts[1]["no_new_charge"])
+        replay = result.evidence["server_evidence"]["replay"]["stage_c"]
+        self.assertEqual(0, replay[0]["consume_match_count"])
+        self.assertTrue(replay[0]["no_new_charge"])
         self.assertNotIn("_response_request_ids", result.evidence)
         self.assertNotIn("_replay_attempts", result.evidence)
+        self.assertNotIn("_http_request_id", json.dumps(attempts))
         dumped = json.dumps(build_report([result]))
         self.assertNotIn("req-b-exact", dumped)
         self.assertNotIn("req-c-exact", dumped)

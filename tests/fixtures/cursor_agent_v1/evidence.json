@@ -31,8 +31,8 @@
     {"stage": "c", "offset_seconds": 23, "http_status": 409, "request_hash": "abc", "http_request_id_hash": "h2", "receipt_hash": "rec"}
   ],
   "retry_valid": [
-    {"stage": "b", "offset_seconds": 0, "http_status": 200, "request_hash": "abc", "http_request_id_hash": "h1", "receipt_hash": "rec", "terminal_hash": "term"},
-    {"stage": "c", "offset_seconds": 23, "http_status": 200, "request_hash": "abc", "http_request_id_hash": "h2", "receipt_hash": "rec", "terminal_hash": "term"},
-    {"stage": "c", "offset_seconds": 180, "http_status": 200, "request_hash": "abc", "http_request_id_hash": "h3", "receipt_hash": "rec", "terminal_hash": "term"}
+    {"stage": "b", "offset_seconds": 0, "http_status": 200, "request_hash": "abc", "http_request_id_hash": "h1", "receipt_hash": "rec", "terminal_hash": "term", "consume_match_count": 1},
+    {"stage": "c", "offset_seconds": 23, "http_status": 200, "request_hash": "abc", "http_request_id_hash": "h2", "receipt_hash": "", "terminal_hash": "term", "consume_match_count": 0, "replay_without_consume": true, "no_new_charge": true},
+    {"stage": "c", "offset_seconds": 180, "http_status": 200, "request_hash": "abc", "http_request_id_hash": "h3", "receipt_hash": "", "terminal_hash": "term", "consume_match_count": 0, "replay_without_consume": true, "no_new_charge": true}
   ]
 }

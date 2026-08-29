@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from .cursor_agent_v1 import forced_representative_cell
 from .manifest import Inventory
 from .model import TIERS, MatrixCell
 
@@ -78,6 +79,9 @@ def representative_matrix(cells: list[MatrixCell]) -> list[MatrixCell]:
     deep_scenarios = ["local-tool-read", "session-resume", "native-web-search"]
     selected: dict[str, MatrixCell] = {}
     for cell in cells:
+        if forced_representative_cell(cell):
+            selected[cell.id] = cell
+            continue
         scenario_id = cell.scenario.id
         if cell.client.adapter == "raw-http":
             if (

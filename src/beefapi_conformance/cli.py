@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from .clients import resolve_binary
+from .cursor_agent_v1 import missing_critical_executions
 from .harbor import harbor_binary, validate_harbor_tasks
 from .inventory import sync_live_inventory
 from .manifest import load_inventory
@@ -57,10 +58,21 @@ def command_validate(args: argparse.Namespace) -> int:
     inventory = _inventory(args)
     errors = validate_harbor_tasks(ROOT)
     release_cells = compile_matrix(inventory, "release")
+    representative_cells = compile_matrix(
+        inventory, "release", coverage="representative"
+    )
     covered_clients = {cell.client.id for cell in release_cells}
     missing_clients = sorted({item.id for item in inventory.clients} - covered_clients)
     if missing_clients:
         errors.append(f"clients without release cells: {', '.join(missing_clients)}")
+    for label, cells in (
+        ("full", release_cells),
+        ("representative", representative_cells),
+    ):
+        missing = missing_critical_executions(cells)
+        errors.extend(
+            f"{label} release missing critical type64 cell {item}" for item in missing
+        )
     payload = {
         "ok": not errors,
         "counts": {
@@ -153,7 +165,7 @@ def command_run(args: argparse.Namespace) -> int:
             break
     if batch_evidence:
         finalize_batch_server_evidence(cells[: len(results)], results, batch_evidence)
-    report = build_report(results)
+    report = build_report(results, tier=args.tier, planned_cells=cells)
     write_report(report, Path(args.output))
     print(json.dumps(report["summary"], indent=2))
     return 0 if report["classification"] == "passed" else 1

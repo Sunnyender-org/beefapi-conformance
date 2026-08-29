@@ -59,3 +59,7 @@ The provider certifier contains useful protocol payloads and parsers. Keeping it
 under `legacy/` makes migration reviewable while preventing two active matrix
 contracts. New scenarios must be registered under `scenarios/`; protocol cases
 move individually after their evidence semantics are represented here.
+
+Cursor Agent v1 completion rules, critical/major weights, and comparison
+semantics live in [cursor-agent-v1-completion.md](cursor-agent-v1-completion.md)
+and `manifests/cursor-agent-v1-completion.json`.

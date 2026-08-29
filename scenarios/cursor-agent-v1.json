@@ -1,0 +1,454 @@
+{
+  "scenarios": [
+    {
+      "id": "cursor-v1-usage-quality",
+      "name": "Type64 usage quality: observed unknown vs billing estimate",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["cursor.agent_v1", "text", "messages"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "evidence_requirements": ["usage.quality"],
+      "turns": [
+        {
+          "prompt": "Reply exactly BEEFAPI_CURSOR_V1_USAGE_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_USAGE_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "cursor-v1-tool-catalog-canary",
+      "name": "Caller local tools visible; Cursor native shell/fs hidden",
+      "tier": "nightly",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["cursor.agent_v1", "tool.shell"],
+      "timeout_seconds": 180,
+      "requires_local_tools": true,
+      "evidence_requirements": ["tool.catalog"],
+      "turns": [
+        {
+          "prompt": "Use only your caller-local tools to read exactly {{workspace}}/marker.txt. Do not use Cursor native shell or filesystem tools. Then reply exactly BEEFAPI_CURSOR_V1_CATALOG_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_CATALOG_OK",
+          "expected_events": ["BEEFAPI_CONFORMANCE_FILE_OK"]
+        }
+      ]
+    },
+    {
+      "id": "cursor-v1-custom-tool-canary",
+      "name": "Caller custom tool remains visible on Cursor Agent v1",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["cursor.agent_v1", "tool.custom", "messages"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "evidence_requirements": ["tool.custom.canary"],
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 128,
+        "tools": [
+          {
+            "name": "beefapi_conformance_canary",
+            "description": "Caller-local conformance canary. Echo the marker.",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "marker": {"type": "string"}
+              }
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "{{prompt}}"
+          }
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "The caller canary tool beefapi_conformance_canary must remain visible. Reply exactly BEEFAPI_CURSOR_V1_CUSTOM_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_CUSTOM_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "cursor-v1-tool-result-retry-23s",
+      "name": "Identical completed tool_result retry at +23s is idempotent",
+      "tier": "nightly",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["cursor.agent_v1", "tool.custom", "messages"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "retry_offsets_seconds": [23],
+      "evidence_requirements": ["tool_result.idempotent"],
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 128,
+        "messages": [
+          {"role": "user", "content": "Use the canary tool."},
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_conformance_retry_23s",
+                "name": "beefapi_conformance_canary",
+                "input": {"marker": "BEEFAPI_CURSOR_V1_RETRY_23S_OK"}
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_conformance_retry_23s",
+                "content": "BEEFAPI_CURSOR_V1_RETRY_23S_OK"
+              }
+            ]
+          }
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "The completed tool_result is already present. Reply exactly BEEFAPI_CURSOR_V1_RETRY_23S_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_RETRY_23S_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "cursor-v1-tool-result-retry-3m",
+      "name": "Identical completed tool_result retry at +3m is idempotent",
+      "tier": "nightly",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["cursor.agent_v1", "tool.custom", "messages"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "retry_offsets_seconds": [180],
+      "evidence_requirements": ["tool_result.idempotent"],
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 128,
+        "messages": [
+          {"role": "user", "content": "Use the canary tool."},
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_conformance_retry_3m",
+                "name": "beefapi_conformance_canary",
+                "input": {"marker": "BEEFAPI_CURSOR_V1_RETRY_3M_OK"}
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_conformance_retry_3m",
+                "content": "BEEFAPI_CURSOR_V1_RETRY_3M_OK"
+              }
+            ]
+          }
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "The completed tool_result is already present. Reply exactly BEEFAPI_CURSOR_V1_RETRY_3M_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_RETRY_3M_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "cursor-v1-covering-set-tool-result",
+      "name": "Covering-set tool_result blocks must not 4xx",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["cursor.agent_v1", "tool.custom", "messages"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "evidence_requirements": ["http.not_4xx"],
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 128,
+        "messages": [
+          {"role": "user", "content": "Use both canary tools."},
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_conformance_cover_a",
+                "name": "beefapi_conformance_canary",
+                "input": {"marker": "A"}
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_conformance_cover_b",
+                "name": "beefapi_conformance_canary",
+                "input": {"marker": "B"}
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_conformance_cover_a",
+                "content": "A"
+              },
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_conformance_cover_b",
+                "content": "B"
+              }
+            ]
+          }
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "Covering tool results are complete. Reply exactly BEEFAPI_CURSOR_V1_COVERING_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_COVERING_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "cursor-v1-mixed-tool-result-text",
+      "name": "tool_result plus ordinary text must not 4xx",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["cursor.agent_v1", "tool.custom", "messages"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "evidence_requirements": ["http.not_4xx"],
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 128,
+        "messages": [
+          {"role": "user", "content": "Use the canary tool."},
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_conformance_mixed",
+                "name": "beefapi_conformance_canary",
+                "input": {"marker": "mixed"}
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_conformance_mixed",
+                "content": "mixed"
+              },
+              {
+                "type": "text",
+                "text": "{{prompt}}"
+              }
+            ]
+          }
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "Continue after the tool result. Reply exactly BEEFAPI_CURSOR_V1_MIXED_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_MIXED_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "cursor-v1-mcp-serial",
+      "name": "Two MCP servers declared serial must not overlap",
+      "tier": "nightly",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["cursor.agent_v1", "mcp.serial", "messages"],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "mcp_mode": "serial",
+      "evidence_requirements": ["mcp.serial"],
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 128,
+        "tools": [
+          {
+            "name": "beefapi_mcp_alpha",
+            "description": "First MCP canary. Serial with beefapi_mcp_beta.",
+            "input_schema": {"type": "object", "properties": {}}
+          },
+          {
+            "name": "beefapi_mcp_beta",
+            "description": "Second MCP canary. Serial with beefapi_mcp_alpha.",
+            "input_schema": {"type": "object", "properties": {}}
+          }
+        ],
+        "messages": [
+          {"role": "user", "content": "{{prompt}}"}
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "Call beefapi_mcp_alpha then beefapi_mcp_beta serially. Reply exactly BEEFAPI_CURSOR_V1_MCP_SERIAL_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_MCP_SERIAL_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "cursor-v1-mcp-parallel",
+      "name": "Two MCP servers declared parallel must overlap",
+      "tier": "nightly",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["cursor.agent_v1", "mcp.parallel", "messages"],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "mcp_mode": "parallel",
+      "evidence_requirements": ["mcp.parallel"],
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 128,
+        "tools": [
+          {
+            "name": "beefapi_mcp_alpha",
+            "description": "First MCP canary. Parallel with beefapi_mcp_beta.",
+            "input_schema": {"type": "object", "properties": {}}
+          },
+          {
+            "name": "beefapi_mcp_beta",
+            "description": "Second MCP canary. Parallel with beefapi_mcp_alpha.",
+            "input_schema": {"type": "object", "properties": {}}
+          }
+        ],
+        "messages": [
+          {"role": "user", "content": "{{prompt}}"}
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "Call beefapi_mcp_alpha and beefapi_mcp_beta in parallel. Reply exactly BEEFAPI_CURSOR_V1_MCP_PARALLEL_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_MCP_PARALLEL_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "cursor-v1-thinking-progress",
+      "name": "Thinking-only time emits keepalive/progress and measurable first-byte",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["cursor.agent_v1", "stream.progress", "messages"],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "evidence_requirements": ["stream.first_byte", "stream.keepalive"],
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 256,
+        "stream": true,
+        "thinking": {"type": "enabled", "budget_tokens": 128},
+        "messages": [
+          {"role": "user", "content": "{{prompt}}"}
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "Think silently, keep the stream alive, then reply exactly BEEFAPI_CURSOR_V1_THINKING_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_THINKING_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "cursor-v1-claude-classifier",
+      "name": "Real Claude Code auto-mode classifier remains on the type64 path",
+      "tier": "nightly",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["cursor.agent_v1", "client.classifier"],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "evidence_requirements": ["client.classifier"],
+      "turns": [
+        {
+          "prompt": "Stay in auto mode. Classify whether local tools are needed, then reply exactly BEEFAPI_CURSOR_V1_CLASSIFIER_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_CLASSIFIER_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "cursor-v1-disconnect",
+      "name": "Client disconnect finalizes uniquely and does not reuse a receipt",
+      "tier": "nightly",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["cursor.agent_v1", "lifecycle.disconnect", "messages"],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "evidence_requirements": ["lifecycle.disconnect", "receipt.unique"],
+      "turns": [
+        {
+          "prompt": "Reply exactly BEEFAPI_CURSOR_V1_DISCONNECT_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_DISCONNECT_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "cursor-v1-restart",
+      "name": "Client restart issues a new unique receipt",
+      "tier": "nightly",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["cursor.agent_v1", "lifecycle.restart", "messages"],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "evidence_requirements": ["lifecycle.restart", "receipt.unique"],
+      "turns": [
+        {
+          "prompt": "Reply exactly BEEFAPI_CURSOR_V1_RESTART_1_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_RESTART_1_OK",
+          "expected_events": []
+        },
+        {
+          "prompt": "Reply exactly BEEFAPI_CURSOR_V1_RESTART_2_OK.",
+          "marker": "BEEFAPI_CURSOR_V1_RESTART_2_OK",
+          "expected_events": []
+        }
+      ]
+    }
+  ]
+}

@@ -13,6 +13,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .clients import ClientCommand, assistant_text, resolve_binary
+from .cursor_agent_v1 import (
+    attach_completion_metadata,
+    correlate_id,
+    evaluate_hosted_search,
+    evaluate_public_artifacts,
+    evaluate_usage_quality,
+    hosted_search_counts,
+    redact_correlation_ids,
+    type64_usage_fields,
+)
 from .model import CellResult, MatrixCell, TurnResult
 from .redact import redact
 
@@ -114,7 +124,9 @@ def run_cell(
                     timeout=cell.scenario.timeout_seconds,
                     check=False,
                 )
-                output = redact(completed.stdout or "", (token or "",))
+                output = redact_correlation_ids(
+                    redact(completed.stdout or "", (token or "",))
+                )
                 observed_request_ids.update(AGENT_V1_RESPONSE_ID.findall(output))
                 command.observe_output(output)
                 missing = [
@@ -156,7 +168,7 @@ def run_cell(
                         None,
                         turn.marker,
                         ["terminal"],
-                        redact(raw, (token or "",))[-4000:],
+                        redact_correlation_ids(redact(raw, (token or "",)))[-4000:],
                     )
                 )
                 break
@@ -169,7 +181,9 @@ def run_cell(
                         None,
                         turn.marker,
                         ["client_execution"],
-                        redact(str(exc), (token or "",))[-4000:],
+                        redact_correlation_ids(redact(str(exc), (token or "",)))[
+                            -4000:
+                        ],
                     )
                 )
                 break
@@ -184,6 +198,22 @@ def run_cell(
             if defer_server_evidence
             else _server_evidence(cell, base_token, started_epoch, evidence_fence, None)
         )
+        combined_output = "\n".join(item.output_tail for item in turn_results)
+        permission_mode = (
+            "default"
+            if "client.classifier" in cell.scenario.required_capabilities
+            else "bypassPermissions"
+        )
+        public = evaluate_public_artifacts(
+            cell,
+            output=combined_output,
+            evidence=server_evidence if isinstance(server_evidence, dict) else {},
+            permission_mode=permission_mode,
+        )
+        detail = ""
+        if public.status != "pass":
+            status = "fail"
+            detail = public.detail
         evidence = {
             "workspace_marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
             "route_auth_mode": cell.route.auth_mode,
@@ -195,7 +225,6 @@ def run_cell(
                 "finished_epoch": int(time.time()),
             }
             evidence["_response_request_ids"] = sorted(observed_request_ids)
-        detail = ""
         if (
             require_server_evidence
             and not defer_server_evidence
@@ -244,82 +273,116 @@ def _run_http_cell(
             [],
             "HTTP route or endpoint missing",
         )
-    turn = cell.scenario.turns[0]
     token = _request_token(cell, base_token)
     model = cell.model.client_model(cell.client.id)
-    if cell.scenario.http_payload is not None:
-        payload = _render_http_payload(cell.scenario.http_payload, model, turn.prompt)
-    elif cell.scenario.protocol == "messages":
-        payload = {
-            "model": model,
-            "max_tokens": 128,
-            "messages": [{"role": "user", "content": turn.prompt}],
-        }
-    elif cell.scenario.protocol == "chat":
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": turn.prompt}],
-            "stream": False,
-        }
-    else:
-        payload = {"model": model, "input": turn.prompt, "stream": False}
-    if cell.scenario.protocol == "messages":
-        headers = {
-            "content-type": "application/json",
-            "x-api-key": token or "",
-            "anthropic-version": "2023-06-01",
-        }
-    elif cell.scenario.protocol == "chat":
-        headers = {
-            "content-type": "application/json",
-            "authorization": f"Bearer {token or ''}",
-        }
-    else:
-        headers = {
-            "content-type": "application/json",
-            "authorization": f"Bearer {token or ''}",
-        }
-    request = urllib.request.Request(
-        base_url.rstrip("/") + cell.scenario.http_endpoint,
-        data=json.dumps(payload).encode(),
-        headers=headers,
-        method="POST",
-    )
-    turn_started = time.monotonic()
-    status_code: int | None = None
-    response_request_id: str | None = None
-    try:
-        with urllib.request.urlopen(
-            request, timeout=cell.scenario.timeout_seconds
-        ) as response:
-            status_code = response.status
-            response_request_id = response.headers.get("X-Oneapi-Request-Id")
-            output = response.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
-        status_code = exc.code
-        response_request_id = (
-            exc.headers.get("X-Oneapi-Request-Id") if exc.headers else None
+    url = base_url.rstrip("/") + cell.scenario.http_endpoint
+    headers = _http_headers(cell.scenario.protocol, token)
+    turn_results: list[TurnResult] = []
+    observed_request_ids: list[str] = []
+    attempts: list[dict[str, object]] = []
+    last_status: int | None = None
+    last_output = ""
+    stream_meta: dict[str, object] = {
+        "first_byte_ms": None,
+        "keepalive_count": 0,
+        "progress_event_count": 0,
+    }
+    public_mcp: dict[str, object] = {}
+    disconnect = "lifecycle.disconnect" in cell.scenario.evidence_requirements
+    for index, turn in enumerate(cell.scenario.turns, 1):
+        payload = _http_payload_for_turn(cell, model, turn.prompt)
+        turn_started = time.monotonic()
+        if disconnect and index == 1:
+            aborted_status, _aborted_output, aborted_id, aborted_stream = (
+                _http_exchange(
+                    url,
+                    payload,
+                    headers,
+                    min(cell.scenario.timeout_seconds, 5),
+                    abort_after_bytes=1,
+                )
+            )
+            attempts.append(
+                {
+                    "aborted": True,
+                    "http_status": aborted_status,
+                    "receipt_hash": correlate_id(aborted_id or ""),
+                    "stream": aborted_stream,
+                }
+            )
+        status_code, output, response_request_id, stream = _http_exchange(
+            url, payload, headers, cell.scenario.timeout_seconds
         )
-        output = exc.read().decode("utf-8", "replace")
-    except (OSError, TimeoutError) as exc:
-        output = str(exc)
-    sanitized = redact(output, (token or "",))
-    response_text = _http_response_text(cell.scenario.protocol, output)
-    missing = [item for item in turn.expected_events if item not in sanitized]
-    passed = (
-        status_code is not None
-        and 200 <= status_code < 300
-        and turn.marker in response_text
-        and not missing
+        last_status = status_code
+        last_output = output
+        stream_meta = stream
+        if isinstance(response_request_id, str) and response_request_id:
+            observed_request_ids.append(response_request_id)
+        request_hash = hashlib.sha256(
+            json.dumps(payload, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        attempts.append(
+            {
+                "offset_seconds": 0,
+                "aborted": False,
+                "http_status": status_code,
+                "request_hash": request_hash,
+                "receipt_hash": correlate_id(response_request_id or ""),
+            }
+        )
+        if cell.scenario.retry_offsets_seconds and require_server_evidence:
+            for offset in cell.scenario.retry_offsets_seconds:
+                time.sleep(offset)
+                retry_status, retry_output, retry_id, retry_stream = _http_exchange(
+                    url, payload, headers, cell.scenario.timeout_seconds
+                )
+                last_status = retry_status
+                last_output = retry_output
+                stream_meta = retry_stream
+                if isinstance(retry_id, str) and retry_id:
+                    observed_request_ids.append(retry_id)
+                attempts.append(
+                    {
+                        "offset_seconds": offset,
+                        "aborted": False,
+                        "http_status": retry_status,
+                        "request_hash": request_hash,
+                        "receipt_hash": correlate_id(retry_id or ""),
+                    }
+                )
+        sanitized = redact_correlation_ids(redact(output, (token or "",)))
+        response_text = _http_response_text(cell.scenario.protocol, output)
+        missing = [item for item in turn.expected_events if item not in sanitized]
+        passed = (
+            status_code is not None
+            and 200 <= status_code < 300
+            and (turn.marker in response_text or turn.marker in sanitized)
+            and not missing
+        )
+        mcp = _mcp_from_http_body(output)
+        if mcp:
+            public_mcp = mcp
+        turn_results.append(
+            TurnResult(
+                index,
+                "pass" if passed else "fail",
+                int((time.monotonic() - turn_started) * 1000),
+                status_code,
+                turn.marker,
+                missing,
+                sanitized[-4000:],
+            )
+        )
+        if not passed:
+            break
+    status = (
+        "pass"
+        if len(turn_results) == len(cell.scenario.turns)
+        and all(item.status == "pass" for item in turn_results)
+        else "fail"
     )
-    result = TurnResult(
-        1,
-        "pass" if passed else "fail",
-        int((time.monotonic() - turn_started) * 1000),
-        status_code,
-        turn.marker,
-        missing,
-        sanitized[-4000:],
+    primary_request_id = (
+        observed_request_ids[-1] if len(observed_request_ids) == 1 else None
     )
     server_evidence = (
         {"status": "deferred"}
@@ -329,39 +392,189 @@ def _run_http_cell(
             base_token,
             started_epoch,
             evidence_fence,
-            response_request_id,
+            primary_request_id,
         )
     )
-    evidence = {
-        "http_status": status_code,
+    public_evidence: dict[str, object] = (
+        dict(server_evidence) if isinstance(server_evidence, dict) else {}
+    )
+    if public_mcp:
+        public_evidence["mcp"] = public_mcp
+    public = evaluate_public_artifacts(
+        cell,
+        http_status=last_status,
+        output=redact_correlation_ids(redact(last_output, (token or "",))),
+        evidence=public_evidence,
+        stream=stream_meta,
+        attempts=attempts,
+    )
+    detail = ""
+    if public.status != "pass":
+        status = "fail"
+        detail = public.detail
+    evidence: dict[str, object] = {
+        "http_status": last_status,
         "route_auth_mode": cell.route.auth_mode,
         "server_evidence": server_evidence,
+        "stream": stream_meta,
     }
+    if public_mcp:
+        evidence["mcp"] = public_mcp
     if defer_server_evidence:
-        evidence["_response_request_id"] = response_request_id
+        if len(observed_request_ids) == 1:
+            evidence["_response_request_id"] = observed_request_ids[0]
+        evidence["_response_request_ids"] = observed_request_ids
         evidence["_server_window"] = {
             "started_epoch": started_epoch,
             "finished_epoch": int(time.time()),
         }
-    detail = ""
     if (
         require_server_evidence
         and not defer_server_evidence
         and cell.route.release_evidence_required
         and server_evidence.get("status") != "pass"
     ):
-        result.status = "fail"
+        status = "fail"
         detail = "release tier requires passing server evidence"
     return _result(
         cell,
-        result.status,
+        status,
         started_at,
         started,
         "python-urllib",
-        [result],
+        turn_results,
         detail,
         evidence,
     )
+
+
+def _http_headers(protocol: str | None, token: str | None) -> dict[str, str]:
+    if protocol == "messages":
+        return {
+            "content-type": "application/json",
+            "x-api-key": token or "",
+            "anthropic-version": "2023-06-01",
+        }
+    return {
+        "content-type": "application/json",
+        "authorization": f"Bearer {token or ''}",
+    }
+
+
+def _http_payload_for_turn(cell: MatrixCell, model: str, prompt: str) -> object:
+    if cell.scenario.http_payload is not None:
+        return _render_http_payload(cell.scenario.http_payload, model, prompt)
+    if cell.scenario.protocol == "messages":
+        return {
+            "model": model,
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+    if cell.scenario.protocol == "chat":
+        return {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+        }
+    return {"model": model, "input": prompt, "stream": False}
+
+
+def _http_exchange(
+    url: str,
+    payload: object,
+    headers: dict[str, str],
+    timeout: int,
+    abort_after_bytes: int | None = None,
+) -> tuple[int | None, str, str | None, dict[str, object]]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode(),
+        headers=headers,
+        method="POST",
+    )
+    started = time.monotonic()
+    status_code: int | None = None
+    response_request_id: str | None = None
+    output = ""
+    stream: dict[str, object] = {
+        "first_byte_ms": None,
+        "keepalive_count": 0,
+        "progress_event_count": 0,
+        "aborted": False,
+    }
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status_code = response.status
+            response_request_id = response.headers.get("X-Oneapi-Request-Id")
+            output, stream = _read_http_body(response, started, abort_after_bytes)
+    except urllib.error.HTTPError as exc:
+        status_code = exc.code
+        response_request_id = (
+            exc.headers.get("X-Oneapi-Request-Id") if exc.headers else None
+        )
+        output = exc.read().decode("utf-8", "replace")
+        stream["first_byte_ms"] = int((time.monotonic() - started) * 1000)
+        stream["aborted"] = abort_after_bytes is not None
+    except (OSError, TimeoutError) as exc:
+        output = str(exc)
+        stream["aborted"] = abort_after_bytes is not None
+    return status_code, output, response_request_id, stream
+
+
+def _read_http_body(
+    response: object,
+    started: float,
+    abort_after_bytes: int | None,
+) -> tuple[str, dict[str, object]]:
+    first_byte_ms: int | None = None
+    chunks: list[bytes] = []
+    aborted = False
+    while True:
+        remaining = None
+        if abort_after_bytes is not None:
+            remaining = abort_after_bytes - sum(len(item) for item in chunks)
+            if remaining <= 0:
+                aborted = True
+                break
+        chunk = response.read(64 if remaining is None else min(64, remaining))
+        if not chunk:
+            break
+        if first_byte_ms is None:
+            first_byte_ms = int((time.monotonic() - started) * 1000)
+        chunks.append(chunk)
+        if (
+            abort_after_bytes is not None
+            and sum(len(item) for item in chunks) >= abort_after_bytes
+        ):
+            aborted = True
+            break
+    text = b"".join(chunks).decode("utf-8", "replace")
+    return text, {
+        "first_byte_ms": first_byte_ms,
+        "keepalive_count": (
+            text.count("event: ping")
+            + text.count("event: keepalive")
+            + text.count(": ping")
+            + text.count(": keepalive")
+        ),
+        "progress_event_count": (
+            text.count("event: content_block_delta")
+            + text.count("event: message_delta")
+            + text.count("event: thinking")
+            + text.count('"type": "thinking"')
+            + text.count('"type":"thinking"')
+        ),
+        "aborted": aborted,
+    }
+
+
+def _mcp_from_http_body(output: str) -> dict[str, object]:
+    try:
+        body = json.loads(output)
+    except json.JSONDecodeError:
+        return {}
+    mcp = body.get("mcp") if isinstance(body, dict) else None
+    return mcp if isinstance(mcp, dict) else {}
 
 
 def _render_http_payload(value: object, model: str, prompt: str) -> object:
@@ -381,7 +594,17 @@ def _http_response_text(protocol: str | None, output: str) -> str:
     try:
         body = json.loads(output)
     except json.JSONDecodeError:
-        return ""
+        fragments: list[str] = []
+        for line in output.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            fragment = _http_response_text(protocol, data)
+            if fragment:
+                fragments.append(fragment)
+        return "\n".join(fragments)
     values: list[str] = []
     if protocol == "messages":
         content = body.get("content", []) if isinstance(body, dict) else []
@@ -708,37 +931,53 @@ def finalize_batch_server_evidence(
         request_ids = result.evidence.pop("_response_request_ids", [])
 
         if cell.client.adapter == "raw-http":
-            matches = (
-                _matching_usage_logs(
+            exact_ids = (
+                [request_id]
+                if request_id
+                else [
+                    str(item).strip()
+                    for item in request_ids
+                    if isinstance(item, str) and str(item).strip()
+                ]
+            )
+            matches = [
+                log
+                for exact in exact_ids
+                for log in _matching_usage_logs(
                     cell,
                     final_logs[key],
                     0,
                     sessions[key]["fence"],
-                    request_id,
+                    exact,
                 )
-                if request_id
-                else []
-            )
+            ]
             used_request_ids[key].update(
                 str(item.get("request_id", "")) for item in matches
             )
             if result.status != "pass":
                 continue
-            if not request_id:
+            if not exact_ids:
                 _set_batch_evidence_failure(
                     result, "raw HTTP response did not expose X-Oneapi-Request-Id"
                 )
                 continue
-            if len(matches) != 1:
+            if len(matches) != len(exact_ids):
                 _set_batch_evidence_failure(
                     result,
                     "raw HTTP request id did not resolve to exactly one consume log",
                 )
                 continue
-            payload = _usage_log_payload(cell, matches[0], final_commits[key])
+            payloads = [
+                _usage_log_payload(cell, item, final_commits[key]) for item in matches
+            ]
+            payload = dict(payloads[0])
+            if len(payloads) > 1:
+                payload["requests"] = payloads
             result.evidence["server_evidence"] = payload
-            if payload.get("status") != "pass":
+            if any(item.get("status") != "pass" for item in payloads):
                 _set_batch_evidence_failure(result, str(payload.get("detail", "")))
+            else:
+                _apply_public_artifact_gate(cell, result)
             continue
 
         exact_request_ids = [
@@ -803,6 +1042,7 @@ def finalize_batch_server_evidence(
             payload["requests"] = final_payloads
         payload["provisional_count"] = len(payloads) - len(final_payloads)
         result.evidence["server_evidence"] = payload
+        _apply_public_artifact_gate(cell, result)
 
 
 def _batch_session_key(cell: MatrixCell) -> tuple[str, str]:
@@ -831,8 +1071,33 @@ def _fetch_token_logs(base_url: str, token: str) -> tuple[list[dict[str, object]
     return [item for item in logs if isinstance(item, dict)], commit
 
 
+def _apply_public_artifact_gate(cell: MatrixCell, result: CellResult) -> None:
+    evidence = result.evidence.get("server_evidence")
+    if not isinstance(evidence, dict):
+        return
+    stream = result.evidence.get("stream")
+    public = evaluate_public_artifacts(
+        cell,
+        http_status=result.evidence.get("http_status")
+        if isinstance(result.evidence.get("http_status"), int)
+        else None,
+        output="\n".join(item.output_tail for item in result.turns),
+        evidence=evidence,
+        stream=stream if isinstance(stream, dict) else None,
+        permission_mode=(
+            "default"
+            if "client.classifier" in cell.scenario.required_capabilities
+            else "bypassPermissions"
+        ),
+    )
+    if public.status != "pass":
+        result.status = "fail"
+        result.detail = public.detail
+
+
 def _set_batch_evidence_failure(result: CellResult, detail: str) -> None:
     result.evidence.pop("_response_request_id", None)
+    result.evidence.pop("_response_request_ids", None)
     result.evidence.pop("_server_window", None)
     result.evidence["server_evidence"] = {"status": "fail", "detail": detail}
     if result.status == "pass":
@@ -851,23 +1116,48 @@ def _usage_log_payload(
     receipt_state = (
         other.get("usage_receipt_state") if isinstance(other, dict) else None
     )
-    if isinstance(other, dict) and cell.route.channel_type == 64:
-        web_search_call_count = int(
-            other.get("cursor_agent_v1_hosted_search_call_count", 0) or 0
+    other_dict = other if isinstance(other, dict) else {}
+    citation_count = 0
+    progress_event_count = 0
+    if cell.route.channel_type == 64:
+        web_search_call_count, citation_count, progress_event_count = (
+            hosted_search_counts(other_dict)
         )
     else:
-        web_search_call_count = (
-            int(other.get("web_search_call_count", 0) or 0)
-            if isinstance(other, dict)
-            else 0
-        )
-    search_evidence_valid = (
-        web_search_call_count > 0 if cell.scenario.id == "native-web-search" else True
-    )
+        web_search_call_count = int(other_dict.get("web_search_call_count", 0) or 0)
+    search_evidence_valid = True
+    search_detail = "native web search has no observed search call"
+    if cell.scenario.id == "native-web-search":
+        if cell.route.channel_type == 64:
+            hosted = evaluate_hosted_search(
+                web_search_call_count=web_search_call_count,
+                citation_count=citation_count,
+                progress_event_count=progress_event_count,
+            )
+            search_evidence_valid = hosted.ok
+            search_detail = hosted.detail or search_detail
+        else:
+            search_evidence_valid = web_search_call_count > 0
     valid = bool(
         commit and receipt_id and receipt_state == "final" and search_evidence_valid
     )
-    return {
+    if cell.route.channel_type == 64:
+        usage: dict[str, object] = type64_usage_fields(
+            log,
+            other_dict,
+            web_search_call_count,
+            citation_count,
+            progress_event_count,
+        )
+    else:
+        usage = {
+            "prompt_tokens": int(log.get("prompt_tokens", 0) or 0),
+            "completion_tokens": int(log.get("completion_tokens", 0) or 0),
+            "quota": int(log.get("quota", 0) or 0),
+            "use_time": int(log.get("use_time", 0) or 0),
+            "web_search_call_count": web_search_call_count,
+        }
+    payload = {
         "status": "pass" if valid else "fail",
         "commit": commit,
         "route": {
@@ -877,30 +1167,34 @@ def _usage_log_payload(
         },
         "terminal": {
             "status": "completed" if int(log.get("type", 0) or 0) == 2 else "failed",
-            "request_id": str(log.get("request_id", "")),
+            "request_id_hash": correlate_id(str(log.get("request_id", ""))),
         },
         "receipt": {
-            "id": str(receipt_id or ""),
-            "provider": str(other.get("usage_receipt_provider", ""))
-            if isinstance(other, dict)
-            else "",
+            "id_hash": correlate_id(str(receipt_id or "")),
+            "provider": str(other_dict.get("usage_receipt_provider", "")),
             "state": str(receipt_state or ""),
         },
-        "usage": {
-            "prompt_tokens": int(log.get("prompt_tokens", 0) or 0),
-            "completion_tokens": int(log.get("completion_tokens", 0) or 0),
-            "quota": int(log.get("quota", 0) or 0),
-            "use_time": int(log.get("use_time", 0) or 0),
-            "web_search_call_count": web_search_call_count,
-        },
+        "usage": usage,
         "detail": ""
         if valid
         else (
-            "native web search has no observed search call"
+            search_detail
             if not search_evidence_valid
             else "usage receipt is missing or not final"
         ),
     }
+    if cell.route.channel_type == 64:
+        quality = evaluate_usage_quality(payload, channel_type=64)
+        if not quality.ok:
+            payload["status"] = "fail"
+            payload["detail"] = quality.detail
+        mcp_spans = other_dict.get("cursor_agent_v1_mcp_spans")
+        mcp_mode = other_dict.get("cursor_agent_v1_mcp_mode")
+        if mcp_spans or mcp_mode:
+            payload["mcp"] = {"mode": mcp_mode, "spans": mcp_spans or []}
+        if other_dict.get("cursor_agent_v1_classifier_invoked") is True:
+            payload["classifier"] = {"invoked": True}
+    return payload
 
 
 def _version(binary: str, cell: MatrixCell) -> str | None:
@@ -928,6 +1222,9 @@ def _result(
     detail: str,
     evidence: dict[str, object] | None = None,
 ) -> CellResult:
+    merged = dict(evidence or {})
+    for key, value in attach_completion_metadata(cell).items():
+        merged.setdefault(key, value)
     return CellResult(
         cell_id=cell.id,
         status=status,
@@ -938,6 +1235,6 @@ def _result(
         model_id=cell.model.id,
         scenario_id=cell.scenario.id,
         turns=turns,
-        evidence=evidence or {},
+        evidence=merged,
         detail=detail,
     )

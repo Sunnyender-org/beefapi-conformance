@@ -34,6 +34,13 @@ CURSOR_AGENT_V1_CAPABILITIES = [
     "chat",
     "messages.trailing_system",
     "client.trailing_system",
+    "cursor.agent_v1",
+    "stream.progress",
+    "mcp.serial",
+    "mcp.parallel",
+    "client.classifier",
+    "lifecycle.disconnect",
+    "lifecycle.restart",
 ]
 
 

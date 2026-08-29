@@ -517,9 +517,25 @@ class ContractTests(unittest.TestCase):
                 "cursor_agent_v1_hosted_search_call_count": 1,
             }
         )
+        count_only = _usage_log_payload(cell, log, "commit-sha")
+        self.assertEqual("fail", count_only["status"])
+        self.assertRegex(count_only["detail"], "progress|citation")
+
+        log["other"] = json.dumps(
+            {
+                "usage_receipt_id": "cursor-agent-v1:receipt",
+                "usage_receipt_provider": "cursor-agent-v1",
+                "usage_receipt_state": "final",
+                "cursor_agent_v1_hosted_search_call_count": 1,
+                "cursor_agent_v1_hosted_search_citation_count": 2,
+                "cursor_agent_v1_hosted_search_progress_events": 3,
+            }
+        )
         present = _usage_log_payload(cell, log, "commit-sha")
         self.assertEqual("pass", present["status"])
         self.assertEqual(1, present["usage"]["web_search_call_count"])
+        self.assertEqual(2, present["usage"]["citation_count"])
+        self.assertNotIn("cursor-agent-v1:receipt", json.dumps(present))
 
     def test_token_log_matching_rejects_empty_and_ambiguous_request_ids(self):
         cell = CommandTests().cell("codex")
@@ -889,15 +905,24 @@ class ContractTests(unittest.TestCase):
         ):
             sessions = prepare_batch_server_evidence([first, second])
             finalize_batch_server_evidence([first, second], results, sessions)
+        from beefapi_conformance.cursor_agent_v1 import correlate_id
+
         first_ids = {
-            item["terminal"]["request_id"]
+            item["terminal"]["request_id_hash"]
             for item in results[0].evidence["server_evidence"]["requests"]
         }
-        second_id = results[1].evidence["server_evidence"]["terminal"]["request_id"]
-        self.assertEqual({"first-tool", "first-followup"}, first_ids)
+        second_id = results[1].evidence["server_evidence"]["terminal"][
+            "request_id_hash"
+        ]
+        self.assertEqual(
+            {correlate_id("first-tool"), correlate_id("first-followup")}, first_ids
+        )
         self.assertEqual(1, results[0].evidence["server_evidence"]["provisional_count"])
-        self.assertEqual("second-only", second_id)
+        self.assertEqual(correlate_id("second-only"), second_id)
         self.assertNotIn(second_id, first_ids)
+        self.assertNotIn(
+            "first-tool", json.dumps(results[0].evidence["server_evidence"])
+        )
 
 
 class CommandTests(unittest.TestCase):

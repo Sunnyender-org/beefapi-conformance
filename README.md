@@ -108,7 +108,8 @@ and normalized trajectories. See [architecture](docs/architecture.md).
 See [matrix contract](docs/matrix-contract.md) and
 [adding a client](docs/adding-a-client.md). Production inventory, exact-channel
 pinning, scheduled CI, and receipt evidence are documented in
-[production conformance](docs/production.md).
+[production conformance](docs/production.md). Cursor Agent v1 type64 completion
+gates are in [cursor-agent-v1-completion.md](docs/cursor-agent-v1-completion.md).
 
 ## License
 

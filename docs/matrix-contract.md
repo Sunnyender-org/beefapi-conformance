@@ -47,6 +47,12 @@ passes. Capability-incompatible cells are excluded from the plan. An advertised
 capability that should exist must therefore be corrected in the manifests rather
 than hidden as unsupported.
 
+Cursor Agent v1 (channel type 64) adds a completion inventory with critical and
+major weights. Ordinary missing binaries remain skip. A required release or
+nightly cell for a critical advertised type64 capability cannot stay skip: that
+cell fails, and classification cannot be `passed` if any such capability was
+skipped or never executed. See [Cursor Agent v1 completion](cursor-agent-v1-completion.md).
+
 ## Required release evidence
 
 For a route to be declared user-ready, the release report must include:
@@ -65,3 +71,8 @@ closed when a route marked `release_evidence_required` has no valid collector.
 
 HTTP success, a local unit test, push, deployment, or one clean text turn cannot
 substitute for this set.
+
+Type64 usage evidence must distinguish `observed_usage` from `billing_estimate`.
+Input and cache tokens are unobservable on that route: they are `unknown` or
+`estimated`, never a measured zero. Report artifacts persist only hashed
+request/receipt correlation ids, not raw identifiers.

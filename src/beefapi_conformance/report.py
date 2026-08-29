@@ -6,20 +6,43 @@ from datetime import UTC, datetime
 from pathlib import Path
 from xml.etree import ElementTree
 
-from .model import CellResult
+from .cursor_agent_v1 import (
+    apply_completion_gates,
+    missing_critical_executions,
+    sanitize_report_value,
+)
+from .model import CellResult, MatrixCell
 
 
-def build_report(results: list[CellResult]) -> dict[str, object]:
+def build_report(
+    results: list[CellResult],
+    *,
+    tier: str | None = None,
+    planned_cells: list[MatrixCell] | None = None,
+) -> dict[str, object]:
+    gated = apply_completion_gates(results, tier=tier)
+    unexecuted = (
+        missing_critical_executions(planned_cells, gated)
+        if planned_cells is not None
+        else []
+    )
+    classification = classify(gated)
+    if unexecuted:
+        classification = "failed"
     counts = {
-        status: sum(1 for item in results if item.status == status)
+        status: sum(1 for item in gated if item.status == status)
         for status in ("pass", "fail", "skip")
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(UTC).isoformat(),
-        "classification": classify(results),
-        "summary": {"total": len(results), **counts},
-        "results": [asdict(item) for item in results],
+        "classification": classification,
+        "summary": {"total": len(gated), **counts},
+        "gates": {
+            "unexecuted_critical": unexecuted,
+            "critical_skip_fails_release": True,
+        },
+        "results": [sanitize_report_value(asdict(item)) for item in gated],
     }
 
 

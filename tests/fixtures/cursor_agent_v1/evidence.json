@@ -1,0 +1,38 @@
+{
+  "usage_false_green_measured_zero": {
+    "status": "pass",
+    "commit": "commit-sha",
+    "route": {"id": "cursor-agent-v1-channel-301", "channel_id": 301, "group": "cursor-agent-v1-acceptance"},
+    "terminal": {"status": "completed", "request_id": "req-raw-false-green"},
+    "receipt": {"id": "cursor-agent-v1:receipt-false-green", "provider": "cursor-agent-v1", "state": "final"},
+    "usage": {"prompt_tokens": 0, "completion_tokens": 0, "quota": 0, "use_time": 0, "web_search_call_count": 0}
+  },
+  "usage_valid_unknown_and_estimate": {
+    "status": "pass",
+    "commit": "commit-sha",
+    "route": {"id": "cursor-agent-v1-channel-301", "channel_id": 301, "group": "cursor-agent-v1-acceptance"},
+    "terminal": {"status": "completed", "request_id_hash": "sha256:placeholder"},
+    "receipt": {"id_hash": "sha256:placeholder", "provider": "cursor-agent-v1", "state": "final"},
+    "usage": {
+      "observed_usage": {
+        "prompt_tokens": {"value": null, "quality": "unknown"},
+        "cache_tokens": {"value": null, "quality": "unknown"},
+        "completion_tokens": {"value": null, "quality": "unknown"}
+      },
+      "billing_estimate": {
+        "prompt_tokens": {"value": 0, "quality": "estimated"},
+        "cache_tokens": {"value": 0, "quality": "estimated"},
+        "completion_tokens": {"value": 0, "quality": "estimated"}
+      }
+    }
+  },
+  "retry_false_green": [
+    {"offset_seconds": 0, "http_status": 200, "request_hash": "abc"},
+    {"offset_seconds": 23, "http_status": 409, "request_hash": "abc"}
+  ],
+  "retry_valid": [
+    {"offset_seconds": 0, "http_status": 200, "request_hash": "abc"},
+    {"offset_seconds": 23, "http_status": 200, "request_hash": "abc"},
+    {"offset_seconds": 180, "http_status": 200, "request_hash": "abc"}
+  ]
+}

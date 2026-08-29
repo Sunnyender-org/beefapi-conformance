@@ -160,6 +160,11 @@ class ClientCommand:
         model = self.cell.model.client_model(self.cell.client.id)
         workspace = str(self.root / "workspace")
         if adapter == "claude-code":
+            permission_mode = (
+                "default"
+                if "client.classifier" in self.cell.scenario.required_capabilities
+                else "bypassPermissions"
+            )
             args = [
                 self.binary,
                 "--print",
@@ -169,7 +174,7 @@ class ClientCommand:
                 "--model",
                 model,
                 "--permission-mode",
-                "bypassPermissions",
+                permission_mode,
             ]
             args += (
                 ["--session-id", self.session_id]

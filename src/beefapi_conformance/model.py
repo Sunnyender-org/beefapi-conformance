@@ -238,6 +238,9 @@ class Scenario:
     turns: tuple[Turn, ...]
     http_endpoint: str | None = None
     http_payload: dict[str, Any] | None = None
+    retry_offsets_seconds: tuple[int, ...] = ()
+    mcp_mode: str | None = None
+    evidence_requirements: frozenset[str] = frozenset()
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Scenario:
@@ -264,6 +267,23 @@ class Scenario:
             )
         if http_payload is not None:
             _validate_http_payload_credentials(http_payload)
+        offsets = raw.get("retry_offsets_seconds", [])
+        if offsets and (
+            not isinstance(offsets, list)
+            or not all(isinstance(item, int) and item >= 0 for item in offsets)
+        ):
+            raise ContractError(
+                "scenario.retry_offsets_seconds must be an array of integers"
+            )
+        mcp_mode = raw.get("mcp_mode")
+        if mcp_mode is not None and mcp_mode not in {"serial", "parallel"}:
+            raise ContractError(f"scenario.mcp_mode invalid: {mcp_mode}")
+        requirements = raw.get("evidence_requirements", [])
+        if requirements and (
+            not isinstance(requirements, list)
+            or not all(isinstance(item, str) and item for item in requirements)
+        ):
+            raise ContractError("scenario.evidence_requirements must be a string array")
         return cls(
             id=_required(raw, "id"),
             name=_required(raw, "name"),
@@ -280,6 +300,9 @@ class Scenario:
             turns=tuple(Turn.parse(item) for item in turns_raw),
             http_endpoint=endpoint,
             http_payload=http_payload,
+            retry_offsets_seconds=tuple(offsets or ()),
+            mcp_mode=mcp_mode,
+            evidence_requirements=frozenset(requirements or ()),
         )
 
 

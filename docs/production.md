@@ -37,9 +37,9 @@ evidence requires:
 
 - current `X-New-Api-Commit`;
 - expected channel id and group;
-- completed terminal request id;
-- final usage receipt;
-- prompt/completion/quota/use-time values.
+- completed terminal request correlation (`request_id_hash`);
+- final usage receipt correlation (`id_hash`);
+- usage quality: type64 `observed_usage` versus `billing_estimate`.
 
 This prevents a recent earlier request from satisfying a new cell.
 Raw HTTP cells additionally bind the response `X-Oneapi-Request-Id` exactly.

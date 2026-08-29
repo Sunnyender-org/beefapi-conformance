@@ -31,6 +31,8 @@ CLASSIFIER_MARKERS = (
     "auto-mode",
 )
 AGENT_V1_PUBLIC_ID = re.compile(r"resp_bf_agentv1_u[0-9]+_c[0-9]+_[A-Za-z0-9]+")
+TOOL_USE_LITERAL = re.compile(r"toolu_[A-Za-z0-9_]+")
+RECEIPT_LITERAL = re.compile(r"cursor-agent-v1:[A-Za-z0-9:_-]+")
 RAW_ID_KEYS = frozenset(
     {
         "request_id",
@@ -96,7 +98,16 @@ def correlate_id(value: str) -> str:
 def redact_correlation_ids(text: str) -> str:
     if not text:
         return text
-    return AGENT_V1_PUBLIC_ID.sub(lambda match: correlate_id(match.group(0)), text)
+    result = AGENT_V1_PUBLIC_ID.sub(lambda match: correlate_id(match.group(0)), text)
+    result = TOOL_USE_LITERAL.sub(lambda match: correlate_id(match.group(0)), result)
+    return RECEIPT_LITERAL.sub(lambda match: correlate_id(match.group(0)), result)
+
+
+def redact_known_ids(text: str, raw_ids: Iterable[str]) -> str:
+    result = redact_correlation_ids(text)
+    for raw in sorted({item for item in raw_ids if item}, key=len, reverse=True):
+        result = result.replace(raw, correlate_id(raw))
+    return result
 
 
 def sanitize_report_value(
@@ -115,6 +126,7 @@ def sanitize_report_value(
         return {
             inner_key: sanitize_report_value(inner, inner_key, parent=key)
             for inner_key, inner in value.items()
+            if not str(inner_key).startswith("_")
         }
     return value
 
@@ -451,7 +463,7 @@ def evaluate_idempotent_retries(attempts: list[dict[str, Any]]) -> Evaluation:
         if item.get("stage") in {"b", "c"} or item.get("offset_seconds")
     ]
     if any(item.get("stage") in {"b", "c"} for item in attempts):
-        return evaluate_replay_identity(attempts)
+        return evaluate_replay_identity(attempts, require_receipts=False)
     if len(replay) < 2:
         if len(attempts) < 2:
             return Evaluation(

@@ -22,6 +22,7 @@ from .cursor_agent_v1 import (
     evaluate_usage_quality,
     hosted_search_counts,
     redact_correlation_ids,
+    redact_known_ids,
     type64_usage_fields,
 )
 from .model import CellResult, MatrixCell, TurnResult
@@ -32,6 +33,7 @@ from .tool_replay import (
     execute_tool_replay,
     parse_assistant_text,
     parse_json_objects,
+    sleep_deltas,
 )
 
 SERVER_EVIDENCE_FIELDS = {"status", "commit", "route", "terminal", "receipt", "usage"}
@@ -356,8 +358,12 @@ def _run_http_cell(
             }
         )
         if cell.scenario.retry_offsets_seconds and require_server_evidence:
-            for offset in cell.scenario.retry_offsets_seconds:
-                time.sleep(offset)
+            for offset, delta in zip(
+                cell.scenario.retry_offsets_seconds,
+                sleep_deltas(cell.scenario.retry_offsets_seconds),
+                strict=True,
+            ):
+                time.sleep(delta)
                 retry_status, retry_output, retry_id, retry_stream = _http_exchange(
                     url, payload, headers, cell.scenario.timeout_seconds
                 )
@@ -540,48 +546,46 @@ def _run_tool_replay_http_cell(
         elif not mcp_eval.ok:
             status = "fail"
             detail = mcp_eval.detail
-    request_ids = [
-        str(item.get("http_request_id_hash") or "")
+    raw_request_ids = [
+        str(item.get("_http_request_id") or "")
         for item in replay.attempts
-        if item.get("http_request_id_hash")
+        if item.get("_http_request_id")
     ]
-    server_evidence: dict[str, object] = (
-        {"status": "deferred"}
-        if defer_server_evidence
-        else _server_evidence(
+    known_ids = [
+        *raw_request_ids,
+        *(item.id for item in replay.tool_uses),
+    ]
+    sanitized = redact_known_ids(sanitized, known_ids)
+    server_evidence: dict[str, object]
+    if defer_server_evidence:
+        server_evidence = {"status": "deferred"}
+    elif cell.route.evidence_provider == "beefapi_token_log":
+        server_evidence = _bind_replay_server_evidence(
+            cell,
+            replay.attempts,
+            base_token,
+            started_epoch,
+            evidence_fence,
+        )
+        if offsets:
+            identity = evaluate_replay_identity(
+                replay.attempts, require_receipts=require_server_evidence
+            )
+        elif require_server_evidence:
+            identity = _evaluate_single_stage_receipts(replay.attempts)
+        else:
+            identity = None
+        if identity is not None and not identity.ok and status == "pass":
+            status = "fail"
+            detail = identity.detail
+    else:
+        server_evidence = _server_evidence(
             cell,
             base_token,
             started_epoch,
             evidence_fence,
-            None,
+            raw_request_ids[-1] if len(raw_request_ids) == 1 else None,
         )
-    )
-    if isinstance(server_evidence, dict) and server_evidence.get("status") == "pass":
-        receipt_hash = ""
-        receipt = server_evidence.get("receipt")
-        if isinstance(receipt, dict):
-            receipt_hash = str(receipt.get("id_hash") or "")
-        consume = 1
-        extra = server_evidence.get("requests")
-        if isinstance(extra, list):
-            consume = len(
-                {
-                    str((item.get("receipt") or {}).get("id_hash") or "")
-                    for item in extra
-                    if isinstance(item, dict)
-                }
-            )
-        for attempt in replay.attempts:
-            if attempt.get("stage") in {"b", "c"}:
-                attempt["receipt_hash"] = receipt_hash
-                attempt["consume_log_count"] = (
-                    consume if attempt.get("stage") == "c" else 1
-                )
-        if offsets:
-            identity = evaluate_replay_identity(replay.attempts)
-            if not identity.ok:
-                status = "fail"
-                detail = identity.detail
     public_evidence: dict[str, object] = (
         dict(server_evidence) if isinstance(server_evidence, dict) else {}
     )
@@ -609,11 +613,14 @@ def _run_tool_replay_http_cell(
     if public_mcp:
         evidence["mcp"] = public_mcp
     if defer_server_evidence:
-        evidence["_response_request_ids"] = request_ids
+        evidence["_response_request_ids"] = raw_request_ids
+        evidence["_replay_attempts"] = replay.attempts
         evidence["_server_window"] = {
             "started_epoch": started_epoch,
             "finished_epoch": int(time.time()),
         }
+    else:
+        _scrub_private_replay_fields(evidence, replay.attempts)
     if (
         require_server_evidence
         and not defer_server_evidence
@@ -642,6 +649,105 @@ def _run_tool_replay_http_cell(
         detail,
         evidence,
     )
+
+
+def bind_replay_attempt_receipts(
+    cell: MatrixCell,
+    attempts: list[dict[str, object]],
+    logs: object,
+    commit: str,
+    started_epoch: int = 0,
+    fence: set[str] | None = None,
+) -> None:
+    """Attach per-attempt receipts from exact request-id log matches.
+
+    Does not copy one receipt onto every retry. Stage B/C each resolve independently.
+    """
+    for attempt in attempts:
+        if not isinstance(attempt, dict) or attempt.get("stage") not in {"b", "c"}:
+            continue
+        raw_id = str(attempt.get("_http_request_id") or "")
+        if not raw_id:
+            attempt["consume_match_count"] = 0
+            attempt["receipt_hash"] = ""
+            continue
+        matches = _matching_usage_logs(cell, logs, started_epoch, fence, raw_id)
+        attempt["consume_match_count"] = len(matches)
+        if len(matches) != 1:
+            attempt["receipt_hash"] = ""
+            continue
+        payload = _usage_log_payload(cell, matches[0], commit)
+        receipt = (
+            payload.get("receipt") if isinstance(payload.get("receipt"), dict) else {}
+        )
+        if payload.get("status") != "pass":
+            attempt["receipt_hash"] = ""
+            attempt["receipt_state"] = str(receipt.get("state") or "")
+            continue
+        attempt["receipt_hash"] = str(receipt.get("id_hash") or "")
+        attempt["receipt_state"] = str(receipt.get("state") or "")
+        attempt["_bound_payload"] = payload
+
+
+def _bind_replay_server_evidence(
+    cell: MatrixCell,
+    attempts: list[dict[str, object]],
+    token: str | None,
+    started_epoch: int,
+    fence: set[str] | None,
+) -> dict[str, object]:
+    if not token or not cell.route.base_url:
+        return {
+            "status": "fail",
+            "detail": "token-log evidence lacks token or base URL",
+        }
+    if fence is None:
+        return {"status": "fail", "detail": "pre-call token-log fence was unavailable"}
+    last_detail = "matching usage log not found"
+    for attempt in range(8):
+        try:
+            logs, commit = _fetch_token_logs(cell.route.base_url.rstrip("/"), token)
+            bind_replay_attempt_receipts(
+                cell, attempts, logs, commit, started_epoch, fence
+            )
+            bound = [
+                item.get("_bound_payload")
+                for item in attempts
+                if isinstance(item, dict)
+                and item.get("stage") in {"b", "c"}
+                and isinstance(item.get("_bound_payload"), dict)
+            ]
+            if bound:
+                payload = dict(bound[0])
+                if len(bound) > 1:
+                    payload["requests"] = bound
+                return payload
+            last_detail = "stage B/C request ids did not resolve to final receipts"
+        except (
+            OSError,
+            TimeoutError,
+            json.JSONDecodeError,
+            RuntimeError,
+            TypeError,
+        ) as exc:
+            last_detail = redact(str(exc), (token,))
+        if attempt < 7:
+            time.sleep(1)
+    return {"status": "fail", "detail": last_detail}
+
+
+def _scrub_private_replay_fields(
+    evidence: dict[str, object],
+    attempts: list[dict[str, object]] | None = None,
+) -> None:
+    evidence.pop("_response_request_id", None)
+    evidence.pop("_response_request_ids", None)
+    evidence.pop("_server_window", None)
+    evidence.pop("_replay_attempts", None)
+    for attempt in attempts or []:
+        if isinstance(attempt, dict):
+            attempt.pop("_http_request_id", None)
+            attempt.pop("_bound_payload", None)
 
 
 def _http_headers(protocol: str | None, token: str | None) -> dict[str, str]:
@@ -998,7 +1104,7 @@ def _matching_usage_logs(
             continue
         if cell.route.group and str(log.get("group", "")) != cell.route.group:
             continue
-        if request_id in seen_request_ids:
+        if request_id in seen_request_ids and expected_request_id is None:
             continue
         seen_request_ids.add(request_id)
         matches.append(log)
@@ -1125,6 +1231,19 @@ def finalize_batch_server_evidence(
         finished_epoch = int(window.get("finished_epoch", 0) or 0)
         request_id = str(result.evidence.pop("_response_request_id", "") or "")
         request_ids = result.evidence.pop("_response_request_ids", [])
+
+        if cell.client.adapter == "raw-http" and cell.scenario.tool_replay:
+            _finalize_replay_batch_evidence(
+                cell,
+                result,
+                final_logs[key],
+                final_commits[key],
+                sessions[key]["fence"],
+                used_request_ids[key],
+                request_id,
+                request_ids,
+            )
+            continue
 
         if cell.client.adapter == "raw-http":
             exact_ids = (
@@ -1267,19 +1386,99 @@ def _fetch_token_logs(base_url: str, token: str) -> tuple[list[dict[str, object]
     return [item for item in logs if isinstance(item, dict)], commit
 
 
-def _apply_public_artifact_gate(cell: MatrixCell, result: CellResult) -> None:
+def _finalize_replay_batch_evidence(
+    cell: MatrixCell,
+    result: CellResult,
+    logs: list[dict[str, object]],
+    commit: str,
+    fence: object,
+    used_request_ids: set[str],
+    request_id: str,
+    request_ids: object,
+) -> None:
+    exact_ids = (
+        [request_id]
+        if request_id
+        else [
+            str(item).strip()
+            for item in (request_ids or [])
+            if isinstance(item, str) and str(item).strip()
+        ]
+    )
+    attempts = result.evidence.get("_replay_attempts")
+    typed_attempts = (
+        [item for item in attempts if isinstance(item, dict)]
+        if isinstance(attempts, list)
+        else []
+    )
+    typed_fence = fence if isinstance(fence, set) else set()
+    bind_replay_attempt_receipts(cell, typed_attempts, logs, commit, 0, typed_fence)
+    used_request_ids.update(exact_ids)
+    if result.status == "pass":
+        if not exact_ids:
+            _set_batch_evidence_failure(
+                result, "raw HTTP response did not expose X-Oneapi-Request-Id"
+            )
+        else:
+            identity = (
+                evaluate_replay_identity(typed_attempts, require_receipts=True)
+                if cell.scenario.retry_offsets_seconds
+                else _evaluate_single_stage_receipts(typed_attempts)
+            )
+            if identity is not None and not identity.ok:
+                _set_batch_evidence_failure(result, identity.detail)
+            else:
+                bound = [
+                    item.get("_bound_payload")
+                    for item in typed_attempts
+                    if item.get("stage") in {"b", "c"}
+                    and isinstance(item.get("_bound_payload"), dict)
+                ]
+                if bound:
+                    payload = dict(bound[0])
+                    if len(bound) > 1:
+                        payload["requests"] = bound
+                    result.evidence["server_evidence"] = payload
+                _apply_public_artifact_gate(cell, result, typed_attempts)
+    _scrub_private_replay_fields(result.evidence, typed_attempts)
+
+
+def _evaluate_single_stage_receipts(attempts: list[dict[str, object]]):
+    from .cursor_agent_v1 import Evaluation
+
+    for item in attempts:
+        if item.get("stage") != "b":
+            continue
+        if item.get("consume_match_count") != 1 or not item.get("receipt_hash"):
+            return Evaluation(
+                "fail",
+                "stage B request id did not resolve to exactly one final receipt",
+            )
+    return Evaluation("pass")
+
+
+def _apply_public_artifact_gate(
+    cell: MatrixCell,
+    result: CellResult,
+    attempts: list[dict[str, object]] | None = None,
+) -> None:
     evidence = result.evidence.get("server_evidence")
     if not isinstance(evidence, dict):
         return
     stream = result.evidence.get("stream")
+    merged = dict(evidence)
+    replay_meta = result.evidence.get("tool_replay")
+    if isinstance(replay_meta, dict):
+        merged["tool_replay"] = replay_meta
     public = evaluate_public_artifacts(
         cell,
         http_status=result.evidence.get("http_status")
         if isinstance(result.evidence.get("http_status"), int)
         else None,
         output="\n".join(item.output_tail for item in result.turns),
-        evidence=evidence,
+        evidence=merged,
         stream=stream if isinstance(stream, dict) else None,
+        attempts=attempts,
         permission_mode=(
             "default"
             if "client.classifier" in cell.scenario.required_capabilities
@@ -1294,6 +1493,7 @@ def _apply_public_artifact_gate(cell: MatrixCell, result: CellResult) -> None:
 def _set_batch_evidence_failure(result: CellResult, detail: str) -> None:
     result.evidence.pop("_response_request_id", None)
     result.evidence.pop("_response_request_ids", None)
+    result.evidence.pop("_replay_attempts", None)
     result.evidence.pop("_server_window", None)
     result.evidence["server_evidence"] = {"status": "fail", "detail": detail}
     if result.status == "pass":

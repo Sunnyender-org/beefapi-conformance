@@ -121,8 +121,7 @@
       "evidence_requirements": ["http.not_4xx", "tool_replay.parked_batch"],
       "tool_replay": {
         "mode": "covering",
-        "min_tool_uses": 2,
-        "allow_historical_extras": true
+        "min_tool_uses": 2
       },
       "turns": [
         {

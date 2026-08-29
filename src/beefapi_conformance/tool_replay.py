@@ -15,7 +15,7 @@ from typing import Any
 
 from .cursor_agent_v1 import Evaluation, correlate_id
 
-STATIC_TOOL_USE_ID = re.compile(r"^toolu_conformance_")
+STATIC_TOOL_USE_ID = re.compile(r"^toolu_(conformance_|historical_routed_)")
 CANARY_TOOL_NAME = "beefapi_conformance_canary"
 CANARY_TOOL_B_NAME = "beefapi_conformance_canary_b"
 MCP_ALPHA = "beefapi_mcp_alpha"
@@ -217,22 +217,9 @@ def tool_results_for_uses(
     return results
 
 
-def covering_tool_results(
-    uses: list[ToolUse], *, marker: str, allow_historical_extras: bool = False
-) -> list[dict[str, Any]]:
-    if not uses:
-        return []
-    results = tool_results_for_uses(uses, marker=marker)
-    if allow_historical_extras:
-        suffix = correlate_id(uses[0].id).split(":", 1)[-1][:8]
-        results.append(
-            {
-                "type": "tool_result",
-                "tool_use_id": f"toolu_historical_routed_{suffix}",
-                "content": "historical-routed-extra",
-            }
-        )
-    return results
+def covering_tool_results(uses: list[ToolUse], *, marker: str) -> list[dict[str, Any]]:
+    """Covering-set tool_result blocks for ids returned by the parked Run."""
+    return tool_results_for_uses(uses, marker=marker)
 
 
 def stage_b_payload(
@@ -245,11 +232,7 @@ def stage_b_payload(
 ) -> dict[str, Any]:
     mode = str(spec.get("mode") or "")
     if mode == "covering":
-        results = covering_tool_results(
-            uses,
-            marker=marker,
-            allow_historical_extras=bool(spec.get("allow_historical_extras")),
-        )
+        results = covering_tool_results(uses, marker=marker)
     else:
         results = tool_results_for_uses(uses, marker=marker)
     user_content: list[dict[str, Any]] = list(results)
@@ -300,7 +283,20 @@ def evaluate_live_tool_ids(uses: list[ToolUse]) -> Evaluation:
     return Evaluation("pass")
 
 
-def evaluate_replay_identity(attempts: list[dict[str, Any]]) -> Evaluation:
+def sleep_deltas(offsets: tuple[int, ...], *, origin: int = 0) -> list[int]:
+    """Convert absolute elapsed offsets into successive sleep deltas."""
+    previous = origin
+    deltas: list[int] = []
+    for offset in offsets:
+        value = int(offset)
+        deltas.append(max(0, value - previous))
+        previous = max(previous, value)
+    return deltas
+
+
+def evaluate_replay_identity(
+    attempts: list[dict[str, Any]], *, require_receipts: bool = False
+) -> Evaluation:
     replay = [
         item
         for item in attempts
@@ -323,16 +319,6 @@ def evaluate_replay_identity(attempts: list[dict[str, Any]]) -> Evaluation:
                 f"completed tool_result retry at +{item.get('offset_seconds')}s "
                 f"was not idempotent HTTP {status}",
             )
-    receipts = [
-        str(item.get("receipt_hash") or "")
-        for item in replay
-        if item.get("receipt_hash")
-    ]
-    if receipts and len(set(receipts)) != 1:
-        return Evaluation(
-            "fail",
-            "billing receipt identity drifted across replay; HTTP request ids are not receipts",
-        )
     terminals = {
         str(item.get("terminal_hash") or "")
         for item in replay
@@ -340,15 +326,33 @@ def evaluate_replay_identity(attempts: list[dict[str, Any]]) -> Evaluation:
     }
     if terminals and len(terminals) != 1:
         return Evaluation("fail", "terminal semantics drifted across replay")
-    consume = [
-        int(item.get("consume_log_count") or 0)
-        for item in replay
-        if item.get("consume_log_count") is not None
-    ]
-    if consume and max(consume) > 1:
+    receipts = [str(item.get("receipt_hash") or "") for item in replay]
+    present = [item for item in receipts if item]
+    if require_receipts:
+        for item in replay:
+            stage = item.get("stage")
+            offset = item.get("offset_seconds")
+            matches = item.get("consume_match_count")
+            if matches is not None and matches != 1:
+                return Evaluation(
+                    "fail",
+                    f"stage {stage} at +{offset}s request id did not resolve to "
+                    "exactly one consume log",
+                )
+            if not item.get("receipt_hash"):
+                return Evaluation(
+                    "fail",
+                    f"stage {stage} at +{offset}s lacks a final usage receipt",
+                )
+        if len(set(present)) != 1:
+            return Evaluation(
+                "fail",
+                "billing receipt identity drifted across replay; HTTP request ids are not receipts",
+            )
+    elif present and len(set(present)) != 1:
         return Evaluation(
             "fail",
-            "stage C replay created additional consume logs; expected one billing receipt",
+            "billing receipt identity drifted across replay; HTTP request ids are not receipts",
         )
     return Evaluation("pass")
 
@@ -487,14 +491,14 @@ def execute_tool_replay(
     stream = stream_b
     if offsets:
         pause = sleeper or _default_sleep
-        for offset in offsets:
-            pause(offset)
+        for offset, delta in zip(offsets, sleep_deltas(offsets), strict=True):
+            pause(delta)
             status_c, output_c, req_c, stream_c = exchange(stage_b)
             attempts.append(_attempt("c", offset, stage_b, status_c, output_c, req_c))
             last_status = status_c
             last_output = output_c
             stream = stream_c
-        replay = evaluate_replay_identity(attempts)
+        replay = evaluate_replay_identity(attempts, require_receipts=False)
         if not replay.ok:
             return ReplayResult(
                 status="fail",
@@ -551,7 +555,9 @@ def _attempt(
         "http_status": status,
         "request_hash": payload_hash(payload),
         "http_request_id_hash": correlate_id(request_id or ""),
+        "_http_request_id": request_id or "",
         "receipt_hash": "",
+        "consume_match_count": None,
         "terminal_hash": correlate_id(json.dumps(semantics, sort_keys=True)),
         "stop_reason": semantics["stop_reason"],
         "aborted": False,

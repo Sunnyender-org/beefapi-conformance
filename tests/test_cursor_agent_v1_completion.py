@@ -8,6 +8,7 @@ import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
 from beefapi_conformance.clients import ClientCommand
 from beefapi_conformance.cursor_agent_v1 import (
@@ -37,17 +38,26 @@ from beefapi_conformance.model import (
     MatrixCell,
     Scenario,
     Turn,
+    TurnResult,
 )
 from beefapi_conformance.report import build_report
-from beefapi_conformance.runner import _usage_log_payload, run_cell
+from beefapi_conformance.runner import (
+    _usage_log_payload,
+    bind_replay_attempt_receipts,
+    finalize_batch_server_evidence,
+    prepare_batch_server_evidence,
+    run_cell,
+)
 from beefapi_conformance.tool_replay import (
     ToolUse,
     covering_tool_results,
     evaluate_live_tool_ids,
     evaluate_mcp_spans,
+    evaluate_replay_identity,
     execute_tool_replay,
     parse_assistant_message,
     parse_tool_uses,
+    sleep_deltas,
     stage_a_payload,
     stage_b_payload,
 )
@@ -273,9 +283,11 @@ class CatalogAndToolResultTests(unittest.TestCase):
         )
         self.assertEqual("pass", result.status, result.detail)
         self.assertEqual(2, len(result.evidence["tool_replay"]["tool_use_id_hashes"]))
-        dumped = json.dumps(result.evidence)
+        dumped = json.dumps(build_report([result], tier="pr"))
         self.assertNotIn("toolu_01ParkedA", dumped)
         self.assertNotIn("toolu_01ParkedB", dumped)
+        self.assertNotIn("_http_request_id", dumped)
+        self.assertNotIn("_response_request_ids", dumped)
 
     def test_covering_set_without_a_real_batch_is_blocked(self):
         result = self._run_parked_http(
@@ -503,10 +515,8 @@ class ToolReplayDriverTests(unittest.TestCase):
         self.assertEqual("toolu_01LiveParked", result_block["tool_use_id"])
         self.assertEqual("BEEFAPI_CURSOR_V1_RETRY_23S_OK", result_block["content"])
 
-    def test_covering_historical_extras_require_a_real_parked_batch(self):
-        self.assertEqual(
-            [], covering_tool_results([], marker="X", allow_historical_extras=True)
-        )
+    def test_covering_set_uses_only_parked_run_ids(self):
+        self.assertEqual([], covering_tool_results([], marker="X"))
         uses = [
             ToolUse(
                 id="toolu_01ParkedA",
@@ -521,11 +531,26 @@ class ToolReplayDriverTests(unittest.TestCase):
                 raw={},
             ),
         ]
-        results = covering_tool_results(uses, marker="OK", allow_historical_extras=True)
-        self.assertEqual(3, len(results))
-        self.assertEqual("toolu_01ParkedA", results[0]["tool_use_id"])
-        self.assertTrue(
-            results[2]["tool_use_id"].startswith("toolu_historical_routed_")
+        results = covering_tool_results(uses, marker="OK")
+        self.assertEqual(
+            ["toolu_01ParkedA", "toolu_01ParkedB"],
+            [item["tool_use_id"] for item in results],
+        )
+        self.assertFalse(
+            any("historical_routed" in item["tool_use_id"] for item in results)
+        )
+        self.assertEqual(
+            "fail",
+            evaluate_live_tool_ids(
+                [
+                    ToolUse(
+                        id="toolu_historical_routed_deadbeef",
+                        name="beefapi_conformance_canary",
+                        input={},
+                        raw={},
+                    )
+                ]
+            ).status,
         )
 
     def test_mcp_spans_must_correlate_to_returned_tool_ids(self):
@@ -553,7 +578,9 @@ class ToolReplayDriverTests(unittest.TestCase):
             ).status,
         )
 
-    def test_stage_c_replay_keeps_receipt_when_http_ids_differ(self):
+    def test_absolute_offsets_sleep_deltas_not_the_raw_offsets(self):
+        self.assertEqual([23, 157], sleep_deltas((23, 180)))
+        slept: list[float] = []
         calls: list[dict] = []
 
         def exchange(payload: dict):
@@ -592,15 +619,24 @@ class ToolReplayDriverTests(unittest.TestCase):
             marker="BEEFAPI_CURSOR_V1_RETRY_23S_OK",
             offsets=(23, 180),
             exchange=exchange,
-            sleeper=lambda _seconds: None,
+            sleeper=slept.append,
         )
         self.assertEqual("pass", result.status, result.detail)
+        self.assertEqual([23, 157], slept)
+        self.assertEqual(
+            [0, 0, 23, 180],
+            [item["offset_seconds"] for item in result.attempts],
+        )
+        self.assertEqual(
+            ["a", "b", "c", "c"], [item["stage"] for item in result.attempts]
+        )
         self.assertEqual(4, len(calls))
         self.assertEqual(calls[1], calls[2])
         self.assertEqual(calls[1], calls[3])
         http_ids = [item["http_request_id_hash"] for item in result.attempts]
         self.assertEqual(len(http_ids), len(set(http_ids)))
         self.assertNotIn("toolu_01ReplayLive", json.dumps(result.evidence))
+        self.assertTrue(all(item.get("_http_request_id") for item in result.attempts))
 
     def test_replay_receipt_drift_is_not_idempotent(self):
         self.assertEqual(
@@ -628,6 +664,186 @@ class ToolReplayDriverTests(unittest.TestCase):
                 ]
             ).status,
         )
+
+    def _retry_cell(self):
+        inventory = _type64_inventory()
+        return next(
+            item
+            for item in compile_matrix(inventory, "release")
+            if item.scenario.id == "cursor-v1-tool-result-retry-23s"
+            and item.client.adapter == "raw-http"
+        )
+
+    def _consume_log(self, cell, request_id: str, receipt_id: str):
+        return {
+            "created_at": 200,
+            "type": 2,
+            "model_name": cell.model.id,
+            "channel": cell.route.channel_id,
+            "group": cell.route.group,
+            "request_id": request_id,
+            "other": json.dumps(
+                {
+                    "usage_receipt_id": receipt_id,
+                    "usage_receipt_provider": "cursor-agent-v1",
+                    "usage_receipt_state": "final",
+                }
+            ),
+        }
+
+    def _attempts(self, req_b: str, req_c: str) -> list[dict]:
+        return [
+            {
+                "stage": "b",
+                "offset_seconds": 0,
+                "http_status": 200,
+                "request_hash": "abc",
+                "http_request_id_hash": correlate_id(req_b),
+                "_http_request_id": req_b,
+                "receipt_hash": "",
+                "terminal_hash": "term",
+            },
+            {
+                "stage": "c",
+                "offset_seconds": 23,
+                "http_status": 200,
+                "request_hash": "abc",
+                "http_request_id_hash": correlate_id(req_c),
+                "_http_request_id": req_c,
+                "receipt_hash": "",
+                "terminal_hash": "term",
+            },
+        ]
+
+    def test_bind_receipts_from_separate_log_matches_not_a_copy(self):
+        cell = self._retry_cell()
+        attempts = self._attempts("req-b-exact", "req-c-exact")
+        logs = [
+            self._consume_log(cell, "req-b-exact", "cursor-agent-v1:receipt-shared"),
+            self._consume_log(cell, "req-c-exact", "cursor-agent-v1:receipt-shared"),
+        ]
+        bind_replay_attempt_receipts(cell, attempts, logs, "commit-sha", 0, set())
+        self.assertEqual(1, attempts[0]["consume_match_count"])
+        self.assertEqual(1, attempts[1]["consume_match_count"])
+        shared = correlate_id("cursor-agent-v1:receipt-shared")
+        self.assertEqual(shared, attempts[0]["receipt_hash"])
+        self.assertEqual(shared, attempts[1]["receipt_hash"])
+        self.assertEqual(
+            "pass",
+            evaluate_replay_identity(attempts, require_receipts=True).status,
+        )
+
+    def test_release_fails_when_retry_request_id_does_not_resolve_once(self):
+        cell = self._retry_cell()
+        missing = self._attempts("req-b-exact", "req-c-missing")
+        logs = [
+            self._consume_log(cell, "req-b-exact", "cursor-agent-v1:receipt-shared"),
+        ]
+        bind_replay_attempt_receipts(cell, missing, logs, "commit-sha", 0, set())
+        self.assertEqual(0, missing[1]["consume_match_count"])
+        self.assertEqual(
+            "fail",
+            evaluate_replay_identity(missing, require_receipts=True).status,
+        )
+        ambiguous = self._attempts("req-b-exact", "req-c-dup")
+        dup_logs = [
+            self._consume_log(cell, "req-b-exact", "cursor-agent-v1:receipt-shared"),
+            self._consume_log(cell, "req-c-dup", "cursor-agent-v1:receipt-shared"),
+            self._consume_log(cell, "req-c-dup", "cursor-agent-v1:receipt-other"),
+        ]
+        bind_replay_attempt_receipts(cell, ambiguous, dup_logs, "commit-sha", 0, set())
+        self.assertEqual(2, ambiguous[1]["consume_match_count"])
+        self.assertEqual(
+            "fail",
+            evaluate_replay_identity(ambiguous, require_receipts=True).status,
+        )
+
+    def test_local_tests_may_omit_receipts_but_release_cannot(self):
+        attempts = self._attempts("req-b-exact", "req-c-exact")
+        self.assertEqual(
+            "pass", evaluate_replay_identity(attempts, require_receipts=False).status
+        )
+        self.assertEqual(
+            "fail", evaluate_replay_identity(attempts, require_receipts=True).status
+        )
+        self.assertIn(
+            "final usage receipt",
+            evaluate_replay_identity(attempts, require_receipts=True).detail,
+        )
+
+    def test_deferred_batch_correlates_raw_ids_then_scrubs_them(self):
+        cell = self._retry_cell()
+        attempts = self._attempts("req-b-exact", "req-c-exact")
+        receipt = "cursor-agent-v1:receipt-shared"
+        old = self._consume_log(cell, "old", "old-receipt")
+        old["created_at"] = 100
+        result = CellResult(
+            cell.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            cell.route.id,
+            cell.model.id,
+            cell.scenario.id,
+            [],
+            {
+                "http_status": 200,
+                "server_evidence": {"status": "deferred"},
+                "_response_request_ids": ["req-a", "req-b-exact", "req-c-exact"],
+                "_replay_attempts": attempts,
+                "tool_replay": {"mode": "retry", "tool_use_id_hashes": []},
+            },
+        )
+
+        class FakeResponse:
+            def __init__(self, body: dict, headers: dict[str, str] | None = None):
+                self.body = json.dumps(body).encode()
+                self.headers = headers or {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return self.body
+
+        responses = [
+            FakeResponse(
+                {"success": True, "data": [old]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {
+                    "success": True,
+                    "data": [
+                        self._consume_log(cell, "req-c-exact", receipt),
+                        self._consume_log(cell, "req-b-exact", receipt),
+                        old,
+                    ],
+                },
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+        ]
+        with (
+            patch.dict(os.environ, {cell.route.token_env or "TEST_TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=responses),
+        ):
+            sessions = prepare_batch_server_evidence([cell])
+            finalize_batch_server_evidence([cell], [result], sessions)
+        self.assertEqual("pass", result.status, result.detail)
+        self.assertEqual(1, attempts[0]["consume_match_count"])
+        self.assertEqual(1, attempts[1]["consume_match_count"])
+        self.assertEqual(attempts[0]["receipt_hash"], attempts[1]["receipt_hash"])
+        self.assertNotIn("_response_request_ids", result.evidence)
+        self.assertNotIn("_replay_attempts", result.evidence)
+        dumped = json.dumps(build_report([result]))
+        self.assertNotIn("req-b-exact", dumped)
+        self.assertNotIn("req-c-exact", dumped)
+        self.assertNotIn(receipt, dumped)
+        self.assertIn(correlate_id(receipt), dumped)
 
 
 class ServerToolStreamAndClassifierTests(unittest.TestCase):
@@ -978,6 +1194,49 @@ class LifecycleAndReportTests(unittest.TestCase):
         self.assertNotIn(raw_request, redact_correlation_ids(public_id))
         sanitized = sanitize_report_value({"request_id": raw_request})
         self.assertEqual(hashed, sanitized["request_id"])
+
+    def test_final_json_contains_no_raw_request_tool_or_receipt_ids(self):
+        raw_request = "req-raw-secret-abcdef123"
+        raw_tool = "toolu_01LiveParkedSecret"
+        raw_receipt = "cursor-agent-v1:receipt-secret"
+        result = CellResult(
+            "cell",
+            "pass",
+            "client",
+            "now",
+            1,
+            "route",
+            "model",
+            "scenario",
+            [
+                TurnResult(
+                    1,
+                    "pass",
+                    1,
+                    200,
+                    "marker",
+                    [],
+                    f"output {raw_tool} {raw_receipt}",
+                )
+            ],
+            {
+                "_response_request_ids": [raw_request],
+                "_replay_attempts": [{"_http_request_id": raw_request}],
+                "server_evidence": {
+                    "terminal": {"request_id": raw_request, "status": "completed"},
+                    "receipt": {"id": raw_receipt, "state": "final"},
+                },
+                "tool_replay": {"tool_use_id_hashes": [correlate_id(raw_tool)]},
+            },
+        )
+        dumped = json.dumps(build_report([result], tier="pr"))
+        self.assertNotIn(raw_request, dumped)
+        self.assertNotIn(raw_receipt, dumped)
+        self.assertNotIn("_response_request_ids", dumped)
+        self.assertNotIn("_http_request_id", dumped)
+        self.assertIn(correlate_id(raw_request), dumped)
+        self.assertIn(correlate_id(raw_receipt), dumped)
+        self.assertNotIn(raw_tool, dumped)
 
 
 if __name__ == "__main__":

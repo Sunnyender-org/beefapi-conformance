@@ -18,11 +18,14 @@ static assistant history. `tool_replay.py` drives public Messages traffic:
    `type=tool_use` from JSON or SSE `data:` frames and keeps the exact assistant
    `content` array.
 2. Stage B rebuilds `messages` as original user, that assistant message, then a
-   user turn of `tool_result` blocks whose `tool_use_id` values are the returned
-   ids. Mixed adds a text block on the same user turn. Covering-set may append
-   `toolu_historical_routed_*` extras only after a real parked batch exists.
-3. Stage C POSTs the exact Stage B payload at +23s and +180s. Terminal
-   semantics and `receipt.id_hash` must match. `http_request_id_hash` may change.
+   user turn of `tool_result` blocks whose `tool_use_id` values are only the ids
+   returned by that parked Run. Mixed adds a text block on the same user turn.
+   Historical extras from a prior completed tool call are out of scope unless a
+   genuine preliminary stage is added later.
+3. Stage C POSTs the exact Stage B payload at absolute elapsed offsets +23s and
+   +180s (sleeps 23s, then 157s). Each B/C HTTP request id is matched to its own
+   consume log. Those logs must share one final `receipt.id_hash`. Transport
+   `http_request_id_hash` values may differ and are not receipt identity.
 
 If covering-set or MCP Stage A returns fewer than two live `tool_use` ids, the
 cell is `blocked` rather than a pass on synthetic history.
@@ -41,7 +44,7 @@ completion.
 |---|---|---|
 | Usage | `observed_usage` and `billing_estimate` are both present and distinct. Type64 input/cache quality is `unknown` or `estimated`. | Flat `prompt_tokens: 0` / `cache_tokens: 0` treated as measured. Observed quality `measured` for unobservable fields. |
 | Tool catalog | Caller canaries (`Bash`, `Read`, `beefapi_conformance_canary`) remain visible. | Cursor native shell/fs names appear in the visible catalog (`Shell`, `ReadFile`, `DeleteFile`, `edit_file`, `list_dir`). |
-| Tool results | Stage A returns a live `tool_use` id. Stage B sends that exact assistant history plus a real `tool_result`. Stage C at +23s/+180s replays Stage B with the same billing receipt and terminal semantics. HTTP request ids may differ. Covering-set and mixed cases park a real returned batch first. | Static `toolu_conformance_*` history. Marker-only custom-tool answers. Stage C new consume/receipt. Covering-set without a real two-call parked batch (blocked). |
+| Tool results | Stage A returns a live `tool_use` id. Stage B sends that exact assistant history plus a real `tool_result` for those ids only. Stage C at absolute +23s/+180s replays Stage B. Separate log matches for each B/C request id share one final receipt. | Static `toolu_conformance_*` history. Invented `toolu_historical_routed_*` ids. Marker-only custom-tool answers. Copied receipts. B/C request id missing or not unique. Stage C new billing receipt. Covering-set without a real two-call parked batch (blocked). |
 | Hosted web | Server-tool count, progress, and citations are present. Claude Code does not execute `WebSearch`/`WebFetch` itself. | Count-only receipts, missing citations/progress, or a local web-search tool_use. |
 | MCP | Spans correlate to real returned `tool_use` ids and match the declared serial or parallel contract. | Arbitrary `mcp` JSON, spans without matching tool ids, or serial/parallel mismatch. |
 | Thinking | First-byte is measured and the stream emits keepalive or progress during thinking-only time. | Silent wait until the final message. |

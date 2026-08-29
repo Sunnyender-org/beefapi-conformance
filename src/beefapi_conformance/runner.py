@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -16,6 +17,9 @@ from .model import CellResult, MatrixCell, TurnResult
 from .redact import redact
 
 SERVER_EVIDENCE_FIELDS = {"status", "commit", "route", "terminal", "receipt", "usage"}
+AGENT_V1_RESPONSE_ID = re.compile(
+    r'"id"\s*:\s*"resp_bf_agentv1_u[0-9]+_c[0-9]+_([A-Za-z0-9]+)"'
+)
 
 
 def _now() -> str:
@@ -95,6 +99,7 @@ def run_cell(
         command.prepare()
         env = command.environment()
         turn_results: list[TurnResult] = []
+        observed_request_ids: set[str] = set()
         for index, turn in enumerate(cell.scenario.turns, 1):
             turn_started = time.monotonic()
             try:
@@ -110,6 +115,7 @@ def run_cell(
                     check=False,
                 )
                 output = redact(completed.stdout or "", (token or "",))
+                observed_request_ids.update(AGENT_V1_RESPONSE_ID.findall(output))
                 command.observe_output(output)
                 missing = [
                     event for event in turn.expected_events if event not in output
@@ -188,6 +194,7 @@ def run_cell(
                 "started_epoch": started_epoch,
                 "finished_epoch": int(time.time()),
             }
+            evidence["_response_request_ids"] = sorted(observed_request_ids)
         detail = ""
         if (
             require_server_evidence
@@ -698,6 +705,7 @@ def finalize_batch_server_evidence(
         started_epoch = int(window.get("started_epoch", 0) or 0)
         finished_epoch = int(window.get("finished_epoch", 0) or 0)
         request_id = str(result.evidence.pop("_response_request_id", "") or "")
+        request_ids = result.evidence.pop("_response_request_ids", [])
 
         if cell.client.adapter == "raw-http":
             matches = (
@@ -733,17 +741,39 @@ def finalize_batch_server_evidence(
                 _set_batch_evidence_failure(result, str(payload.get("detail", "")))
             continue
 
-        candidates = _matching_usage_logs(
-            cell,
-            final_logs[key],
-            started_epoch,
-            sessions[key]["fence"],
-        )
+        exact_request_ids = [
+            str(item).strip()
+            for item in request_ids
+            if isinstance(item, str) and str(item).strip()
+        ]
+        if exact_request_ids:
+            candidates = [
+                log
+                for exact_request_id in exact_request_ids
+                for log in _matching_usage_logs(
+                    cell,
+                    final_logs[key],
+                    0,
+                    sessions[key]["fence"],
+                    exact_request_id,
+                )
+            ]
+        else:
+            candidates = _matching_usage_logs(
+                cell,
+                final_logs[key],
+                started_epoch,
+                sessions[key]["fence"],
+            )
+            candidates = [
+                item
+                for item in candidates
+                if int(item.get("created_at", 0) or 0) <= finished_epoch
+            ]
         candidates = [
             item
             for item in candidates
             if str(item.get("request_id", "")) not in used_request_ids[key]
-            and int(item.get("created_at", 0) or 0) <= finished_epoch
         ]
         candidates.sort(key=lambda item: int(item.get("created_at", 0) or 0))
         used_request_ids[key].update(

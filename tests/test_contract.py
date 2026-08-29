@@ -28,6 +28,7 @@ from beefapi_conformance.model import (
 from beefapi_conformance.redact import redact
 from beefapi_conformance.report import build_report
 from beefapi_conformance.runner import (
+    AGENT_V1_RESPONSE_ID,
     _beefapi_token_log_evidence,
     _evidence_fence,
     _matching_usage_log,
@@ -64,6 +65,15 @@ class ContractTests(unittest.TestCase):
             ROOT / "manifests/routes.example.json",
             ROOT / "manifests/models.example.json",
         )
+
+    def test_agent_v1_request_id_extraction_requires_response_id_field(self):
+        request_id = "202608291253521598208738268d9d67sN73Cgw"
+        public_id = f"resp_bf_agentv1_u1_c301_{request_id}"
+        self.assertEqual(
+            [request_id],
+            AGENT_V1_RESPONSE_ID.findall(json.dumps({"id": public_id})),
+        )
+        self.assertEqual([], AGENT_V1_RESPONSE_ID.findall(public_id))
 
     def test_inventory_loads_workbuddy_as_first_class_client(self):
         inventory = self.inventory()
@@ -842,9 +852,14 @@ class ContractTests(unittest.TestCase):
                 [],
                 {
                     "server_evidence": {"status": "deferred"},
+                    "_response_request_ids": [
+                        "first-tool",
+                        "first-followup",
+                        "first-provisional",
+                    ],
                     "_server_window": {
                         "started_epoch": 199,
-                        "finished_epoch": 200,
+                        "finished_epoch": 198,
                     },
                 },
             ),
@@ -860,6 +875,7 @@ class ContractTests(unittest.TestCase):
                 [],
                 {
                     "server_evidence": {"status": "deferred"},
+                    "_response_request_ids": ["second-only"],
                     "_server_window": {
                         "started_epoch": 210,
                         "finished_epoch": 211,

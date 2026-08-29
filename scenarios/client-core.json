@@ -63,7 +63,7 @@
       "timeout_seconds": 240,
       "requires_local_tools": false,
       "turns": [
-        {"prompt": "Use your native web search tool to find the title of example.com, cite the source, then end with BEEFAPI_CONFORMANCE_WEB_OK.", "marker": "BEEFAPI_CONFORMANCE_WEB_OK", "expected_events": [], "expected_any_events": [["WebSearch", "web_search", "webSearch"]]}
+        {"prompt": "Use your native web search tool to find the title of example.com, cite the source, then end with BEEFAPI_CONFORMANCE_WEB_OK.", "marker": "BEEFAPI_CONFORMANCE_WEB_OK", "expected_events": []}
       ]
     }
   ]

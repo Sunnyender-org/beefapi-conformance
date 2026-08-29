@@ -821,7 +821,22 @@ def _usage_log_payload(
     receipt_state = (
         other.get("usage_receipt_state") if isinstance(other, dict) else None
     )
-    valid = bool(commit and receipt_id and receipt_state == "final")
+    if isinstance(other, dict) and cell.route.channel_type == 64:
+        web_search_call_count = int(
+            other.get("cursor_agent_v1_hosted_search_call_count", 0) or 0
+        )
+    else:
+        web_search_call_count = (
+            int(other.get("web_search_call_count", 0) or 0)
+            if isinstance(other, dict)
+            else 0
+        )
+    search_evidence_valid = (
+        web_search_call_count > 0 if cell.scenario.id == "native-web-search" else True
+    )
+    valid = bool(
+        commit and receipt_id and receipt_state == "final" and search_evidence_valid
+    )
     return {
         "status": "pass" if valid else "fail",
         "commit": commit,
@@ -846,8 +861,15 @@ def _usage_log_payload(
             "completion_tokens": int(log.get("completion_tokens", 0) or 0),
             "quota": int(log.get("quota", 0) or 0),
             "use_time": int(log.get("use_time", 0) or 0),
+            "web_search_call_count": web_search_call_count,
         },
-        "detail": "" if valid else "usage receipt is missing or not final",
+        "detail": ""
+        if valid
+        else (
+            "native web search has no observed search call"
+            if not search_evidence_valid
+            else "usage receipt is missing or not final"
+        ),
     }
 
 

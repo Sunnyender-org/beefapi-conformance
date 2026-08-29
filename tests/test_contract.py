@@ -476,6 +476,41 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(252, payload["route"]["channel_id"])
         self.assertEqual("final", payload["receipt"]["state"])
 
+    def test_native_web_search_requires_positive_observed_search_evidence(self):
+        base = CommandTests().cell("codex")
+        cell = MatrixCell(
+            base.client,
+            replace(base.route, channel_type=64),
+            base.model,
+            replace(base.scenario, id="native-web-search"),
+        )
+        log = {
+            "type": 2,
+            "request_id": "req-search",
+            "other": json.dumps(
+                {
+                    "usage_receipt_id": "cursor-agent-v1:receipt",
+                    "usage_receipt_provider": "cursor-agent-v1",
+                    "usage_receipt_state": "final",
+                }
+            ),
+        }
+        missing = _usage_log_payload(cell, log, "commit-sha")
+        self.assertEqual("fail", missing["status"])
+        self.assertIn("no observed search call", missing["detail"])
+
+        log["other"] = json.dumps(
+            {
+                "usage_receipt_id": "cursor-agent-v1:receipt",
+                "usage_receipt_provider": "cursor-agent-v1",
+                "usage_receipt_state": "final",
+                "cursor_agent_v1_hosted_search_call_count": 1,
+            }
+        )
+        present = _usage_log_payload(cell, log, "commit-sha")
+        self.assertEqual("pass", present["status"])
+        self.assertEqual(1, present["usage"]["web_search_call_count"])
+
     def test_token_log_matching_rejects_empty_and_ambiguous_request_ids(self):
         cell = CommandTests().cell("codex")
         route = replace(

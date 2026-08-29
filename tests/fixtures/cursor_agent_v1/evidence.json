@@ -11,7 +11,7 @@
     "status": "pass",
     "commit": "commit-sha",
     "route": {"id": "cursor-agent-v1-channel-301", "channel_id": 301, "group": "cursor-agent-v1-acceptance"},
-    "terminal": {"status": "completed", "request_id_hash": "sha256:placeholder"},
+    "terminal": {"status": "completed", "http_request_id_hash": "sha256:placeholder"},
     "receipt": {"id_hash": "sha256:placeholder", "provider": "cursor-agent-v1", "state": "final"},
     "usage": {
       "observed_usage": {
@@ -27,12 +27,12 @@
     }
   },
   "retry_false_green": [
-    {"offset_seconds": 0, "http_status": 200, "request_hash": "abc"},
-    {"offset_seconds": 23, "http_status": 409, "request_hash": "abc"}
+    {"stage": "b", "offset_seconds": 0, "http_status": 200, "request_hash": "abc", "http_request_id_hash": "h1", "receipt_hash": "rec"},
+    {"stage": "c", "offset_seconds": 23, "http_status": 409, "request_hash": "abc", "http_request_id_hash": "h2", "receipt_hash": "rec"}
   ],
   "retry_valid": [
-    {"offset_seconds": 0, "http_status": 200, "request_hash": "abc"},
-    {"offset_seconds": 23, "http_status": 200, "request_hash": "abc"},
-    {"offset_seconds": 180, "http_status": 200, "request_hash": "abc"}
+    {"stage": "b", "offset_seconds": 0, "http_status": 200, "request_hash": "abc", "http_request_id_hash": "h1", "receipt_hash": "rec", "terminal_hash": "term"},
+    {"stage": "c", "offset_seconds": 23, "http_status": 200, "request_hash": "abc", "http_request_id_hash": "h2", "receipt_hash": "rec", "terminal_hash": "term"},
+    {"stage": "c", "offset_seconds": 180, "http_status": 200, "request_hash": "abc", "http_request_id_hash": "h3", "receipt_hash": "rec", "terminal_hash": "term"}
   ]
 }

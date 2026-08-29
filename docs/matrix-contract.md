@@ -39,7 +39,7 @@ run uses 500. Growing beyond either bound stops before sending model requests.
 
 - `passed`: every scheduled cell ran and passed.
 - `partial`: at least one cell passed and another was skipped.
-- `failed`: at least one cell failed.
+- `failed`: at least one cell failed or was blocked.
 - `not_run`: no cells ran or every cell skipped.
 
 Missing binaries, credentials, or the explicit local-tool opt-in are skips, not

@@ -37,8 +37,8 @@ evidence requires:
 
 - current `X-New-Api-Commit`;
 - expected channel id and group;
-- completed terminal request correlation (`request_id_hash`);
-- final usage receipt correlation (`id_hash`);
+- completed HTTP request correlation (`http_request_id_hash`);
+- final usage receipt correlation (`receipt.id_hash`), distinct from the HTTP request id;
 - usage quality: type64 `observed_usage` versus `billing_estimate`.
 
 This prevents a recent earlier request from satisfying a new cell.

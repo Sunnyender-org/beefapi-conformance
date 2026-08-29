@@ -92,6 +92,7 @@ def build_live_inventory(
             channel.get("cursor_agent_v1_native_web_search", False)
         ):
             capabilities.append("tool.web")
+            capabilities.append("tool.web.hosted")
         model_ids = [
             item.strip()
             for item in str(channel.get("models", "")).split(",")

@@ -908,11 +908,11 @@ class ContractTests(unittest.TestCase):
         from beefapi_conformance.cursor_agent_v1 import correlate_id
 
         first_ids = {
-            item["terminal"]["request_id_hash"]
+            item["terminal"]["http_request_id_hash"]
             for item in results[0].evidence["server_evidence"]["requests"]
         }
         second_id = results[1].evidence["server_evidence"]["terminal"][
-            "request_id_hash"
+            "http_request_id_hash"
         ]
         self.assertEqual(
             {correlate_id("first-tool"), correlate_id("first-followup")}, first_ids

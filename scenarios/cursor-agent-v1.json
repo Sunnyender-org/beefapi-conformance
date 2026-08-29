@@ -39,40 +39,22 @@
     },
     {
       "id": "cursor-v1-custom-tool-canary",
-      "name": "Caller custom tool remains visible on Cursor Agent v1",
+      "name": "Caller custom tool selection plus tool_result round trip",
       "tier": "merge",
       "kind": "http",
       "protocol": "messages",
       "http_endpoint": "/v1/messages",
       "required_capabilities": ["cursor.agent_v1", "tool.custom", "messages"],
-      "timeout_seconds": 120,
+      "timeout_seconds": 180,
       "requires_local_tools": false,
-      "evidence_requirements": ["tool.custom.canary"],
-      "http_payload": {
-        "model": "{{model}}",
-        "max_tokens": 128,
-        "tools": [
-          {
-            "name": "beefapi_conformance_canary",
-            "description": "Caller-local conformance canary. Echo the marker.",
-            "input_schema": {
-              "type": "object",
-              "properties": {
-                "marker": {"type": "string"}
-              }
-            }
-          }
-        ],
-        "messages": [
-          {
-            "role": "user",
-            "content": "{{prompt}}"
-          }
-        ]
+      "evidence_requirements": ["tool.custom.round_trip"],
+      "tool_replay": {
+        "mode": "custom",
+        "min_tool_uses": 1
       },
       "turns": [
         {
-          "prompt": "The caller canary tool beefapi_conformance_canary must remain visible. Reply exactly BEEFAPI_CURSOR_V1_CUSTOM_OK.",
+          "prompt": "You must call beefapi_conformance_canary before answering. After the tool result, reply exactly BEEFAPI_CURSOR_V1_CUSTOM_OK.",
           "marker": "BEEFAPI_CURSOR_V1_CUSTOM_OK",
           "expected_events": []
         }
@@ -86,41 +68,17 @@
       "protocol": "messages",
       "http_endpoint": "/v1/messages",
       "required_capabilities": ["cursor.agent_v1", "tool.custom", "messages"],
-      "timeout_seconds": 120,
+      "timeout_seconds": 180,
       "requires_local_tools": false,
       "retry_offsets_seconds": [23],
       "evidence_requirements": ["tool_result.idempotent"],
-      "http_payload": {
-        "model": "{{model}}",
-        "max_tokens": 128,
-        "messages": [
-          {"role": "user", "content": "Use the canary tool."},
-          {
-            "role": "assistant",
-            "content": [
-              {
-                "type": "tool_use",
-                "id": "toolu_conformance_retry_23s",
-                "name": "beefapi_conformance_canary",
-                "input": {"marker": "BEEFAPI_CURSOR_V1_RETRY_23S_OK"}
-              }
-            ]
-          },
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "tool_result",
-                "tool_use_id": "toolu_conformance_retry_23s",
-                "content": "BEEFAPI_CURSOR_V1_RETRY_23S_OK"
-              }
-            ]
-          }
-        ]
+      "tool_replay": {
+        "mode": "retry",
+        "min_tool_uses": 1
       },
       "turns": [
         {
-          "prompt": "The completed tool_result is already present. Reply exactly BEEFAPI_CURSOR_V1_RETRY_23S_OK.",
+          "prompt": "You must call beefapi_conformance_canary. After the tool result, reply exactly BEEFAPI_CURSOR_V1_RETRY_23S_OK.",
           "marker": "BEEFAPI_CURSOR_V1_RETRY_23S_OK",
           "expected_events": []
         }
@@ -134,41 +92,17 @@
       "protocol": "messages",
       "http_endpoint": "/v1/messages",
       "required_capabilities": ["cursor.agent_v1", "tool.custom", "messages"],
-      "timeout_seconds": 120,
+      "timeout_seconds": 180,
       "requires_local_tools": false,
       "retry_offsets_seconds": [180],
       "evidence_requirements": ["tool_result.idempotent"],
-      "http_payload": {
-        "model": "{{model}}",
-        "max_tokens": 128,
-        "messages": [
-          {"role": "user", "content": "Use the canary tool."},
-          {
-            "role": "assistant",
-            "content": [
-              {
-                "type": "tool_use",
-                "id": "toolu_conformance_retry_3m",
-                "name": "beefapi_conformance_canary",
-                "input": {"marker": "BEEFAPI_CURSOR_V1_RETRY_3M_OK"}
-              }
-            ]
-          },
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "tool_result",
-                "tool_use_id": "toolu_conformance_retry_3m",
-                "content": "BEEFAPI_CURSOR_V1_RETRY_3M_OK"
-              }
-            ]
-          }
-        ]
+      "tool_replay": {
+        "mode": "retry",
+        "min_tool_uses": 1
       },
       "turns": [
         {
-          "prompt": "The completed tool_result is already present. Reply exactly BEEFAPI_CURSOR_V1_RETRY_3M_OK.",
+          "prompt": "You must call beefapi_conformance_canary. After the tool result, reply exactly BEEFAPI_CURSOR_V1_RETRY_3M_OK.",
           "marker": "BEEFAPI_CURSOR_V1_RETRY_3M_OK",
           "expected_events": []
         }
@@ -176,57 +110,23 @@
     },
     {
       "id": "cursor-v1-covering-set-tool-result",
-      "name": "Covering-set tool_result blocks must not 4xx",
+      "name": "Covering-set tool_result blocks from a real parked Run must not 4xx",
       "tier": "merge",
       "kind": "http",
       "protocol": "messages",
       "http_endpoint": "/v1/messages",
       "required_capabilities": ["cursor.agent_v1", "tool.custom", "messages"],
-      "timeout_seconds": 120,
+      "timeout_seconds": 180,
       "requires_local_tools": false,
-      "evidence_requirements": ["http.not_4xx"],
-      "http_payload": {
-        "model": "{{model}}",
-        "max_tokens": 128,
-        "messages": [
-          {"role": "user", "content": "Use both canary tools."},
-          {
-            "role": "assistant",
-            "content": [
-              {
-                "type": "tool_use",
-                "id": "toolu_conformance_cover_a",
-                "name": "beefapi_conformance_canary",
-                "input": {"marker": "A"}
-              },
-              {
-                "type": "tool_use",
-                "id": "toolu_conformance_cover_b",
-                "name": "beefapi_conformance_canary",
-                "input": {"marker": "B"}
-              }
-            ]
-          },
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "tool_result",
-                "tool_use_id": "toolu_conformance_cover_a",
-                "content": "A"
-              },
-              {
-                "type": "tool_result",
-                "tool_use_id": "toolu_conformance_cover_b",
-                "content": "B"
-              }
-            ]
-          }
-        ]
+      "evidence_requirements": ["http.not_4xx", "tool_replay.parked_batch"],
+      "tool_replay": {
+        "mode": "covering",
+        "min_tool_uses": 2,
+        "allow_historical_extras": true
       },
       "turns": [
         {
-          "prompt": "Covering tool results are complete. Reply exactly BEEFAPI_CURSOR_V1_COVERING_OK.",
+          "prompt": "Call both beefapi_conformance_canary and beefapi_conformance_canary_b in one assistant turn. After covering tool results, reply exactly BEEFAPI_CURSOR_V1_COVERING_OK.",
           "marker": "BEEFAPI_CURSOR_V1_COVERING_OK",
           "expected_events": []
         }
@@ -234,50 +134,22 @@
     },
     {
       "id": "cursor-v1-mixed-tool-result-text",
-      "name": "tool_result plus ordinary text must not 4xx",
+      "name": "Parked tool_result plus ordinary text must not 4xx",
       "tier": "merge",
       "kind": "http",
       "protocol": "messages",
       "http_endpoint": "/v1/messages",
       "required_capabilities": ["cursor.agent_v1", "tool.custom", "messages"],
-      "timeout_seconds": 120,
+      "timeout_seconds": 180,
       "requires_local_tools": false,
-      "evidence_requirements": ["http.not_4xx"],
-      "http_payload": {
-        "model": "{{model}}",
-        "max_tokens": 128,
-        "messages": [
-          {"role": "user", "content": "Use the canary tool."},
-          {
-            "role": "assistant",
-            "content": [
-              {
-                "type": "tool_use",
-                "id": "toolu_conformance_mixed",
-                "name": "beefapi_conformance_canary",
-                "input": {"marker": "mixed"}
-              }
-            ]
-          },
-          {
-            "role": "user",
-            "content": [
-              {
-                "type": "tool_result",
-                "tool_use_id": "toolu_conformance_mixed",
-                "content": "mixed"
-              },
-              {
-                "type": "text",
-                "text": "{{prompt}}"
-              }
-            ]
-          }
-        ]
+      "evidence_requirements": ["http.not_4xx", "tool_replay.parked_batch"],
+      "tool_replay": {
+        "mode": "mixed",
+        "min_tool_uses": 1
       },
       "turns": [
         {
-          "prompt": "Continue after the tool result. Reply exactly BEEFAPI_CURSOR_V1_MIXED_OK.",
+          "prompt": "You must call beefapi_conformance_canary. After the tool result plus this follow-up text, reply exactly BEEFAPI_CURSOR_V1_MIXED_OK.",
           "marker": "BEEFAPI_CURSOR_V1_MIXED_OK",
           "expected_events": []
         }
@@ -295,28 +167,13 @@
       "requires_local_tools": false,
       "mcp_mode": "serial",
       "evidence_requirements": ["mcp.serial"],
-      "http_payload": {
-        "model": "{{model}}",
-        "max_tokens": 128,
-        "tools": [
-          {
-            "name": "beefapi_mcp_alpha",
-            "description": "First MCP canary. Serial with beefapi_mcp_beta.",
-            "input_schema": {"type": "object", "properties": {}}
-          },
-          {
-            "name": "beefapi_mcp_beta",
-            "description": "Second MCP canary. Serial with beefapi_mcp_alpha.",
-            "input_schema": {"type": "object", "properties": {}}
-          }
-        ],
-        "messages": [
-          {"role": "user", "content": "{{prompt}}"}
-        ]
+      "tool_replay": {
+        "mode": "mcp",
+        "min_tool_uses": 2
       },
       "turns": [
         {
-          "prompt": "Call beefapi_mcp_alpha then beefapi_mcp_beta serially. Reply exactly BEEFAPI_CURSOR_V1_MCP_SERIAL_OK.",
+          "prompt": "Call beefapi_mcp_alpha then beefapi_mcp_beta. Reply exactly BEEFAPI_CURSOR_V1_MCP_SERIAL_OK after both tool results.",
           "marker": "BEEFAPI_CURSOR_V1_MCP_SERIAL_OK",
           "expected_events": []
         }
@@ -334,28 +191,13 @@
       "requires_local_tools": false,
       "mcp_mode": "parallel",
       "evidence_requirements": ["mcp.parallel"],
-      "http_payload": {
-        "model": "{{model}}",
-        "max_tokens": 128,
-        "tools": [
-          {
-            "name": "beefapi_mcp_alpha",
-            "description": "First MCP canary. Parallel with beefapi_mcp_beta.",
-            "input_schema": {"type": "object", "properties": {}}
-          },
-          {
-            "name": "beefapi_mcp_beta",
-            "description": "Second MCP canary. Parallel with beefapi_mcp_alpha.",
-            "input_schema": {"type": "object", "properties": {}}
-          }
-        ],
-        "messages": [
-          {"role": "user", "content": "{{prompt}}"}
-        ]
+      "tool_replay": {
+        "mode": "mcp",
+        "min_tool_uses": 2
       },
       "turns": [
         {
-          "prompt": "Call beefapi_mcp_alpha and beefapi_mcp_beta in parallel. Reply exactly BEEFAPI_CURSOR_V1_MCP_PARALLEL_OK.",
+          "prompt": "Call beefapi_mcp_alpha and beefapi_mcp_beta together. Reply exactly BEEFAPI_CURSOR_V1_MCP_PARALLEL_OK after both tool results.",
           "marker": "BEEFAPI_CURSOR_V1_MCP_PARALLEL_OK",
           "expected_events": []
         }

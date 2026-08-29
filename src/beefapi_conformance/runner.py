@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .clients import ClientCommand, assistant_text, resolve_binary
 from .cursor_agent_v1 import (
+    NON_HOSTED_WEB_CLIENTS,
     attach_completion_metadata,
     correlate_id,
     evaluate_hosted_search,
@@ -25,6 +26,13 @@ from .cursor_agent_v1 import (
 )
 from .model import CellResult, MatrixCell, TurnResult
 from .redact import redact
+from .tool_replay import (
+    evaluate_mcp_spans,
+    evaluate_replay_identity,
+    execute_tool_replay,
+    parse_assistant_text,
+    parse_json_objects,
+)
 
 SERVER_EVIDENCE_FIELDS = {"status", "commit", "route", "terminal", "receipt", "usage"}
 AGENT_V1_RESPONSE_ID = re.compile(
@@ -277,6 +285,21 @@ def _run_http_cell(
     model = cell.model.client_model(cell.client.id)
     url = base_url.rstrip("/") + cell.scenario.http_endpoint
     headers = _http_headers(cell.scenario.protocol, token)
+    if cell.scenario.tool_replay:
+        return _run_tool_replay_http_cell(
+            cell,
+            started_at,
+            started,
+            started_epoch,
+            base_token,
+            evidence_fence,
+            require_server_evidence,
+            defer_server_evidence,
+            token,
+            model,
+            url,
+            headers,
+        )
     turn_results: list[TurnResult] = []
     observed_request_ids: list[str] = []
     attempts: list[dict[str, object]] = []
@@ -306,7 +329,8 @@ def _run_http_cell(
                 {
                     "aborted": True,
                     "http_status": aborted_status,
-                    "receipt_hash": correlate_id(aborted_id or ""),
+                    "http_request_id_hash": correlate_id(aborted_id or ""),
+                    "receipt_hash": "",
                     "stream": aborted_stream,
                 }
             )
@@ -327,7 +351,8 @@ def _run_http_cell(
                 "aborted": False,
                 "http_status": status_code,
                 "request_hash": request_hash,
-                "receipt_hash": correlate_id(response_request_id or ""),
+                "http_request_id_hash": correlate_id(response_request_id or ""),
+                "receipt_hash": "",
             }
         )
         if cell.scenario.retry_offsets_seconds and require_server_evidence:
@@ -347,7 +372,8 @@ def _run_http_cell(
                         "aborted": False,
                         "http_status": retry_status,
                         "request_hash": request_hash,
-                        "receipt_hash": correlate_id(retry_id or ""),
+                        "http_request_id_hash": correlate_id(retry_id or ""),
+                        "receipt_hash": "",
                     }
                 )
         sanitized = redact_correlation_ids(redact(output, (token or "",)))
@@ -443,6 +469,176 @@ def _run_http_cell(
         started,
         "python-urllib",
         turn_results,
+        detail,
+        evidence,
+    )
+
+
+def _run_tool_replay_http_cell(
+    cell: MatrixCell,
+    started_at: str,
+    started: float,
+    started_epoch: int,
+    base_token: str | None,
+    evidence_fence: set[str] | None,
+    require_server_evidence: bool,
+    defer_server_evidence: bool,
+    token: str | None,
+    model: str,
+    url: str,
+    headers: dict[str, str],
+) -> CellResult:
+    turn = cell.scenario.turns[0]
+    spec = dict(cell.scenario.tool_replay or {})
+    offsets = cell.scenario.retry_offsets_seconds
+
+    def exchange(
+        payload: dict[str, object],
+    ) -> tuple[int | None, str, str | None, dict[str, object]]:
+        return _http_exchange(url, payload, headers, cell.scenario.timeout_seconds)
+
+    replay = execute_tool_replay(
+        spec=spec,
+        model=model,
+        prompt=turn.prompt,
+        marker=turn.marker,
+        offsets=offsets,
+        exchange=exchange,
+        sleeper=time.sleep if offsets else None,
+    )
+    sanitized = redact_correlation_ids(redact(replay.last_output, (token or "",)))
+    response_text = parse_assistant_text(replay.last_output)
+    missing = [item for item in turn.expected_events if item not in sanitized]
+    http_ok = replay.last_status is not None and 200 <= replay.last_status < 300
+    marker_ok = turn.marker in response_text or turn.marker in sanitized
+    status = replay.status
+    detail = replay.detail
+    if status == "pass" and not (http_ok and marker_ok and not missing):
+        status = "fail"
+        detail = (
+            detail or "tool_result round trip did not complete with the expected marker"
+        )
+    public_mcp: dict[str, object] = {}
+    for body in parse_json_objects(replay.last_output):
+        mcp = body.get("mcp")
+        if isinstance(mcp, dict):
+            public_mcp = mcp
+    if cell.scenario.mcp_mode and status == "pass":
+        spans = (
+            public_mcp.get("spans") if isinstance(public_mcp.get("spans"), list) else []
+        )
+        typed_spans = [item for item in spans if isinstance(item, dict)]
+        mcp_eval = evaluate_mcp_spans(
+            cell.scenario.mcp_mode,
+            typed_spans,
+            replay.tool_uses,
+            replay.tool_use_id_hashes,
+        )
+        if mcp_eval.status == "blocked":
+            status = "blocked"
+            detail = mcp_eval.detail
+        elif not mcp_eval.ok:
+            status = "fail"
+            detail = mcp_eval.detail
+    request_ids = [
+        str(item.get("http_request_id_hash") or "")
+        for item in replay.attempts
+        if item.get("http_request_id_hash")
+    ]
+    server_evidence: dict[str, object] = (
+        {"status": "deferred"}
+        if defer_server_evidence
+        else _server_evidence(
+            cell,
+            base_token,
+            started_epoch,
+            evidence_fence,
+            None,
+        )
+    )
+    if isinstance(server_evidence, dict) and server_evidence.get("status") == "pass":
+        receipt_hash = ""
+        receipt = server_evidence.get("receipt")
+        if isinstance(receipt, dict):
+            receipt_hash = str(receipt.get("id_hash") or "")
+        consume = 1
+        extra = server_evidence.get("requests")
+        if isinstance(extra, list):
+            consume = len(
+                {
+                    str((item.get("receipt") or {}).get("id_hash") or "")
+                    for item in extra
+                    if isinstance(item, dict)
+                }
+            )
+        for attempt in replay.attempts:
+            if attempt.get("stage") in {"b", "c"}:
+                attempt["receipt_hash"] = receipt_hash
+                attempt["consume_log_count"] = (
+                    consume if attempt.get("stage") == "c" else 1
+                )
+        if offsets:
+            identity = evaluate_replay_identity(replay.attempts)
+            if not identity.ok:
+                status = "fail"
+                detail = identity.detail
+    public_evidence: dict[str, object] = (
+        dict(server_evidence) if isinstance(server_evidence, dict) else {}
+    )
+    public_evidence.update(replay.evidence)
+    if public_mcp:
+        public_evidence["mcp"] = public_mcp
+    public = evaluate_public_artifacts(
+        cell,
+        http_status=replay.last_status,
+        output=sanitized,
+        evidence=public_evidence,
+        stream=replay.stream,
+        attempts=replay.attempts,
+    )
+    if public.status != "pass" and status == "pass":
+        status = "fail"
+        detail = public.detail
+    evidence: dict[str, object] = {
+        "http_status": replay.last_status,
+        "route_auth_mode": cell.route.auth_mode,
+        "server_evidence": server_evidence,
+        "stream": replay.stream,
+        **replay.evidence,
+    }
+    if public_mcp:
+        evidence["mcp"] = public_mcp
+    if defer_server_evidence:
+        evidence["_response_request_ids"] = request_ids
+        evidence["_server_window"] = {
+            "started_epoch": started_epoch,
+            "finished_epoch": int(time.time()),
+        }
+    if (
+        require_server_evidence
+        and not defer_server_evidence
+        and cell.route.release_evidence_required
+        and server_evidence.get("status") != "pass"
+        and status == "pass"
+    ):
+        status = "fail"
+        detail = "release tier requires passing server evidence"
+    turn_result = TurnResult(
+        1,
+        "pass" if status == "pass" else status if status == "blocked" else "fail",
+        int((time.monotonic() - started) * 1000),
+        replay.last_status,
+        turn.marker,
+        missing,
+        sanitized[-4000:],
+    )
+    return _result(
+        cell,
+        status,
+        started_at,
+        started,
+        "python-urllib",
+        [turn_result],
         detail,
         evidence,
     )
@@ -1128,7 +1324,10 @@ def _usage_log_payload(
     search_evidence_valid = True
     search_detail = "native web search has no observed search call"
     if cell.scenario.id == "native-web-search":
-        if cell.route.channel_type == 64:
+        if (
+            cell.route.channel_type == 64
+            and cell.client.id not in NON_HOSTED_WEB_CLIENTS
+        ):
             hosted = evaluate_hosted_search(
                 web_search_call_count=web_search_call_count,
                 citation_count=citation_count,
@@ -1167,7 +1366,7 @@ def _usage_log_payload(
         },
         "terminal": {
             "status": "completed" if int(log.get("type", 0) or 0) == 2 else "failed",
-            "request_id_hash": correlate_id(str(log.get("request_id", ""))),
+            "http_request_id_hash": correlate_id(str(log.get("request_id", ""))),
         },
         "receipt": {
             "id_hash": correlate_id(str(receipt_id or "")),

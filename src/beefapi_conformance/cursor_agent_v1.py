@@ -32,8 +32,22 @@ CLASSIFIER_MARKERS = (
 )
 AGENT_V1_PUBLIC_ID = re.compile(r"resp_bf_agentv1_u[0-9]+_c[0-9]+_[A-Za-z0-9]+")
 RAW_ID_KEYS = frozenset(
-    {"request_id", "usage_receipt_id", "receipt_id", "request_id_raw"}
+    {
+        "request_id",
+        "usage_receipt_id",
+        "receipt_id",
+        "request_id_raw",
+        "http_request_id",
+        "tool_use_id",
+    }
 )
+APPLICABLE_CLIENT_SCENARIOS = frozenset(
+    {"text-turn", "local-tool-read", "session-resume"}
+)
+REQUIRED_NATIVE_CLIENTS = frozenset(
+    {"claude-code", "codex-cli", "grok-build", "workbuddy-cli"}
+)
+NON_HOSTED_WEB_CLIENTS = frozenset({"codex-cli", "grok-build", "workbuddy-cli"})
 
 
 @dataclass(frozen=True)
@@ -187,24 +201,50 @@ def lookup_item(scenario_id: str) -> CompletionItem | None:
     return load_completion_inventory().by_scenario.get(scenario_id)
 
 
+def client_coverage_required(cell: MatrixCell) -> bool:
+    if cell.scenario.id not in APPLICABLE_CLIENT_SCENARIOS:
+        return False
+    if cell.client.id not in REQUIRED_NATIVE_CLIENTS:
+        return False
+    if cell.client.id == "workbuddy-cli":
+        return True
+    return cell.route.channel_type == 64
+
+
 def attach_completion_metadata(cell: MatrixCell) -> dict[str, Any]:
-    if cell.route.channel_type != 64:
+    completion: dict[str, Any] = {}
+    if cell.route.channel_type == 64:
+        item = lookup_item(cell.scenario.id)
+        if item is not None:
+            completion = {
+                "family": "cursor-agent-v1",
+                "item": item.id,
+                "weight": item.weight,
+                "required_release": item.weight == "critical",
+                "capabilities": sorted(item.capabilities),
+            }
+    if client_coverage_required(cell):
+        if completion:
+            completion["required_release"] = True
+            completion["client_coverage"] = True
+        else:
+            completion = {
+                "family": "cursor-agent-v1",
+                "item": f"client-coverage:{cell.client.id}:{cell.scenario.id}",
+                "weight": "critical",
+                "required_release": True,
+                "client_coverage": True,
+            }
+    if not completion:
         return {}
-    item = lookup_item(cell.scenario.id)
-    if item is None:
-        return {}
-    return {
-        "completion": {
-            "family": "cursor-agent-v1",
-            "item": item.id,
-            "weight": item.weight,
-            "required_release": item.weight == "critical",
-            "capabilities": sorted(item.capabilities),
-        }
-    }
+    return {"completion": completion}
 
 
 def forced_representative_cell(cell: MatrixCell) -> bool:
+    if client_coverage_required(cell):
+        if cell.client.id == "workbuddy-cli":
+            return True
+        return cell.model.id == cell.route.test_model
     if cell.route.channel_type != 64:
         return False
     if cell.model.id != cell.route.test_model:
@@ -403,14 +443,27 @@ def evaluate_http_status(status_code: int | None) -> Evaluation:
 
 
 def evaluate_idempotent_retries(attempts: list[dict[str, Any]]) -> Evaluation:
-    if len(attempts) < 2:
-        return Evaluation("fail", "identical tool_result retry attempts are missing")
-    hashes = {str(item.get("request_hash") or "") for item in attempts}
+    from .tool_replay import evaluate_replay_identity
+
+    replay = [
+        item
+        for item in attempts
+        if item.get("stage") in {"b", "c"} or item.get("offset_seconds")
+    ]
+    if any(item.get("stage") in {"b", "c"} for item in attempts):
+        return evaluate_replay_identity(attempts)
+    if len(replay) < 2:
+        if len(attempts) < 2:
+            return Evaluation(
+                "fail", "identical tool_result retry attempts are missing"
+            )
+        replay = [item for item in attempts if not item.get("aborted")]
+    hashes = {str(item.get("request_hash") or "") for item in replay}
     if "" in hashes or len(hashes) != 1:
         return Evaluation(
             "fail", "retry payload drifted from the completed tool_result"
         )
-    for item in attempts:
+    for item in replay:
         status = evaluate_http_status(
             item.get("http_status")
             if isinstance(item.get("http_status"), int)
@@ -422,6 +475,16 @@ def evaluate_idempotent_retries(attempts: list[dict[str, Any]]) -> Evaluation:
                 "fail",
                 f"completed tool_result retry at +{offset}s was not idempotent: {status.detail}",
             )
+    receipts = {
+        str(item.get("receipt_hash") or "")
+        for item in replay
+        if item.get("receipt_hash")
+    }
+    if receipts and len(receipts) != 1:
+        return Evaluation(
+            "fail",
+            "billing receipt identity drifted across replay; HTTP request ids are not receipts",
+        )
     return Evaluation("pass")
 
 
@@ -552,6 +615,47 @@ def missing_critical_executions(
             executed = [result for result in matching if result.status not in {"skip"}]
             if not executed:
                 missing.append(f"{route_id}/{item.scenario}")
+    missing.extend(_missing_client_coverage(planned, results))
+    return missing
+
+
+def _missing_client_coverage(
+    planned: list[MatrixCell],
+    results: list[CellResult] | None,
+) -> list[str]:
+    missing: list[str] = []
+    by_route: dict[str, list[MatrixCell]] = {}
+    for cell in planned:
+        by_route.setdefault(cell.route.id, []).append(cell)
+    for route_id, cells in by_route.items():
+        route_clients = cells[0].route.clients
+        planned_scenarios = {cell.scenario.id for cell in cells}
+        type64 = cells[0].route.channel_type == 64
+        for client_id in sorted(REQUIRED_NATIVE_CLIENTS & route_clients):
+            if client_id != "workbuddy-cli" and not type64:
+                continue
+            for scenario_id in sorted(APPLICABLE_CLIENT_SCENARIOS):
+                if scenario_id not in planned_scenarios:
+                    continue
+                matching = [
+                    cell
+                    for cell in cells
+                    if cell.client.id == client_id and cell.scenario.id == scenario_id
+                ]
+                if not matching:
+                    missing.append(f"{route_id}/{client_id}/{scenario_id}")
+                    continue
+                if results is None:
+                    continue
+                hits = [
+                    result
+                    for result in results
+                    if result.route_id == route_id
+                    and result.scenario_id == scenario_id
+                    and result.cell_id.startswith(f"{client_id}/")
+                ]
+                if not hits or all(item.status == "skip" for item in hits):
+                    missing.append(f"{route_id}/{client_id}/{scenario_id}")
     return missing
 
 
@@ -608,7 +712,23 @@ def evaluate_public_artifacts(
         if not catalog.ok:
             details.append(catalog.detail)
 
-    if cell.scenario.id == "native-web-search" and cell.route.channel_type == 64:
+    if "tool.custom.round_trip" in requirements:
+        replay = (
+            payload.get("tool_replay")
+            if isinstance(payload.get("tool_replay"), dict)
+            else {}
+        )
+        hashes = replay.get("tool_use_id_hashes") if isinstance(replay, dict) else []
+        if not hashes:
+            details.append(
+                "custom-tool canary did not prove tool selection plus tool_result round trip"
+            )
+
+    if (
+        cell.scenario.id == "native-web-search"
+        and cell.route.channel_type == 64
+        and cell.client.id not in NON_HOSTED_WEB_CLIENTS
+    ):
         usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
         if payload.get("status") in {"pass", "fail"} or usage:
             hosted = evaluate_hosted_search(
@@ -621,12 +741,30 @@ def evaluate_public_artifacts(
                 details.append(hosted.detail)
 
     if cell.scenario.mcp_mode:
+        from .tool_replay import evaluate_mcp_spans, parse_tool_uses
+
         mcp = payload.get("mcp") if isinstance(payload.get("mcp"), dict) else {}
         spans = mcp.get("spans") if isinstance(mcp.get("spans"), list) else []
         typed_spans = [item for item in spans if isinstance(item, dict)]
-        if payload.get("status") == "pass" or typed_spans:
-            mode = evaluate_mcp_mode(cell.scenario.mcp_mode, typed_spans)
-            if not mode.ok:
+        replay_meta = (
+            payload.get("tool_replay")
+            if isinstance(payload.get("tool_replay"), dict)
+            else {}
+        )
+        hashed_ids = (
+            [str(item) for item in replay_meta.get("tool_use_id_hashes") or []]
+            if isinstance(replay_meta, dict)
+            else []
+        )
+        uses = parse_tool_uses(output)
+        if typed_spans or uses or hashed_ids:
+            mode = evaluate_mcp_spans(
+                cell.scenario.mcp_mode,
+                typed_spans,
+                uses,
+                hashed_ids,
+            )
+            if mode.status == "blocked" or not mode.ok:
                 details.append(mode.detail)
         elif "mcp.serial" in requirements or "mcp.parallel" in requirements:
             if payload.get("status") in {"pass", "fail"}:

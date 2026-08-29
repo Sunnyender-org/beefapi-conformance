@@ -64,7 +64,7 @@
       "scenario": "cursor-v1-custom-tool-canary",
       "weight": "critical",
       "capabilities": ["cursor.agent_v1", "tool.custom"],
-      "evidence": ["http.2xx"]
+      "evidence": ["tool.custom.round_trip"]
     },
     {
       "id": "tool-retry-23s",

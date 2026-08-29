@@ -31,7 +31,7 @@ def build_report(
         classification = "failed"
     counts = {
         status: sum(1 for item in gated if item.status == status)
-        for status in ("pass", "fail", "skip")
+        for status in ("pass", "fail", "skip", "blocked")
     }
     return {
         "schema_version": 2,
@@ -49,7 +49,7 @@ def build_report(
 def classify(results: list[CellResult]) -> str:
     if not results or all(item.status == "skip" for item in results):
         return "not_run"
-    if any(item.status == "fail" for item in results):
+    if any(item.status in {"fail", "blocked"} for item in results):
         return "failed"
     if any(item.status == "skip" for item in results):
         return "partial"
@@ -71,7 +71,7 @@ def write_report(report: dict[str, object], output_dir: Path) -> None:
             name=str(result["cell_id"]),
             time=str(result["duration_ms"] / 1000),
         )
-        if result["status"] == "fail":
+        if result["status"] in {"fail", "blocked"}:
             failure = ElementTree.SubElement(
                 case,
                 "failure",

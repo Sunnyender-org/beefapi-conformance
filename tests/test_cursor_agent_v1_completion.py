@@ -33,12 +33,24 @@ from beefapi_conformance.manifest import load_inventory
 from beefapi_conformance.matrix import compile_matrix
 from beefapi_conformance.model import (
     CellResult,
+    ContractError,
     MatrixCell,
     Scenario,
     Turn,
 )
 from beefapi_conformance.report import build_report
 from beefapi_conformance.runner import _usage_log_payload, run_cell
+from beefapi_conformance.tool_replay import (
+    ToolUse,
+    covering_tool_results,
+    evaluate_live_tool_ids,
+    evaluate_mcp_spans,
+    execute_tool_replay,
+    parse_assistant_message,
+    parse_tool_uses,
+    stage_a_payload,
+    stage_b_payload,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = json.loads(
@@ -141,6 +153,34 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual([], missing_critical_executions(cells))
         self.assertFalse(any(cell.scenario.id == "native-web-search" for cell in cells))
 
+    def test_representative_requires_codex_grok_and_workbuddy_applicable_cells(self):
+        type64 = _type64_inventory()
+        cells = compile_matrix(type64, "release", coverage="representative")
+        for client_id in ("codex-cli", "grok-build", "claude-code"):
+            for scenario_id in ("text-turn", "local-tool-read", "session-resume"):
+                self.assertTrue(
+                    any(
+                        cell.client.id == client_id and cell.scenario.id == scenario_id
+                        for cell in cells
+                    ),
+                    f"{client_id}/{scenario_id}",
+                )
+        example = load_inventory(
+            ROOT,
+            ROOT / "manifests/routes.example.json",
+            ROOT / "manifests/models.example.json",
+        )
+        example_cells = compile_matrix(example, "release", coverage="representative")
+        for scenario_id in ("text-turn", "local-tool-read", "session-resume"):
+            self.assertTrue(
+                any(
+                    cell.client.id == "workbuddy-cli"
+                    and cell.scenario.id == scenario_id
+                    for cell in example_cells
+                ),
+                scenario_id,
+            )
+
 
 class UsageQualityTests(unittest.TestCase):
     def test_measured_zero_usage_is_false_green(self):
@@ -215,21 +255,121 @@ class CatalogAndToolResultTests(unittest.TestCase):
         )
 
     def test_http_covering_set_4xx_fails_the_cell(self):
-        result = self._run_http_scenario(
-            "cursor-v1-covering-set-tool-result", status=400, marker="NO"
+        result = self._run_parked_http(
+            "cursor-v1-covering-set-tool-result",
+            stage_b_status=400,
+            stage_b_marker="NO",
+            tool_count=2,
         )
         self.assertEqual("fail", result.status)
         self.assertEqual(400, result.turns[0].returncode)
 
     def test_http_covering_set_2xx_passes_without_server_evidence(self):
-        result = self._run_http_scenario(
+        result = self._run_parked_http(
             "cursor-v1-covering-set-tool-result",
-            status=200,
-            marker="BEEFAPI_CURSOR_V1_COVERING_OK",
+            stage_b_status=200,
+            stage_b_marker="BEEFAPI_CURSOR_V1_COVERING_OK",
+            tool_count=2,
+        )
+        self.assertEqual("pass", result.status, result.detail)
+        self.assertEqual(2, len(result.evidence["tool_replay"]["tool_use_id_hashes"]))
+        dumped = json.dumps(result.evidence)
+        self.assertNotIn("toolu_01ParkedA", dumped)
+        self.assertNotIn("toolu_01ParkedB", dumped)
+
+    def test_covering_set_without_a_real_batch_is_blocked(self):
+        result = self._run_parked_http(
+            "cursor-v1-covering-set-tool-result",
+            stage_b_status=200,
+            stage_b_marker="BEEFAPI_CURSOR_V1_COVERING_OK",
+            tool_count=1,
+        )
+        self.assertEqual("blocked", result.status)
+        self.assertIn("parked", result.detail)
+
+    def test_mixed_tool_result_uses_parked_id(self):
+        result = self._run_parked_http(
+            "cursor-v1-mixed-tool-result-text",
+            stage_b_status=200,
+            stage_b_marker="BEEFAPI_CURSOR_V1_MIXED_OK",
+            tool_count=1,
         )
         self.assertEqual("pass", result.status, result.detail)
 
-    def _run_http_scenario(self, scenario_id: str, *, status: int, marker: str):
+    def test_custom_tool_rejects_marker_only_and_requires_round_trip(self):
+        marker_only = self._run_parked_http(
+            "cursor-v1-custom-tool-canary",
+            stage_b_status=200,
+            stage_b_marker="BEEFAPI_CURSOR_V1_CUSTOM_OK",
+            tool_count=0,
+            stage_a_text="BEEFAPI_CURSOR_V1_CUSTOM_OK",
+        )
+        self.assertEqual("fail", marker_only.status)
+        self.assertIn("marker-only", marker_only.detail)
+        round_trip = self._run_parked_http(
+            "cursor-v1-custom-tool-canary",
+            stage_b_status=200,
+            stage_b_marker="BEEFAPI_CURSOR_V1_CUSTOM_OK",
+            tool_count=1,
+        )
+        self.assertEqual("pass", round_trip.status, round_trip.detail)
+
+    def test_static_synthetic_tool_ids_are_rejected_from_manifests(self):
+        with self.assertRaisesRegex(ContractError, "static synthetic tool_use"):
+            Scenario.parse(
+                {
+                    "id": "bad-static",
+                    "name": "Bad",
+                    "tier": "pr",
+                    "kind": "http",
+                    "protocol": "messages",
+                    "http_endpoint": "/v1/messages",
+                    "required_capabilities": ["messages"],
+                    "http_payload": {
+                        "messages": [
+                            {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "tool_use",
+                                        "id": "toolu_conformance_retry_23s",
+                                        "name": "beefapi_conformance_canary",
+                                        "input": {},
+                                    }
+                                ],
+                            }
+                        ]
+                    },
+                    "turns": [{"prompt": "x", "marker": "x", "expected_events": []}],
+                }
+            )
+
+    def _run_parked_http(
+        self,
+        scenario_id: str,
+        *,
+        stage_b_status: int,
+        stage_b_marker: str,
+        tool_count: int,
+        stage_a_text: str = "",
+    ):
+        return self._run_http_scenario(
+            scenario_id,
+            status=stage_b_status,
+            marker=stage_b_marker,
+            tool_count=tool_count,
+            stage_a_text=stage_a_text,
+        )
+
+    def _run_http_scenario(
+        self,
+        scenario_id: str,
+        *,
+        status: int,
+        marker: str,
+        tool_count: int = 2,
+        stage_a_text: str = "",
+    ):
         inventory = _type64_inventory()
         cell = next(
             item
@@ -240,12 +380,51 @@ class CatalogAndToolResultTests(unittest.TestCase):
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 length = int(self.headers.get("content-length", "0"))
-                self.rfile.read(length)
-                body = json.dumps(
-                    {"content": [{"type": "text", "text": marker}]}
-                ).encode()
-                self.send_response(status)
+                request = json.loads(self.rfile.read(length))
+                messages = request.get("messages", [])
+                has_tool_result = any(
+                    isinstance(message.get("content"), list)
+                    and any(
+                        isinstance(block, dict) and block.get("type") == "tool_result"
+                        for block in message.get("content")
+                    )
+                    for message in messages
+                    if isinstance(message, dict)
+                )
+                if not has_tool_result:
+                    content: list[dict] = []
+                    if stage_a_text:
+                        content.append({"type": "text", "text": stage_a_text})
+                    names = [
+                        "beefapi_conformance_canary",
+                        "beefapi_conformance_canary_b",
+                    ]
+                    for index in range(tool_count):
+                        content.append(
+                            {
+                                "type": "tool_use",
+                                "id": f"toolu_01Parked{chr(65 + index)}",
+                                "name": names[index % 2],
+                                "input": {"marker": chr(65 + index)},
+                            }
+                        )
+                    payload = {
+                        "role": "assistant",
+                        "content": content,
+                        "stop_reason": "tool_use" if tool_count else "end_turn",
+                    }
+                    code = 200
+                else:
+                    payload = {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": marker}],
+                        "stop_reason": "end_turn",
+                    }
+                    code = status
+                body = json.dumps(payload).encode()
+                self.send_response(code)
                 self.send_header("content-type", "application/json")
+                self.send_header("X-Oneapi-Request-Id", f"req-{id(request)}")
                 self.send_header("content-length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -270,6 +449,185 @@ class CatalogAndToolResultTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+
+class ToolReplayDriverTests(unittest.TestCase):
+    def test_parse_tool_use_and_build_replay_payload_from_returned_ids(self):
+        output = json.dumps(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_01LiveParked",
+                        "name": "beefapi_conformance_canary",
+                        "input": {"marker": "M"},
+                    }
+                ],
+                "stop_reason": "tool_use",
+            }
+        )
+        uses = parse_tool_uses(output)
+        self.assertEqual(["toolu_01LiveParked"], [item.id for item in uses])
+        self.assertEqual("pass", evaluate_live_tool_ids(uses).status)
+        self.assertEqual(
+            "fail",
+            evaluate_live_tool_ids(
+                [
+                    ToolUse(
+                        id="toolu_conformance_retry_23s",
+                        name="beefapi_conformance_canary",
+                        input={},
+                        raw={},
+                    )
+                ]
+            ).status,
+        )
+        assistant = parse_assistant_message(output)
+        spec = {"mode": "retry"}
+        stage_a = stage_a_payload(spec, "claude-opus-5", "call the canary")
+        self.assertEqual(
+            {"type": "tool", "name": "beefapi_conformance_canary"},
+            stage_a["tool_choice"],
+        )
+        stage_b = stage_b_payload(
+            stage_a,
+            assistant,
+            uses,
+            spec,
+            "follow-up",
+            "BEEFAPI_CURSOR_V1_RETRY_23S_OK",
+        )
+        self.assertEqual(assistant, stage_b["messages"][1])
+        result_block = stage_b["messages"][2]["content"][0]
+        self.assertEqual("toolu_01LiveParked", result_block["tool_use_id"])
+        self.assertEqual("BEEFAPI_CURSOR_V1_RETRY_23S_OK", result_block["content"])
+
+    def test_covering_historical_extras_require_a_real_parked_batch(self):
+        self.assertEqual(
+            [], covering_tool_results([], marker="X", allow_historical_extras=True)
+        )
+        uses = [
+            ToolUse(
+                id="toolu_01ParkedA",
+                name="beefapi_conformance_canary",
+                input={},
+                raw={},
+            ),
+            ToolUse(
+                id="toolu_01ParkedB",
+                name="beefapi_conformance_canary_b",
+                input={},
+                raw={},
+            ),
+        ]
+        results = covering_tool_results(uses, marker="OK", allow_historical_extras=True)
+        self.assertEqual(3, len(results))
+        self.assertEqual("toolu_01ParkedA", results[0]["tool_use_id"])
+        self.assertTrue(
+            results[2]["tool_use_id"].startswith("toolu_historical_routed_")
+        )
+
+    def test_mcp_spans_must_correlate_to_returned_tool_ids(self):
+        uses = [
+            ToolUse(id="toolu_01Alpha", name="beefapi_mcp_alpha", input={}, raw={}),
+            ToolUse(id="toolu_01Beta", name="beefapi_mcp_beta", input={}, raw={}),
+        ]
+        self.assertEqual(
+            "fail",
+            evaluate_mcp_spans(
+                "serial",
+                [{"start": 0, "end": 4}, {"start": 5, "end": 9}],
+                uses,
+            ).status,
+        )
+        self.assertEqual(
+            "pass",
+            evaluate_mcp_spans(
+                "serial",
+                [
+                    {"tool_use_id": "toolu_01Alpha", "start": 0, "end": 4},
+                    {"tool_use_id": "toolu_01Beta", "start": 4, "end": 8},
+                ],
+                uses,
+            ).status,
+        )
+
+    def test_stage_c_replay_keeps_receipt_when_http_ids_differ(self):
+        calls: list[dict] = []
+
+        def exchange(payload: dict):
+            calls.append(payload)
+            if len(payload["messages"]) == 1:
+                body = json.dumps(
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "toolu_01ReplayLive",
+                                "name": "beefapi_conformance_canary",
+                                "input": {"marker": "R"},
+                            }
+                        ],
+                        "stop_reason": "tool_use",
+                    }
+                )
+                return 200, body, f"http-a-{len(calls)}", {}
+            body = json.dumps(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "BEEFAPI_CURSOR_V1_RETRY_23S_OK"}
+                    ],
+                    "stop_reason": "end_turn",
+                }
+            )
+            return 200, body, f"http-b-{len(calls)}", {}
+
+        result = execute_tool_replay(
+            spec={"mode": "retry", "min_tool_uses": 1},
+            model="claude-opus-5",
+            prompt="call canary",
+            marker="BEEFAPI_CURSOR_V1_RETRY_23S_OK",
+            offsets=(23, 180),
+            exchange=exchange,
+            sleeper=lambda _seconds: None,
+        )
+        self.assertEqual("pass", result.status, result.detail)
+        self.assertEqual(4, len(calls))
+        self.assertEqual(calls[1], calls[2])
+        self.assertEqual(calls[1], calls[3])
+        http_ids = [item["http_request_id_hash"] for item in result.attempts]
+        self.assertEqual(len(http_ids), len(set(http_ids)))
+        self.assertNotIn("toolu_01ReplayLive", json.dumps(result.evidence))
+
+    def test_replay_receipt_drift_is_not_idempotent(self):
+        self.assertEqual(
+            "fail",
+            evaluate_idempotent_retries(
+                [
+                    {
+                        "stage": "b",
+                        "offset_seconds": 0,
+                        "http_status": 200,
+                        "request_hash": "abc",
+                        "http_request_id_hash": "h1",
+                        "receipt_hash": "rec-1",
+                        "terminal_hash": "term",
+                    },
+                    {
+                        "stage": "c",
+                        "offset_seconds": 23,
+                        "http_status": 200,
+                        "request_hash": "abc",
+                        "http_request_id_hash": "h2",
+                        "receipt_hash": "rec-2",
+                        "terminal_hash": "term",
+                    },
+                ]
+            ).status,
+        )
 
 
 class ServerToolStreamAndClassifierTests(unittest.TestCase):
@@ -439,6 +797,51 @@ class LifecycleAndReportTests(unittest.TestCase):
                 ]
             ).status,
         )
+
+    def test_receipt_uniqueness_ignores_shared_http_request_hashes(self):
+        http_hash = correlate_id("shared-http-request")
+        first = CellResult(
+            "a/cell",
+            "pass",
+            "client",
+            "now",
+            1,
+            "route",
+            "model",
+            "one",
+            [],
+            {
+                "server_evidence": {
+                    "terminal": {
+                        "http_request_id_hash": http_hash,
+                        "status": "completed",
+                    },
+                    "receipt": {"id_hash": correlate_id("receipt-a"), "state": "final"},
+                }
+            },
+        )
+        second = CellResult(
+            "b/cell",
+            "pass",
+            "client",
+            "now",
+            1,
+            "route",
+            "model",
+            "two",
+            [],
+            {
+                "server_evidence": {
+                    "terminal": {
+                        "http_request_id_hash": http_hash,
+                        "status": "completed",
+                    },
+                    "receipt": {"id_hash": correlate_id("receipt-b"), "state": "final"},
+                }
+            },
+        )
+        self.assertEqual([], evaluate_receipt_uniqueness([first, second]))
+        self.assertEqual(["pass", "pass"], [first.status, second.status])
 
     def test_receipt_uniqueness_fails_colliding_pass_cells(self):
         hashed = correlate_id("shared-receipt")

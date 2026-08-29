@@ -8,6 +8,25 @@ The executable inventory is `manifests/cursor-agent-v1-completion.json`.
 Scenarios live in `scenarios/cursor-agent-v1.json` plus the existing trailing
 system, local-tool, web-search, and session-resume cases.
 
+## Multi-stage tool driver
+
+Retry, covering-set, mixed, custom-tool, and MCP HTTP scenarios do not ship
+static assistant history. `tool_replay.py` drives public Messages traffic:
+
+1. Stage A sends `tools` plus a forcing `tool_choice` (`{"type":"tool","name":...}`
+   or `{"type":"any"}` for a batch). It parses `content[]` blocks with
+   `type=tool_use` from JSON or SSE `data:` frames and keeps the exact assistant
+   `content` array.
+2. Stage B rebuilds `messages` as original user, that assistant message, then a
+   user turn of `tool_result` blocks whose `tool_use_id` values are the returned
+   ids. Mixed adds a text block on the same user turn. Covering-set may append
+   `toolu_historical_routed_*` extras only after a real parked batch exists.
+3. Stage C POSTs the exact Stage B payload at +23s and +180s. Terminal
+   semantics and `receipt.id_hash` must match. `http_request_id_hash` may change.
+
+If covering-set or MCP Stage A returns fewer than two live `tool_use` ids, the
+cell is `blocked` rather than a pass on synthetic history.
+
 ## Why this lock exists
 
 Type64 manifests already advertise `tool.shell`, `tool.custom`, `tool.web`, and
@@ -22,15 +41,22 @@ completion.
 |---|---|---|
 | Usage | `observed_usage` and `billing_estimate` are both present and distinct. Type64 input/cache quality is `unknown` or `estimated`. | Flat `prompt_tokens: 0` / `cache_tokens: 0` treated as measured. Observed quality `measured` for unobservable fields. |
 | Tool catalog | Caller canaries (`Bash`, `Read`, `beefapi_conformance_canary`) remain visible. | Cursor native shell/fs names appear in the visible catalog (`Shell`, `ReadFile`, `DeleteFile`, `edit_file`, `list_dir`). |
-| Tool results | Identical completed `tool_result` retries at +23s and +3m stay 2xx with the same payload hash. Covering-set results and `tool_result` plus ordinary text stay 2xx. | Any of those requests 4xx, or a retry payload drifts. |
+| Tool results | Stage A returns a live `tool_use` id. Stage B sends that exact assistant history plus a real `tool_result`. Stage C at +23s/+180s replays Stage B with the same billing receipt and terminal semantics. HTTP request ids may differ. Covering-set and mixed cases park a real returned batch first. | Static `toolu_conformance_*` history. Marker-only custom-tool answers. Stage C new consume/receipt. Covering-set without a real two-call parked batch (blocked). |
 | Hosted web | Server-tool count, progress, and citations are present. Claude Code does not execute `WebSearch`/`WebFetch` itself. | Count-only receipts, missing citations/progress, or a local web-search tool_use. |
-| MCP | Observed spans match the declared serial or parallel contract. | Serial spans overlap, or parallel spans do not overlap. |
+| MCP | Spans correlate to real returned `tool_use` ids and match the declared serial or parallel contract. | Arbitrary `mcp` JSON, spans without matching tool ids, or serial/parallel mismatch. |
 | Thinking | First-byte is measured and the stream emits keepalive or progress during thinking-only time. | Silent wait until the final message. |
 | Classifier | Claude Code auto-mode runs without `bypassPermissions` and classifier evidence is observed. | Classifier scenario uses bypass mode or produces no classifier evidence. |
 | Lifecycle | Disconnect aborts an in-flight request then completes uniquely. Restart issues a new receipt hash. Receipt hashes do not collide across cells. | Reused receipt correlation, or a required abort never happens. |
 
-Reports persist `request_id_hash` / `id_hash` (`sha256:` plus 16 hex chars). Raw
-request ids, receipt ids, and `resp_bf_agentv1_*` public ids are not stored.
+Reports persist `http_request_id_hash` (transport) and `receipt.id_hash`
+(billing) as `sha256:` plus 16 hex chars. Those identities are not interchangeable.
+Raw request ids, receipt ids, `tool_use` ids, and `resp_bf_agentv1_*` public ids
+are not stored.
+
+Claude Code, Codex CLI, Grok Build, and WorkBuddy each need their applicable
+text / local-or-custom-tool / session cells. Missing required binaries fail
+release. Anthropic hosted web-search blocks are not required from Codex, Grok,
+or WorkBuddy.
 
 ## Critical gates
 

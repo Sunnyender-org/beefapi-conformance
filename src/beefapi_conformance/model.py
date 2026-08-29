@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -241,6 +242,7 @@ class Scenario:
     retry_offsets_seconds: tuple[int, ...] = ()
     mcp_mode: str | None = None
     evidence_requirements: frozenset[str] = frozenset()
+    tool_replay: dict[str, Any] | None = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Scenario:
@@ -284,6 +286,28 @@ class Scenario:
             or not all(isinstance(item, str) and item for item in requirements)
         ):
             raise ContractError("scenario.evidence_requirements must be a string array")
+        tool_replay = raw.get("tool_replay")
+        if tool_replay is not None:
+            if not isinstance(tool_replay, dict) or not str(
+                tool_replay.get("mode") or ""
+            ):
+                raise ContractError("scenario.tool_replay must be an object with mode")
+            if tool_replay.get("mode") not in {
+                "retry",
+                "covering",
+                "mixed",
+                "custom",
+                "mcp",
+            }:
+                raise ContractError(
+                    f"scenario.tool_replay.mode invalid: {tool_replay.get('mode')}"
+                )
+        if http_payload is not None and "toolu_conformance_" in json.dumps(
+            http_payload, default=str
+        ):
+            raise ContractError(
+                "scenario.http_payload must not embed static synthetic tool_use ids"
+            )
         return cls(
             id=_required(raw, "id"),
             name=_required(raw, "name"),
@@ -303,6 +327,7 @@ class Scenario:
             retry_offsets_seconds=tuple(offsets or ()),
             mcp_mode=mcp_mode,
             evidence_requirements=frozenset(requirements or ()),
+            tool_replay=tool_replay,
         )
 
 

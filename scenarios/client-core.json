@@ -14,6 +14,19 @@
       ]
     },
     {
+      "id": "claude-code-dynamic-system",
+      "name": "Released Claude Code with dynamic agent and skill context",
+      "tier": "merge",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["text", "client.trailing_system"],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "turns": [
+        {"prompt": "Reply exactly BEEFAPI_CLAUDE_DYNAMIC_SYSTEM_OK.", "marker": "BEEFAPI_CLAUDE_DYNAMIC_SYSTEM_OK", "expected_events": []}
+      ]
+    },
+    {
       "id": "local-tool-read",
       "name": "Read a fixture through the native shell tool",
       "tier": "merge",

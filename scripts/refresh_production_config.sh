@@ -23,7 +23,7 @@ token_sql="SELECT key FROM tokens WHERE id=${token_id} AND status=1 AND deleted_
 token_key=$(db_query "$token_sql" | tr -d '\r\n')
 [[ ${#token_key} -eq 48 ]] || { echo "acceptance token lookup failed" >&2; exit 1; }
 
-channel_sql="SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT id,type,status,models,test_model FROM channels WHERE status=1 AND position('${group}' in \"group\")>0 ORDER BY id) t;"
+channel_sql="SELECT COALESCE(json_agg(row_to_json(t)), '[]'::json) FROM (SELECT id,type,status,models,test_model,CASE WHEN NULLIF(btrim(setting),'') IS NULL THEN false ELSE COALESCE((setting::jsonb ->> 'cursor_agent_v1_native_web_search')::boolean,false) END AS cursor_agent_v1_native_web_search FROM channels WHERE status=1 AND position('${group}' in \"group\")>0 ORDER BY id) t;"
 channels_json=$(db_query "$channel_sql" | tr -d '\r\n')
 channel_count=$(jq -er 'if type=="array" and length>0 then length else error("empty channel snapshot") end' <<<"$channels_json")
 

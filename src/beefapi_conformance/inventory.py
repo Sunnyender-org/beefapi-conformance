@@ -23,6 +23,18 @@ CURSOR_CAPABILITIES = [
     "compact",
     "images",
 ]
+CURSOR_AGENT_V1_CAPABILITIES = [
+    "text",
+    "stream",
+    "tool.shell",
+    "tool.custom",
+    "session.resume",
+    "responses",
+    "messages",
+    "chat",
+    "messages.trailing_system",
+    "client.trailing_system",
+]
 
 
 def fetch_model_ids(base_url: str, token: str, timeout: int = 30) -> set[str]:
@@ -50,12 +62,29 @@ def build_live_inventory(
     routes: list[dict[str, Any]] = []
     model_routes: dict[str, list[str]] = {}
     for channel in channels:
-        if int(channel.get("status", 0)) != 1 or int(channel.get("type", 0)) != 62:
+        channel_type = int(channel.get("type", 0))
+        if int(channel.get("status", 0)) != 1 or channel_type not in {62, 64}:
             continue
         channel_id = int(channel.get("id", 0))
         if channel_id <= 0:
             continue
-        route_id = f"cursor-channel-{channel_id}"
+        route_id = (
+            f"cursor-agent-v1-channel-{channel_id}"
+            if channel_type == 64
+            else f"cursor-channel-{channel_id}"
+        )
+        route_name = (
+            f"Cursor Agent v1 channel {channel_id}"
+            if channel_type == 64
+            else f"Cursor Native channel {channel_id}"
+        )
+        capabilities = list(
+            CURSOR_AGENT_V1_CAPABILITIES if channel_type == 64 else CURSOR_CAPABILITIES
+        )
+        if channel_type == 64 and bool(
+            channel.get("cursor_agent_v1_native_web_search", False)
+        ):
+            capabilities.append("tool.web")
         model_ids = [
             item.strip()
             for item in str(channel.get("models", "")).split(",")
@@ -73,19 +102,20 @@ def build_live_inventory(
         routes.append(
             {
                 "id": route_id,
-                "name": f"Cursor Native channel {channel_id}",
+                "name": route_name,
                 "auth_mode": "gateway_token",
                 "base_url": base_url.rstrip("/"),
                 "token_env": token_env,
                 "group": group,
                 "channel_id": channel_id,
+                "channel_type": channel_type,
                 "pin_channel": True,
                 "test_model": test_model,
                 "evidence_provider": "beefapi_token_log",
                 "release_evidence_required": True,
                 "clients": CURSOR_CLIENTS,
                 "protocols": CURSOR_PROTOCOLS,
-                "capabilities": CURSOR_CAPABILITIES,
+                "capabilities": capabilities,
             }
         )
         for model_id in model_ids:
@@ -98,7 +128,14 @@ def build_live_inventory(
             "name": model_id,
             "routes": sorted(route_ids),
             "clients": CURSOR_CLIENTS,
-            "capabilities": CURSOR_CAPABILITIES,
+            "capabilities": sorted(
+                {
+                    capability
+                    for route in routes
+                    if route["id"] in route_ids
+                    for capability in route["capabilities"]
+                }
+            ),
             "aliases": {},
         }
         for model_id, route_ids in sorted(model_routes.items())

@@ -1,10 +1,29 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 TIERS = {"pr": 0, "merge": 1, "nightly": 2, "release": 3}
+SENSITIVE_HTTP_PAYLOAD_KEYS = {
+    "accesstoken",
+    "apikey",
+    "authorization",
+    "authtoken",
+    "bearertoken",
+    "clientsecret",
+    "cookie",
+    "idtoken",
+    "password",
+    "proxyauthorization",
+    "refreshtoken",
+    "setcookie",
+    "token",
+    "xapikey",
+}
+TOKEN_LITERAL = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
+BEARER_LITERAL = re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{8,}\b", re.IGNORECASE)
 
 
 class ContractError(ValueError):
@@ -24,6 +43,28 @@ def _required(raw: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise ContractError(f"{key} is required")
     return value
+
+
+def _validate_http_payload_credentials(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).strip().lower())
+            if normalized in SENSITIVE_HTTP_PAYLOAD_KEYS:
+                raise ContractError(
+                    f"scenario.http_payload must not persist credential key {key!r}"
+                )
+            _validate_http_payload_credentials(item)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _validate_http_payload_credentials(item)
+        return
+    if isinstance(value, str) and (
+        TOKEN_LITERAL.search(value) or BEARER_LITERAL.search(value)
+    ):
+        raise ContractError(
+            "scenario.http_payload must not persist credential literals"
+        )
 
 
 @dataclass(frozen=True)
@@ -71,6 +112,7 @@ class Route:
     pin_channel: bool = False
     evidence_provider: str | None = None
     test_model: str | None = None
+    channel_type: int | None = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Route:
@@ -112,6 +154,11 @@ class Route:
             pin_channel=pin_channel,
             evidence_provider=evidence_provider,
             test_model=raw.get("test_model"),
+            channel_type=(
+                int(raw["channel_type"])
+                if raw.get("channel_type") is not None
+                else None
+            ),
         )
 
 
@@ -190,6 +237,7 @@ class Scenario:
     requires_local_tools: bool
     turns: tuple[Turn, ...]
     http_endpoint: str | None = None
+    http_payload: dict[str, Any] | None = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Scenario:
@@ -207,6 +255,15 @@ class Scenario:
             not isinstance(endpoint, str) or not endpoint.startswith("/")
         ):
             raise ContractError("http scenario requires an absolute http_endpoint path")
+        http_payload = raw.get("http_payload")
+        if http_payload is not None and (
+            kind != "http" or not isinstance(http_payload, dict)
+        ):
+            raise ContractError(
+                "scenario.http_payload must be an object on an HTTP scenario"
+            )
+        if http_payload is not None:
+            _validate_http_payload_credentials(http_payload)
         return cls(
             id=_required(raw, "id"),
             name=_required(raw, "name"),
@@ -222,6 +279,7 @@ class Scenario:
             requires_local_tools=bool(raw.get("requires_local_tools", False)),
             turns=tuple(Turn.parse(item) for item in turns_raw),
             http_endpoint=endpoint,
+            http_payload=http_payload,
         )
 
 

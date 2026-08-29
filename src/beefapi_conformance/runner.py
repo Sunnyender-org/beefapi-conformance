@@ -240,16 +240,13 @@ def _run_http_cell(
     turn = cell.scenario.turns[0]
     token = _request_token(cell, base_token)
     model = cell.model.client_model(cell.client.id)
-    if cell.scenario.protocol == "messages":
+    if cell.scenario.http_payload is not None:
+        payload = _render_http_payload(cell.scenario.http_payload, model, turn.prompt)
+    elif cell.scenario.protocol == "messages":
         payload = {
             "model": model,
             "max_tokens": 128,
             "messages": [{"role": "user", "content": turn.prompt}],
-        }
-        headers = {
-            "content-type": "application/json",
-            "x-api-key": token or "",
-            "anthropic-version": "2023-06-01",
         }
     elif cell.scenario.protocol == "chat":
         payload = {
@@ -257,12 +254,20 @@ def _run_http_cell(
             "messages": [{"role": "user", "content": turn.prompt}],
             "stream": False,
         }
+    else:
+        payload = {"model": model, "input": turn.prompt, "stream": False}
+    if cell.scenario.protocol == "messages":
+        headers = {
+            "content-type": "application/json",
+            "x-api-key": token or "",
+            "anthropic-version": "2023-06-01",
+        }
+    elif cell.scenario.protocol == "chat":
         headers = {
             "content-type": "application/json",
             "authorization": f"Bearer {token or ''}",
         }
     else:
-        payload = {"model": model, "input": turn.prompt, "stream": False}
         headers = {
             "content-type": "application/json",
             "authorization": f"Bearer {token or ''}",
@@ -350,6 +355,19 @@ def _run_http_cell(
         detail,
         evidence,
     )
+
+
+def _render_http_payload(value: object, model: str, prompt: str) -> object:
+    if isinstance(value, dict):
+        return {
+            key: _render_http_payload(item, model, prompt)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_render_http_payload(item, model, prompt) for item in value]
+    if isinstance(value, str):
+        return value.replace("{{model}}", model).replace("{{prompt}}", prompt)
+    return value
 
 
 def _http_response_text(protocol: str | None, output: str) -> str:

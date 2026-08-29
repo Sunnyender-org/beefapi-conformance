@@ -25,6 +25,35 @@
       "turns": [{"prompt": "Reply exactly BEEFAPI_MESSAGES_OK.", "marker": "BEEFAPI_MESSAGES_OK", "expected_events": []}]
     },
     {
+      "id": "messages-trailing-system",
+      "name": "Anthropic Messages with Claude Code dynamic system context after user",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "required_capabilities": ["messages", "text", "messages.trailing_system"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 128,
+        "system": "x-anthropic-billing-header: cc_version=2.1.233; cc_entrypoint=sdk-cli;",
+        "messages": [
+          {"role": "user", "content": "{{prompt}}"},
+          {
+            "role": "system",
+            "content": [
+              {
+                "type": "text",
+                "text": "Available agent types and skills for this local Claude Code workspace."
+              }
+            ]
+          }
+        ]
+      },
+      "turns": [{"prompt": "Reply exactly BEEFAPI_TRAILING_SYSTEM_OK.", "marker": "BEEFAPI_TRAILING_SYSTEM_OK", "expected_events": []}]
+    },
+    {
       "id": "chat-text",
       "name": "OpenAI Chat Completions non-stream text",
       "tier": "pr",

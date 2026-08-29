@@ -102,6 +102,47 @@ class ContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ContractError, "environment variable"):
                 load_inventory(ROOT, path, ROOT / "manifests/models.example.json")
 
+    def test_http_payload_rejects_persisted_credentials(self):
+        base = {
+            "id": "secret-payload",
+            "name": "Secret payload",
+            "tier": "pr",
+            "kind": "http",
+            "protocol": "messages",
+            "http_endpoint": "/v1/messages",
+            "required_capabilities": ["messages"],
+            "turns": [
+                {
+                    "prompt": "hello",
+                    "marker": "hello",
+                    "expected_events": [],
+                }
+            ],
+        }
+        for payload in (
+            {"Authorization": "Bearer persisted-secret"},
+            {"metadata": {"cookie": "session=secret"}},
+            {"metadata": {"access_token": "secret"}},
+            {"metadata": {"refreshToken": "secret"}},
+            {"metadata": {"id-token": "secret"}},
+            {"metadata": {"clientSecret": "secret"}},
+            {"metadata": {"password": "secret"}},
+            {"metadata": {"bearer_token": "secret"}},
+            {"messages": [{"role": "user", "content": "sk-abcdef123456"}]},
+            {"messages": [{"role": "user", "content": "Bearer abcdef123456"}]},
+        ):
+            with (
+                self.subTest(payload=payload),
+                self.assertRaisesRegex(ContractError, "credential"),
+            ):
+                Scenario.parse({**base, "http_payload": payload})
+
+    def test_production_refresh_reads_native_search_from_channel_setting(self):
+        script = (ROOT / "scripts/refresh_production_config.sh").read_text()
+        self.assertIn("btrim(setting)", script)
+        self.assertIn("setting::jsonb", script)
+        self.assertNotIn("btrim(other)", script)
+
     def test_redaction_covers_explicit_and_pattern_secrets(self):
         output = redact(
             "Bearer sk-abcdef123456 api_key=plain-secret", ("plain-secret",)
@@ -142,6 +183,116 @@ class ContractTests(unittest.TestCase):
         self.assertTrue(route["pin_channel"])
         self.assertEqual("beefapi_token_log", route["evidence_provider"])
         self.assertEqual(["grok-4.6"], [item["id"] for item in models["models"]])
+
+    def test_live_inventory_includes_cursor_agent_v1_as_a_distinct_route(self):
+        routes, models = build_live_inventory(
+            channels=[
+                {
+                    "id": 301,
+                    "type": 64,
+                    "status": 1,
+                    "models": "claude-opus-5",
+                    "test_model": "claude-opus-5",
+                }
+            ],
+            public_models={"claude-opus-5"},
+            base_url="https://beefapi.example",
+            token_env="TEST_TOKEN",
+            group="cursor-agent-v1-acceptance",
+        )
+
+        self.assertEqual(1, len(routes["routes"]))
+        route = routes["routes"][0]
+        self.assertEqual("cursor-agent-v1-channel-301", route["id"])
+        self.assertEqual(64, route["channel_type"])
+        self.assertEqual(301, route["channel_id"])
+        self.assertIn("messages.trailing_system", route["capabilities"])
+        self.assertIn("client.trailing_system", route["capabilities"])
+        self.assertEqual(["claude-opus-5"], [item["id"] for item in models["models"]])
+
+    def test_trailing_system_scenarios_compile_only_for_cursor_agent_v1(self):
+        routes, models = build_live_inventory(
+            channels=[
+                {
+                    "id": 271,
+                    "type": 62,
+                    "status": 1,
+                    "models": "claude-opus-5",
+                    "test_model": "claude-opus-5",
+                },
+                {
+                    "id": 301,
+                    "type": 64,
+                    "status": 1,
+                    "models": "claude-opus-5",
+                    "test_model": "claude-opus-5",
+                },
+            ],
+            public_models={"claude-opus-5"},
+            base_url="https://beefapi.example",
+            token_env="TEST_TOKEN",
+            group="cursor-agent-v1-acceptance",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            routes_path = Path(tmp) / "routes.json"
+            models_path = Path(tmp) / "models.json"
+            routes_path.write_text(json.dumps(routes))
+            models_path.write_text(json.dumps(models))
+            inventory = load_inventory(ROOT, routes_path, models_path)
+
+        cells = compile_matrix(inventory, "release", coverage="full")
+        trailing_cells = [
+            cell
+            for cell in cells
+            if cell.scenario.id
+            in {"messages-trailing-system", "claude-code-dynamic-system"}
+        ]
+        self.assertTrue(trailing_cells)
+        self.assertEqual(
+            {"cursor-agent-v1-channel-301"},
+            {cell.route.id for cell in trailing_cells},
+        )
+        self.assertTrue(
+            any(
+                cell.client.id == "raw-http"
+                and cell.scenario.id == "messages-trailing-system"
+                for cell in trailing_cells
+            )
+        )
+        self.assertTrue(
+            any(
+                cell.client.id == "claude-code"
+                and cell.scenario.id == "claude-code-dynamic-system"
+                for cell in trailing_cells
+            )
+        )
+
+    def test_cursor_agent_v1_web_capability_follows_sanitized_channel_policy(self):
+        routes, _ = build_live_inventory(
+            channels=[
+                {
+                    "id": 301,
+                    "type": 64,
+                    "status": 1,
+                    "models": "claude-opus-5",
+                    "cursor_agent_v1_native_web_search": False,
+                },
+                {
+                    "id": 302,
+                    "type": 64,
+                    "status": 1,
+                    "models": "claude-opus-5",
+                    "cursor_agent_v1_native_web_search": True,
+                },
+            ],
+            public_models={"claude-opus-5"},
+            base_url="https://beefapi.example",
+            token_env="TEST_TOKEN",
+            group="cursor-agent-v1-acceptance",
+        )
+        by_id = {route["channel_id"]: route for route in routes["routes"]}
+        self.assertNotIn("tool.web", by_id[301]["capabilities"])
+        self.assertIn("tool.web", by_id[302]["capabilities"])
 
     def test_live_inventory_rejects_stale_channel_test_model(self):
         with self.assertRaisesRegex(ContractError, "not in its public model inventory"):
@@ -839,6 +990,123 @@ class CommandTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_raw_http_messages_can_replay_trailing_system_context(self):
+        received: list[dict] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("content-length", "0"))
+                request = json.loads(self.rfile.read(length))
+                received.append(request)
+                roles = [message.get("role") for message in request.get("messages", [])]
+                system = request.get("system", "")
+                is_claude_code = (
+                    "x-anthropic-billing-header: cc_version=" in system
+                    and "cc_entrypoint=sdk-cli;" in system
+                )
+                status = 200 if roles == ["user", "system"] and is_claude_code else 400
+                body = json.dumps(
+                    {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "BEEFAPI_TRAILING_SYSTEM_OK",
+                            }
+                        ]
+                    }
+                ).encode()
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = Client(
+                "raw-http",
+                "HTTP",
+                "raw-http",
+                ("python3",),
+                ("--version",),
+                frozenset({"text", "messages"}),
+                frozenset({"darwin"}),
+            )
+            route = Route(
+                "cursor-agent-v1-channel-301",
+                "Cursor Agent v1",
+                "gateway_token",
+                f"http://127.0.0.1:{server.server_port}",
+                None,
+                "RAW_HTTP_TEST_TOKEN",
+                frozenset({"raw-http"}),
+                frozenset({"messages"}),
+                frozenset({"text", "messages"}),
+                None,
+            )
+            model = Model(
+                "claude-opus-5",
+                "Claude Opus 5",
+                frozenset({route.id}),
+                frozenset({client.id}),
+                frozenset({"text", "messages"}),
+                {},
+            )
+            scenario = Scenario.parse(
+                {
+                    "id": "messages-trailing-system",
+                    "name": "Claude Code dynamic system context after user",
+                    "tier": "pr",
+                    "kind": "http",
+                    "protocol": "messages",
+                    "http_endpoint": "/v1/messages",
+                    "required_capabilities": ["messages", "text"],
+                    "timeout_seconds": 10,
+                    "requires_local_tools": False,
+                    "http_payload": {
+                        "model": "{{model}}",
+                        "max_tokens": 128,
+                        "system": "x-anthropic-billing-header: cc_version=2.1.233; cc_entrypoint=sdk-cli;",
+                        "messages": [
+                            {"role": "user", "content": "{{prompt}}"},
+                            {
+                                "role": "system",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": "Available agent types and skills",
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    "turns": [
+                        {
+                            "prompt": "Reply exactly BEEFAPI_TRAILING_SYSTEM_OK.",
+                            "marker": "BEEFAPI_TRAILING_SYSTEM_OK",
+                            "expected_events": [],
+                        }
+                    ],
+                }
+            )
+            os.environ["RAW_HTTP_TEST_TOKEN"] = "plain-test-token"
+            result = run_cell(MatrixCell(client, route, model, scenario))
+            self.assertEqual("pass", result.status, result)
+            self.assertEqual(
+                ["user", "system"],
+                [message["role"] for message in received[0]["messages"]],
+            )
+        finally:
+            os.environ.pop("RAW_HTTP_TEST_TOKEN", None)
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_mock_client_runs_and_report_passes(self):
         binary = str(ROOT / "tests/fixtures/mock_agent.py")
         client = Client(

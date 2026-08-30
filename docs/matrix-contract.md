@@ -73,6 +73,11 @@ HTTP success, a local unit test, push, deployment, or one clean text turn cannot
 substitute for this set.
 
 Type64 usage evidence must distinguish `observed_usage` from `billing_estimate`.
-Input and cache tokens are unobservable on that route: they are `unknown` or
-`estimated`, never a measured zero. Report artifacts persist only hashed
+The currently deployed adapter does not expose authoritative per-HTTP input and
+cache tokens: they remain `unknown` or `estimated`, never a measured zero.
+Raw Cursor `TurnEndedUpdate` counters can exist, but an upstream turn may span
+caller-tool HTTP requests; their presence alone does not establish per-request
+attribution or authorize adding them to already settled usage. A future adapter
+must preserve counter presence and scope before the evidence contract can mark
+per-request values measured. Report artifacts persist only hashed
 request/receipt correlation ids, not raw identifiers.

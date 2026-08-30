@@ -30,10 +30,12 @@ from .cursor_agent_v1 import (
 from .model import CellResult, MatrixCell, TurnResult
 from .redact import redact
 from .tool_replay import (
+    evaluate_generation_receipts,
     evaluate_mcp_spans,
     evaluate_none_terminal,
     evaluate_replay_identity,
     execute_tool_replay,
+    generation_receipt_gap,
     parse_assistant_text,
     parse_json_objects,
     sleep_deltas,
@@ -699,21 +701,22 @@ def bind_replay_attempt_receipts(
     started_epoch: int = 0,
     fence: set[str] | None = None,
 ) -> None:
-    """Attach the Stage B receipt from an exact request-id log match.
+    """Attach independent Stage A/B receipts from exact request-id log matches.
 
     Stage C duplicate request ids must resolve to zero consume logs. Do not copy
     Stage B's receipt onto C; mark C as replay_without_consume / no_new_charge.
-    Stage A provisional rows are ignored for this replay assertion.
+    A/B are new generation segments; neither may borrow the other's receipt.
     """
     for attempt in attempts:
-        if not isinstance(attempt, dict) or attempt.get("stage") not in {"b", "c"}:
+        if not isinstance(attempt, dict) or attempt.get("stage") not in {"a", "b", "c"}:
             continue
+        attempt.pop("receipt_state", None)
         raw_id = str(attempt.get("_http_request_id") or "")
         if not raw_id:
-            attempt["consume_match_count"] = 0
+            attempt["consume_match_count"] = None
             attempt["receipt_hash"] = ""
             attempt.pop("_bound_payload", None)
-            _mark_stage_c_replay(attempt, zero_consume=True)
+            _mark_stage_c_replay(attempt, zero_consume=False)
             continue
         matches = _matching_usage_logs(cell, logs, started_epoch, fence, raw_id)
         attempt["consume_match_count"] = len(matches)
@@ -751,6 +754,18 @@ def _replay_no_new_charge_evidence(
     attempts: list[dict[str, object]],
 ) -> dict[str, object]:
     return {
+        "stages": [
+            {
+                "stage": item.get("stage"),
+                "offset_seconds": item.get("offset_seconds", 0),
+                "http_request_id_hash": item.get("http_request_id_hash"),
+                "receipt_hash": item.get("receipt_hash") or "",
+                "receipt_state": item.get("receipt_state") or "",
+                "consume_match_count": item.get("consume_match_count"),
+            }
+            for item in attempts
+            if isinstance(item, dict) and item.get("stage") in {"a", "b", "c"}
+        ],
         "stage_c": [
             {
                 "http_request_id_hash": item.get("http_request_id_hash"),
@@ -760,7 +775,7 @@ def _replay_no_new_charge_evidence(
             }
             for item in attempts
             if isinstance(item, dict) and item.get("stage") == "c"
-        ]
+        ],
     }
 
 
@@ -782,22 +797,7 @@ def _replay_receipt_diagnostics(
 
 
 def _replay_receipt_gap(attempts: list[dict[str, object]]) -> str:
-    """Classify Stage B/C receipt evidence as ok, missing, or conflict."""
-    stage_b = [
-        item for item in attempts if isinstance(item, dict) and item.get("stage") == "b"
-    ]
-    if not stage_b:
-        return "missing"
-    for item in stage_b:
-        matches = item.get("consume_match_count")
-        if matches is None or matches == 0:
-            return "missing"
-        if not isinstance(matches, int) or matches != 1:
-            return "conflict"
-        if not item.get("receipt_hash"):
-            if str(item.get("receipt_state") or "") == "final":
-                return "conflict"
-            return "missing"
+    """A/B must settle; a C duplicate charge remains a conflict even if A is late."""
     for item in attempts:
         if not isinstance(item, dict) or item.get("stage") != "c":
             continue
@@ -806,7 +806,7 @@ def _replay_receipt_gap(attempts: list[dict[str, object]]) -> str:
             return "conflict"
         if item.get("receipt_hash"):
             return "conflict"
-    return "ok"
+    return generation_receipt_gap(attempts)
 
 
 def _exact_request_ids(request_id: str, request_ids: object) -> list[str]:
@@ -928,13 +928,16 @@ def _bind_replay_server_evidence(
                 and item.get("stage") == "b"
                 and isinstance(item.get("_bound_payload"), dict)
             ]
-            if bound:
+            settled = (
+                evaluate_replay_identity(attempts, require_receipts=True)
+                if cell.scenario.retry_offsets_seconds
+                else evaluate_generation_receipts(attempts)
+            )
+            if bound and settled.ok:
                 payload = dict(bound[0])
                 payload.update(diagnostics)
                 return payload
-            last_detail = (
-                "stage B request id did not resolve to exactly one final receipt"
-            )
+            last_detail = settled.detail
             if _replay_receipt_gap(attempts) == "conflict":
                 return {"status": "fail", "detail": last_detail, **diagnostics}
         except (
@@ -1888,20 +1891,7 @@ def _commit_batch_match(
 
 
 def _evaluate_single_stage_receipts(attempts: list[dict[str, object]]):
-    from .cursor_agent_v1 import Evaluation
-
-    stage_b = [
-        item for item in attempts if isinstance(item, dict) and item.get("stage") == "b"
-    ]
-    if not stage_b:
-        return Evaluation("fail", "stage B completion is missing")
-    for item in stage_b:
-        if item.get("consume_match_count") != 1 or not item.get("receipt_hash"):
-            return Evaluation(
-                "fail",
-                "stage B request id did not resolve to exactly one final receipt",
-            )
-    return Evaluation("pass")
+    return evaluate_generation_receipts(attempts)
 
 
 def _apply_public_artifact_gate(

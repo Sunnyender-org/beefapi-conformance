@@ -2117,7 +2117,7 @@ class RunnerTests(unittest.TestCase):
                                 "type": "text",
                                 "text": "BEEFAPI_TRAILING_SYSTEM_OK",
                             }
-                        ]
+                        ],
                     }
                 ).encode()
                 self.send_response(status)

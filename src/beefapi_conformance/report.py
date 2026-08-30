@@ -83,6 +83,14 @@ def write_report(report: dict[str, object], output_dir: Path) -> None:
                 case, "skipped", message=str(result.get("detail", ""))
             )
     tmp_junit = output_dir / "junit.xml.tmp"
+    if report.get("unfinished"):
+        case = ElementTree.SubElement(
+            suite, "testcase", name="run-completion", time="0"
+        )
+        ElementTree.SubElement(
+            case, "failure", message="conformance run did not complete"
+        )
+    suite.set("tests", str(len(suite.findall("testcase"))))
     ElementTree.ElementTree(suite).write(
         tmp_junit, encoding="utf-8", xml_declaration=True
     )

@@ -398,7 +398,70 @@ def evaluate_replay_identity(
                 "billing receipt identity drifted across replay; "
                 "HTTP request ids are not receipts",
             )
+    if require_receipts:
+        return evaluate_generation_receipts(attempts)
     return Evaluation("pass")
+
+
+def evaluate_generation_receipts(attempts: list[dict[str, Any]]) -> Evaluation:
+    """Each new model generation A/B owns one exact, distinct final receipt."""
+    receipts: dict[str, str] = {}
+    for stage in ("b", "a"):
+        rows = [item for item in attempts if item.get("stage") == stage]
+        if len(rows) != 1:
+            return Evaluation("fail", f"stage {stage.upper()} is missing or ambiguous")
+        item = rows[0]
+        if (
+            item.get("consume_match_count") != 1
+            or item.get("receipt_state") != "final"
+            or not item.get("receipt_hash")
+            or not item.get("http_request_id_hash")
+        ):
+            return Evaluation(
+                "fail", f"stage {stage.upper()} lacks exactly one final receipt"
+            )
+        receipts[stage] = str(item["receipt_hash"])
+        header = item.get("response_receipt_hash")
+        if header and header != receipts[stage]:
+            return Evaluation(
+                "fail", f"stage {stage.upper()} response receipt header drifted"
+            )
+    if receipts["a"] == receipts["b"]:
+        return Evaluation("fail", "new generation stages A and B reused one receipt")
+    request_ids = {
+        item.get("http_request_id_hash")
+        for item in attempts
+        if item.get("stage") in {"a", "b"}
+    }
+    if len(request_ids) != 2:
+        return Evaluation(
+            "fail", "generation stages A and B reused one HTTP request id"
+        )
+    return Evaluation("pass")
+
+
+def generation_receipt_gap(attempts: list[dict[str, Any]]) -> str:
+    """Polling hint only; the same generation evaluator owns the pass decision."""
+    if evaluate_generation_receipts(attempts).ok:
+        return "ok"
+    for stage in ("a", "b"):
+        rows = [item for item in attempts if item.get("stage") == stage]
+        if len(rows) != 1:
+            return "conflict"
+        item = rows[0]
+        count = item.get("consume_match_count")
+        if isinstance(count, int) and count > 1:
+            return "conflict"
+    if any(
+        item.get("stage") in {"a", "b"}
+        and (
+            item.get("consume_match_count") in {None, 0}
+            or item.get("receipt_state") == "provisional"
+        )
+        for item in attempts
+    ):
+        return "missing"
+    return "conflict"
 
 
 def _stage_c_consume_violation(
@@ -407,6 +470,10 @@ def _stage_c_consume_violation(
     for item in stage_c:
         offset = item.get("offset_seconds")
         matches = item.get("consume_match_count")
+        if require_receipts and not item.get("http_request_id_hash"):
+            return Evaluation(
+                "fail", f"stage C at +{offset}s lacks an exact request id"
+            )
         if require_receipts and matches is None:
             return Evaluation(
                 "fail",

@@ -39,6 +39,13 @@ static assistant history. `tool_replay.py` drives public Messages traffic:
    to expose that header; Stage B's consume receipt plus C's zero logs plus an
    identical terminal snapshot is the supported proof.
 
+Each new model-generation segment settles independently: A and B each require
+an exact HTTP request-id match to one final consume receipt, and their receipt
+identities must differ. A missing/provisional A cannot borrow B's final receipt.
+The same rule applies to non-retry custom/mixed calls. C remains a replay of B:
+zero new consume logs, unchanged terminal semantics, and no copied consume
+receipt. Reports include allowlisted, hashed A/B/C stage receipt evidence.
+
 If covering-set or MCP Stage A returns fewer than two live `tool_use` ids, the
 cell is `blocked` rather than a pass on synthetic history.
 

@@ -1006,6 +1006,7 @@ class ToolReplayDriverTests(unittest.TestCase):
     def test_stage_b_one_consume_log_stage_c_zero_passes(self):
         cell = self._retry_cell()
         attempts = self._attempts("req-b-exact", "req-c-exact")
+        attempts.append(self._generation_a())
         logs = [
             self._consume_log(cell, "req-a", "cursor-agent-v1:receipt-a"),
             self._consume_log(cell, "req-b-exact", "cursor-agent-v1:receipt-shared"),
@@ -1127,7 +1128,7 @@ class ToolReplayDriverTests(unittest.TestCase):
         )
         self.assertEqual("fail", _evaluate_single_stage_receipts([]).status)
         self.assertEqual(
-            "pass",
+            "fail",
             _evaluate_single_stage_receipts(
                 [{"stage": "b", "consume_match_count": 1, "receipt_hash": "rec"}]
             ).status,
@@ -1138,12 +1139,21 @@ class ToolReplayDriverTests(unittest.TestCase):
         matching = self._attempts("req-b-exact", "req-c-exact")
         matching[0]["consume_match_count"] = 1
         matching[0]["receipt_hash"] = shared
+        matching[0]["receipt_state"] = "final"
         matching[0]["response_receipt_hash"] = shared
         matching[1]["consume_match_count"] = 0
         matching[1]["receipt_hash"] = ""
         matching[1]["response_receipt_hash"] = shared
         matching[1]["replay_without_consume"] = True
         matching[1]["no_new_charge"] = True
+        matching.append(
+            {
+                **self._generation_a(),
+                "consume_match_count": 1,
+                "receipt_hash": correlate_id("cursor-agent-v1:receipt-a"),
+                "receipt_state": "final",
+            }
+        )
         self.assertEqual(
             "pass",
             evaluate_replay_identity(matching, require_receipts=True).status,
@@ -1160,6 +1170,7 @@ class ToolReplayDriverTests(unittest.TestCase):
         route = replace(cell.route, base_url=None, base_url_env="TEST_BASE_URL")
         cell = MatrixCell(cell.client, route, cell.model, cell.scenario)
         attempts = self._attempts("req-b-exact", "req-c-exact")
+        attempts.append(self._generation_a())
         seen_urls: list[str] = []
 
         def fake_urlopen(request, timeout=0):
@@ -1168,9 +1179,10 @@ class ToolReplayDriverTests(unittest.TestCase):
                 {
                     "success": True,
                     "data": [
+                        self._consume_log(cell, "req-a", "cursor-agent-v1:receipt-a"),
                         self._consume_log(
                             cell, "req-b-exact", "cursor-agent-v1:receipt-shared"
-                        )
+                        ),
                     ],
                 },
                 {"X-New-Api-Commit": "commit-sha"},
@@ -1190,6 +1202,7 @@ class ToolReplayDriverTests(unittest.TestCase):
     def test_deferred_batch_correlates_raw_ids_then_scrubs_them(self):
         cell = self._retry_cell()
         attempts = self._attempts("req-b-exact", "req-c-exact")
+        attempts.append(self._generation_a())
         receipt = "cursor-agent-v1:receipt-shared"
         old = self._consume_log(cell, "old", "old-receipt")
         old["created_at"] = 100
@@ -1254,7 +1267,7 @@ class ToolReplayDriverTests(unittest.TestCase):
 
     def test_deferred_batch_rereads_empty_snapshot_until_stage_b_final(self):
         cell = self._retry_cell()
-        attempts = self._attempts("req-b-exact", "req-c-exact")
+        attempts = [self._generation_a(), *self._attempts("req-b-exact", "req-c-exact")]
         receipt = "cursor-agent-v1:receipt-shared"
         old = self._consume_log(cell, "old", "old-receipt")
         old["created_at"] = 100
@@ -1302,6 +1315,7 @@ class ToolReplayDriverTests(unittest.TestCase):
                     "success": True,
                     "data": [
                         old,
+                        self._consume_log(cell, "req-a", "cursor-agent-v1:initial-a"),
                         self._consume_log(cell, "req-b-exact", receipt),
                     ],
                 },
@@ -1407,6 +1421,14 @@ class ToolReplayDriverTests(unittest.TestCase):
         slept.assert_not_called()
         self.assertNotIn("req-b-exact", json.dumps(payload))
         self.assertNotIn("cursor-agent-v1:receipt-a", json.dumps(payload))
+
+    def _generation_a(self):
+        return {
+            "stage": "a",
+            "offset_seconds": 0,
+            "_http_request_id": "req-a",
+            "http_request_id_hash": correlate_id("req-a"),
+        }
 
 
 class ServerToolStreamAndClassifierTests(unittest.TestCase):

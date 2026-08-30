@@ -43,6 +43,16 @@ evidence requires:
 
 This prevents a recent earlier request from satisfying a new cell.
 Raw HTTP cells additionally bind the response `X-Oneapi-Request-Id` exactly.
+Grok Build's `models.session_summary` is pinned to the tested client model as
+well as `models.default`: title generation is a separate real inference request,
+not proof that the main CLI turn failed and not a request to silently remap at
+the gateway. `scripts/smoke_grok_local.py` uses an intentionally non-built-in
+model and requires an observed title request with no unexpected model ids;
+the assistant marker alone cannot pass this check. The stub is local protocol
+evidence only; paid release acceptance must reconcile title requests separately
+from the main tool loop and must not require every client request to share one
+final receipt (a tool-only title response may remain provisional).
+
 Native tool loops may legitimately create several requests per turn, so their
 isolation boundary is the dedicated Key plus serialized workflow concurrency;
 all rows in the fenced window are assigned to that cell, and it must contain at

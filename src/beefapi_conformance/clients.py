@@ -382,6 +382,7 @@ def _workbuddy_gateway_model(cell: MatrixCell) -> str:
     if (
         not model_id
         or selected != model_id
+        or model_id.strip().lower().startswith("custom:")
         or model_id.strip().lower() in _WORKBUDDY_UNSAFE_GATEWAY_MODELS
     ):
         raise RuntimeError(

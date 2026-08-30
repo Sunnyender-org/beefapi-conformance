@@ -129,7 +129,10 @@ class WorkBuddyGatewayTests(unittest.TestCase):
                 auth_mode="gateway_token",
                 aliases={"workbuddy-cli": "my-private-model"},
             )
-            for cell in (auto_cell, remapped):
+            self_named_custom = self.cell(
+                auth_mode="gateway_token", model_id="custom:wb-existing-private-model"
+            )
+            for cell in (auto_cell, remapped, self_named_custom):
                 command = ClientCommand(
                     cell,
                     "codebuddy",

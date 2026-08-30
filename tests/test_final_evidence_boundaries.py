@@ -9,6 +9,34 @@ from beefapi_conformance.tool_replay import evaluate_none_terminal
 
 
 class FinalEvidenceBoundaries(unittest.TestCase):
+    def test_messages_deltas_join_within_content_block_without_extra_newlines(self):
+        stream = "\n\n".join(
+            "data: " + json.dumps(event)
+            for event in [
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": "MA"},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "RK"},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "ER"},
+                },
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": "next block"},
+                },
+            ]
+        )
+        self.assertEqual(_http_response_text("messages", stream), "MARKER\nnext block")
+
     def test_non_assistant_message_is_not_a_response(self):
         for role in ("user", "system", None):
             with self.subTest(role=role):

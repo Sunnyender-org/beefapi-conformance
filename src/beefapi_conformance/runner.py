@@ -1140,15 +1140,39 @@ def _http_response_text(protocol: str | None, output: str) -> str:
         body = json.loads(output)
     except json.JSONDecodeError:
         fragments: list[str] = []
+        message_blocks: dict[int, list[str]] = {}
         for line in output.splitlines():
             if not line.startswith("data:"):
                 continue
             data = line[5:].strip()
             if not data or data == "[DONE]":
                 continue
+            if protocol == "messages":
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                index = event.get("index", 0)
+                text = None
+                if event.get("type") == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                        text = delta.get("text")
+                elif event.get("type") == "content_block_start":
+                    block = event.get("content_block", {})
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text")
+                if type(index) is int and index >= 0 and isinstance(text, str):
+                    message_blocks.setdefault(index, []).append(text)
+                    continue
             fragment = _http_response_text(protocol, data)
             if fragment:
                 fragments.append(fragment)
+        fragments.extend(
+            "".join(message_blocks[index]) for index in sorted(message_blocks)
+        )
         return "\n".join(fragments)
     if isinstance(body, dict) and (
         body.get("role") == "user" or body.get("type") == "error"

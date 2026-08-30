@@ -11,6 +11,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from portable import posix_bash
+
 from beefapi_conformance.clients import ClientCommand
 from beefapi_conformance.cursor_agent_v1 import (
     CLASSIFIER_CANARY,
@@ -1666,7 +1668,7 @@ class ServerToolStreamAndClassifierTests(unittest.TestCase):
     def test_classifier_canary_command_runs_only_in_temporary_fixture(self):
         with tempfile.TemporaryDirectory() as tmp:
             completed = subprocess.run(
-                ["bash", "-c", CLASSIFIER_COMMAND],
+                [posix_bash(), "-c", CLASSIFIER_COMMAND],
                 cwd=tmp,
                 capture_output=True,
                 text=True,

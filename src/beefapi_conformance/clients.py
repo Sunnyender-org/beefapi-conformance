@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import uuid
 from pathlib import Path
 
@@ -264,7 +265,17 @@ class ClientCommand:
                 args += ["--settings", settings]
             return [*args, prompt]
         if adapter == "mock":
-            return [self.binary, prompt]
+            argv = [self.binary]
+            if self.binary.endswith(".py"):
+                argv = [sys.executable, self.binary]
+            else:
+                for candidate in self.cell.client.binary_candidates:
+                    expanded = os.path.expanduser(candidate)
+                    if expanded == self.binary or not expanded.endswith(".py"):
+                        continue
+                    argv.append(expanded)
+            argv.append(prompt)
+            return argv
         raise RuntimeError(f"unsupported client adapter: {adapter}")
 
     def observe_output(self, output: str) -> None:

@@ -13,6 +13,8 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from portable import MOCK_AGENT, git_bash_windows, mock_agent_candidates
+
 from beefapi_conformance.cli import (
     _build_run_report,
     _write_run_checkpoint,
@@ -2213,12 +2215,11 @@ class RunnerTests(unittest.TestCase):
             thread.join(timeout=2)
 
     def test_mock_client_runs_and_report_passes(self):
-        binary = str(ROOT / "tests/fixtures/mock_agent.py")
         client = Client(
             "mock",
             "Mock",
             "mock",
-            (binary,),
+            mock_agent_candidates(),
             ("--version",),
             frozenset({"text", "tool.shell"}),
             frozenset({"darwin"}),
@@ -2280,7 +2281,7 @@ class RunnerTests(unittest.TestCase):
         cell = MatrixCell(
             replace(
                 cell.client,
-                binary_candidates=(str(ROOT / "tests/fixtures/mock_agent.py"),),
+                binary_candidates=mock_agent_candidates(),
             ),
             cell.route,
             cell.model,
@@ -2403,12 +2404,11 @@ class RunnerTests(unittest.TestCase):
             thread.join(timeout=2)
 
     def test_workspace_teardown_failure_keeps_cell_result(self):
-        binary = str(ROOT / "tests/fixtures/mock_agent.py")
         client = Client(
             "mock",
             "Mock",
             "mock",
-            (binary,),
+            mock_agent_candidates(),
             ("--version",),
             frozenset({"text", "tool.shell"}),
             frozenset({"darwin"}),
@@ -2743,6 +2743,48 @@ class RunnerTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+
+class PortableHelperTests(unittest.TestCase):
+    def test_mock_agent_candidates_are_interpreter_then_script(self):
+        candidates = mock_agent_candidates()
+        self.assertEqual(sys.executable, candidates[0])
+        self.assertEqual(str(MOCK_AGENT), candidates[1])
+        self.assertTrue(Path(candidates[1]).is_file())
+
+    def test_mock_command_uses_interpreter_plus_script_path(self):
+        base = CommandTests().cell("mock")
+        cell = MatrixCell(
+            replace(base.client, binary_candidates=mock_agent_candidates()),
+            base.route,
+            base.model,
+            base.scenario,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            command = ClientCommand(
+                cell, mock_agent_candidates()[0], Path(tmp), None, None
+            )
+            argv = command.command("prompt", 1)
+        self.assertEqual(
+            [sys.executable, str(MOCK_AGENT), "prompt"],
+            argv,
+        )
+
+    def test_windows_bash_resolver_uses_git_bash_not_wsl_stub(self):
+        def is_file(path):
+            text = str(path).replace("/", "\\")
+            if "system32" in text.lower():
+                return True
+            return text.endswith(r"Git\bin\bash.exe")
+
+        with (
+            patch("portable.os.path.isfile", is_file),
+            patch.dict(os.environ, {"ProgramFiles": r"C:\Program Files"}, clear=False),
+        ):
+            found = git_bash_windows()
+        self.assertTrue(found.replace("\\", "/").endswith("Git/bin/bash.exe"))
+        self.assertNotIn("system32", found.lower())
+        self.assertNotEqual("bash", found)
 
 
 if __name__ == "__main__":

@@ -360,6 +360,7 @@ def _user_plugin_names() -> list[str]:
 
 _WORKBUDDY_INHERITED_ENV_PREFIXES = ("CODEBUDDY_", "WORKBUDDY_")
 _WORKBUDDY_INHERITED_ENV_KEYS = (
+    "ACC_PRODUCT_CONFIG",
     "ACC_PRODUCT_CONFIG_V2",
     "ACC_PRODUCT_CONFIG_V3",
     "ACC_PRODUCT_CONFIG_PATH",
@@ -382,7 +383,7 @@ def _workbuddy_gateway_model(cell: MatrixCell) -> str:
     if (
         not model_id
         or selected != model_id
-        or model_id.strip().lower().startswith("custom:")
+        or model_id.strip().lower().startswith(("custom:", "custom-local:"))
         or model_id.strip().lower() in _WORKBUDDY_UNSAFE_GATEWAY_MODELS
     ):
         raise RuntimeError(

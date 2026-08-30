@@ -80,6 +80,7 @@ class WorkBuddyGatewayTests(unittest.TestCase):
             "WORKBUDDY_CONFIG_DIR": "/tmp/ambient-workbuddy",
             "CODEBUDDY_CONFIG_DIR": "/tmp/ambient-codebuddy",
             "ACC_PRODUCT_CONFIG_V3": '{"authentication":{"type":"custom-token"}}',
+            "ACC_PRODUCT_CONFIG": '{"endpoint":"https://ambient.example"}',
             "WORKBUDDY_CONFORMANCE_SETTINGS_JSON": '{"env":{"CODEBUDDY_AUTH_TOKEN":"sk-settings"}}',
         }
         with (
@@ -105,6 +106,7 @@ class WorkBuddyGatewayTests(unittest.TestCase):
             self.assertNotIn("CODEBUDDY_API_KEY", env)
             self.assertNotIn("CODEBUDDY_MODEL", env)
             self.assertNotIn("ACC_PRODUCT_CONFIG_V3", env)
+            self.assertNotIn("ACC_PRODUCT_CONFIG", env)
             self.assertNotIn("sk-ambient-value", env.values())
             self.assertNotIn("sk-ambient-api-key", env.values())
             self.assertIn("--print", first)
@@ -132,7 +134,10 @@ class WorkBuddyGatewayTests(unittest.TestCase):
             self_named_custom = self.cell(
                 auth_mode="gateway_token", model_id="custom:wb-existing-private-model"
             )
-            for cell in (auto_cell, remapped, self_named_custom):
+            local_custom = self.cell(
+                auth_mode="gateway_token", model_id="custom-local:existing-model"
+            )
+            for cell in (auto_cell, remapped, self_named_custom, local_custom):
                 command = ClientCommand(
                     cell,
                     "codebuddy",

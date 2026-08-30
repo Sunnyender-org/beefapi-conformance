@@ -103,7 +103,12 @@ def _remove_owned_workspace(path: str) -> None:
             shutil.rmtree(path)
             return
         except FileNotFoundError:
-            return
+            if not os.path.lexists(path):
+                return
+            # A raced child removal does not prove the owned root is gone.
+            if attempt >= _TEARDOWN_TRIES - 1:
+                raise
+            time.sleep(_TEARDOWN_PAUSE_SECONDS)
         except OSError as exc:
             last_error = exc
             if not _transient_teardown_error(exc) or attempt >= _TEARDOWN_TRIES - 1:

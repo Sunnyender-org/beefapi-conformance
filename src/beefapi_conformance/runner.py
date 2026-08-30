@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -45,10 +46,82 @@ SERVER_EVIDENCE_FIELDS = {"status", "commit", "route", "terminal", "receipt", "u
 AGENT_V1_RESPONSE_ID = re.compile(
     r'"id"\s*:\s*"resp_bf_agentv1_u[0-9]+_c[0-9]+_([A-Za-z0-9]+)"'
 )
+# Windows sharing/access/dir-not-empty after the owned CLI process has exited.
+_TRANSIENT_WINERRORS = {5, 32, 145}
+_TRANSIENT_ERRNOS = {
+    errno.ENOTEMPTY,
+    errno.EACCES,
+    errno.EPERM,
+    errno.EBUSY,
+}
+_TEARDOWN_TRIES = 5
+_TEARDOWN_PAUSE_SECONDS = 0.1
 
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _transient_teardown_error(exc: BaseException) -> bool:
+    if not isinstance(exc, OSError):
+        return False
+    if getattr(exc, "winerror", None) in _TRANSIENT_WINERRORS:
+        return True
+    if exc.errno in _TRANSIENT_ERRNOS:
+        return True
+    text = str(exc)
+    return any(
+        token in text
+        for token in (
+            "WinError 32",
+            "WinError 5",
+            "WinError 145",
+            "Directory not empty",
+            "being used by another process",
+        )
+    )
+
+
+def _teardown_failure_evidence(exc: OSError) -> dict[str, object]:
+    payload: dict[str, object] = {"teardown": "workspace_cleanup_failed"}
+    if exc.errno is not None:
+        payload["errno"] = exc.errno
+    winerror = getattr(exc, "winerror", None)
+    if winerror is not None:
+        payload["winerror"] = winerror
+    return payload
+
+
+def _remove_owned_workspace(path: str) -> None:
+    """Delete the harness-owned temp tree after the client CLI has exited.
+
+    Retry only known transient filesystem errors. Do not kill processes.
+    """
+    last_error: OSError | None = None
+    for attempt in range(_TEARDOWN_TRIES):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            last_error = exc
+            if not _transient_teardown_error(exc) or attempt >= _TEARDOWN_TRIES - 1:
+                raise
+            time.sleep(_TEARDOWN_PAUSE_SECONDS)
+    if last_error is not None:
+        raise last_error
+
+
+def native_window_schedule_gap(previous: MatrixCell, current: MatrixCell) -> bool:
+    """True when serial native window cells share token-log evidence context."""
+    if previous.client.adapter == "raw-http" or current.client.adapter == "raw-http":
+        return False
+    if previous.route.evidence_provider != "beefapi_token_log":
+        return False
+    if current.route.evidence_provider != "beefapi_token_log":
+        return False
+    return _batch_session_key(previous) == _batch_session_key(current)
 
 
 def _route_base_url(cell: MatrixCell) -> str | None:
@@ -257,8 +330,9 @@ def run_cell(
         )
     finally:
         try:
-            shutil.rmtree(tmp)
-        except OSError:
+            _remove_owned_workspace(tmp)
+        except OSError as exc:
+            infra = _teardown_failure_evidence(exc)
             if result is None:
                 result = _result(
                     cell,
@@ -268,11 +342,11 @@ def run_cell(
                     version,
                     [],
                     "infrastructure failure: workspace cleanup failed",
-                    {"infrastructure": {"teardown": "workspace_cleanup_failed"}},
+                    {"infrastructure": infra},
                 )
             else:
                 evidence = dict(result.evidence)
-                evidence["infrastructure"] = {"teardown": "workspace_cleanup_failed"}
+                evidence["infrastructure"] = infra
                 result.evidence = evidence
                 if result.status == "pass":
                     result.status = "fail"

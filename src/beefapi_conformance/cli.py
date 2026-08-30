@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import sys
+import time
 from pathlib import Path
 
 from .clients import resolve_binary
@@ -20,6 +21,7 @@ from .report import build_report, write_report
 from .runner import (
     _known_request_ids,
     finalize_batch_server_evidence,
+    native_window_schedule_gap,
     prepare_batch_server_evidence,
     run_cell,
 )
@@ -155,7 +157,14 @@ def command_run(args: argparse.Namespace) -> int:
         batch_evidence = (
             prepare_batch_server_evidence(cells) if require_server_evidence else {}
         )
+        previous = None
         for cell in cells:
+            if (
+                batch_evidence
+                and previous is not None
+                and native_window_schedule_gap(previous, cell)
+            ):
+                time.sleep(1)
             print(f"RUN {cell.id}", file=sys.stderr)
             result = run_cell(
                 cell,
@@ -169,6 +178,7 @@ def command_run(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             _write_run_checkpoint(results, args.tier, cells, output)
+            previous = cell
             if args.fail_fast and result.status == "fail":
                 break
         if batch_evidence:

@@ -45,6 +45,7 @@ from beefapi_conformance.runner import (
     _request_token,
     _usage_log_payload,
     finalize_batch_server_evidence,
+    native_window_schedule_gap,
     prepare_batch_server_evidence,
     run_cell,
 )
@@ -1953,6 +1954,36 @@ class ContractTests(unittest.TestCase):
             "ambiguous", results[0].evidence["server_evidence"].get("detail", "")
         )
 
+    def test_native_window_schedule_gap_only_for_shared_evidence_natives(self):
+        native = CommandTests().cell("codex")
+        other = CommandTests().cell("codex")
+        raw = CommandTests().cell("raw-http")
+        route = replace(
+            native.route,
+            evidence_provider="beefapi_token_log",
+            token_env="TOKEN",
+            base_url="https://example.invalid",
+        )
+        other_route = replace(route, token_env="OTHER_TOKEN")
+        first = MatrixCell(
+            replace(native.client, id="codex-a"), route, native.model, native.scenario
+        )
+        second = MatrixCell(
+            replace(other.client, id="codex-b"), route, other.model, other.scenario
+        )
+        raw_cell = MatrixCell(
+            replace(raw.client, id="raw-http"), route, raw.model, raw.scenario
+        )
+        other_token = MatrixCell(
+            replace(native.client, id="codex-c"),
+            other_route,
+            native.model,
+            native.scenario,
+        )
+        self.assertTrue(native_window_schedule_gap(first, second))
+        self.assertFalse(native_window_schedule_gap(first, raw_cell))
+        self.assertFalse(native_window_schedule_gap(first, other_token))
+
 
 class CommandTests(unittest.TestCase):
     def cell(self, adapter: str) -> MatrixCell:
@@ -2450,9 +2481,12 @@ class RunnerTests(unittest.TestCase):
                 ),
             ),
         )
-        with patch(
-            "beefapi_conformance.runner.shutil.rmtree",
-            side_effect=OSError(errno.ENOTEMPTY, "Directory not empty"),
+        with (
+            patch(
+                "beefapi_conformance.runner.shutil.rmtree",
+                side_effect=OSError(errno.ENOTEMPTY, "Directory not empty"),
+            ),
+            patch("beefapi_conformance.runner.time.sleep"),
         ):
             result = run_cell(
                 MatrixCell(client, route, model, scenario), allow_local_tools=True
@@ -2461,6 +2495,108 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("infrastructure", result.detail)
         self.assertEqual(1, len(result.turns))
         self.assertEqual("pass", result.turns[0].status)
+        self.assertEqual(
+            "workspace_cleanup_failed",
+            result.evidence["infrastructure"]["teardown"],
+        )
+        self.assertEqual(errno.ENOTEMPTY, result.evidence["infrastructure"]["errno"])
+
+    def _mock_tool_cell(self):
+        client = Client(
+            "mock",
+            "Mock",
+            "mock",
+            mock_agent_candidates(),
+            ("--version",),
+            frozenset({"text", "tool.shell"}),
+            frozenset({"darwin"}),
+        )
+        route = Route(
+            "mock-route",
+            "Mock",
+            "managed_session",
+            None,
+            None,
+            None,
+            frozenset({"mock"}),
+            frozenset({"mock"}),
+            frozenset({"text", "tool.shell"}),
+            None,
+        )
+        model = Model(
+            "mock-model",
+            "Mock",
+            frozenset({"mock-route"}),
+            frozenset({"mock"}),
+            frozenset({"text", "tool.shell"}),
+            {},
+        )
+        scenario = Scenario(
+            "mock-scenario",
+            "Mock",
+            "pr",
+            "client",
+            None,
+            frozenset({"tool.shell"}),
+            10,
+            True,
+            (
+                Turn(
+                    "BEEFAPI_CONFORMANCE_TOOL_OK",
+                    "BEEFAPI_CONFORMANCE_TOOL_OK",
+                    ("BEEFAPI_CONFORMANCE_FILE_OK",),
+                ),
+            ),
+        )
+        return MatrixCell(client, route, model, scenario)
+
+    def test_transient_teardown_winerror32_then_success_keeps_pass(self):
+        locked = OSError(errno.EACCES, "being used by another process")
+        locked.winerror = 32
+        with (
+            patch(
+                "beefapi_conformance.runner.shutil.rmtree",
+                side_effect=[locked, None],
+            ),
+            patch("beefapi_conformance.runner.time.sleep") as slept,
+        ):
+            result = run_cell(self._mock_tool_cell(), allow_local_tools=True)
+        self.assertEqual("pass", result.status, result.detail)
+        self.assertNotIn("infrastructure", result.evidence)
+        slept.assert_called()
+
+    def test_transient_teardown_access_and_enotempty_then_success_keeps_pass(self):
+        access = OSError(errno.EACCES, "Access is denied")
+        access.winerror = 5
+        empty = OSError(errno.ENOTEMPTY, "Directory not empty")
+        empty.winerror = 145
+        for err in (access, empty):
+            with self.subTest(winerror=getattr(err, "winerror", None)):
+                with (
+                    patch(
+                        "beefapi_conformance.runner.shutil.rmtree",
+                        side_effect=[err, None],
+                    ),
+                    patch("beefapi_conformance.runner.time.sleep"),
+                ):
+                    result = run_cell(self._mock_tool_cell(), allow_local_tools=True)
+                self.assertEqual("pass", result.status, result.detail)
+                self.assertNotIn("infrastructure", result.evidence)
+
+    def test_persistent_teardown_failure_preserves_failed_cell(self):
+        locked = OSError(errno.EACCES, "being used by another process")
+        locked.winerror = 32
+        with (
+            patch(
+                "beefapi_conformance.runner.shutil.rmtree",
+                side_effect=locked,
+            ),
+            patch("beefapi_conformance.runner.time.sleep"),
+        ):
+            result = run_cell(self._mock_tool_cell(), allow_local_tools=True)
+        self.assertEqual("fail", result.status)
+        self.assertEqual("pass", result.turns[0].status)
+        self.assertEqual(32, result.evidence["infrastructure"]["winerror"])
         self.assertEqual(
             "workspace_cleanup_failed",
             result.evidence["infrastructure"]["teardown"],
@@ -2570,6 +2706,87 @@ class RunnerTests(unittest.TestCase):
         self.assertNotEqual("passed", checkpoint["classification"])
         self.assertFalse(final.get("unfinished"))
         self.assertEqual("passed", final["classification"])
+
+    def test_cli_sleeps_between_native_window_cells_sharing_evidence(self):
+        native = CommandTests().cell("codex")
+        route = replace(
+            native.route,
+            evidence_provider="beefapi_token_log",
+            token_env="TOKEN",
+            base_url="https://example.invalid",
+        )
+        first = MatrixCell(
+            replace(native.client, id="codex-a"), route, native.model, native.scenario
+        )
+        second = MatrixCell(
+            replace(native.client, id="codex-b"), route, native.model, native.scenario
+        )
+        raw = CommandTests().cell("raw-http")
+        raw_cell = MatrixCell(
+            replace(raw.client, id="raw-http"), route, raw.model, raw.scenario
+        )
+
+        def fake_run(cell, **_kwargs):
+            return CellResult(
+                cell.id,
+                "pass",
+                "client",
+                "now",
+                1,
+                cell.route.id,
+                cell.model.id,
+                cell.scenario.id,
+                [],
+                {"server_evidence": {"status": "deferred"}},
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = Namespace(
+                tier="pr",
+                allow_local_tools=False,
+                require_server_evidence=True,
+                max_cells=10,
+                fail_fast=False,
+                output=str(Path(tmp) / "report"),
+            )
+            with (
+                patch("beefapi_conformance.cli._matrix", return_value=[first, second]),
+                patch("beefapi_conformance.cli.run_cell", side_effect=fake_run),
+                patch(
+                    "beefapi_conformance.cli.prepare_batch_server_evidence",
+                    return_value={
+                        ("https://example.invalid", "TOKEN"): {
+                            "token": "t",
+                            "fence": set(),
+                            "commit": "x",
+                        }
+                    },
+                ),
+                patch("beefapi_conformance.cli.finalize_batch_server_evidence"),
+                patch("beefapi_conformance.cli.time.sleep") as slept,
+            ):
+                command_run(args)
+            slept.assert_called_with(1)
+            with (
+                patch(
+                    "beefapi_conformance.cli._matrix", return_value=[first, raw_cell]
+                ),
+                patch("beefapi_conformance.cli.run_cell", side_effect=fake_run),
+                patch(
+                    "beefapi_conformance.cli.prepare_batch_server_evidence",
+                    return_value={
+                        ("https://example.invalid", "TOKEN"): {
+                            "token": "t",
+                            "fence": set(),
+                            "commit": "x",
+                        }
+                    },
+                ),
+                patch("beefapi_conformance.cli.finalize_batch_server_evidence"),
+                patch("beefapi_conformance.cli.time.sleep") as slept_raw,
+            ):
+                command_run(args)
+            slept_raw.assert_not_called()
 
     def test_raw_http_marker_in_error_or_tool_input_is_not_a_pass(self):
         marker = "BEEFAPI_ASSISTANT_BODY_OK"

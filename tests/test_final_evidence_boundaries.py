@@ -80,7 +80,7 @@ class FinalEvidenceBoundaries(unittest.TestCase):
         self.assertNotIn(raw_id, serialized)
 
     def test_relay_request_id_in_client_warning_is_hashed(self):
-        raw_id = "20260830031257986234308268d9d6jIRn0kG4"
+        raw_id = "2026010100000000000000000000000TESTONLY"
         self.assertNotIn(
             raw_id, redact_correlation_ids("warning (request id: " + raw_id + ")")
         )

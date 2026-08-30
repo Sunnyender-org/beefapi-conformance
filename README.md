@@ -73,9 +73,14 @@ The runner auto-discovers the CLI bundled with WorkBuddy on macOS:
 
 It also checks `codebuddy` and `cbc` on `PATH`. WorkBuddy is a first-class
 client in the matrix, including print/streaming output, local tools, session
-resume, model selection, and later ACP coverage. A WorkBuddy-managed model uses
-the user's already provisioned custom-model route; a direct BeefAPI credential
-is never silently substituted for that managed route.
+resume, model selection, and later ACP coverage. WorkBuddy has two authentication modes. A `managed_session` model uses the
+user's already provisioned custom-model route; a direct BeefAPI credential is
+never silently substituted for that managed route. An ordinary
+`gateway_token` route uses the same dedicated request token as other clients:
+the harness isolates CodeBuddy/WorkBuddy env and config dirs, passes
+`--setting-sources none`, and selects the public model id. It does not write
+credentials to disk or argv, and it does not reuse a WorkBuddy `auto` or other
+custom alias.
 
 Repeatable local WorkBuddy smokes (using the existing managed login) are:
 

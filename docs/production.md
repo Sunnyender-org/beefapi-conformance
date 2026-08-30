@@ -51,7 +51,11 @@ counted as evidence but never substitute for a final receipt.
 
 ## WorkBuddy boundary
 
-WorkBuddy CodeBuddy uses a managed account/private-model route rather than a
-portable gateway-token config. Its native CLI text/tool/resume checks therefore
-run on a pre-authenticated local host. Hosted production CI does not copy a
+WorkBuddy CodeBuddy can run on an ordinary `gateway_token` route with the same
+dedicated acceptance Key as other clients. Those cells must use the public
+model id and isolated env/`--setting-sources none`; they must not reuse a
+managed `auto` alias or copy a desktop login.
+
+`managed_session` cells still use a pre-authenticated local host and the
+user's provisioned custom-model route. Hosted production CI does not copy a
 WorkBuddy login or pretend that a built-in `auto` model is a BeefAPI route.

@@ -45,13 +45,20 @@ authority.
 ## Authentication modes
 
 `gateway_token` routes point to an environment-variable name. The runner passes
-the secret to the child only and redacts it from captured output.
+the secret to the child only and redacts it from captured output. WorkBuddy is
+not limited to a private backend: on an ordinary gateway route it receives
+`CODEBUDDY_AUTH_TOKEN`, `CODEBUDDY_BASE_URL` (`{base}/v1`), isolated
+`CODEBUDDY_CONFIG_DIR` / `WORKBUDDY_CONFIG_DIR`, and `--setting-sources none`.
+Custom aliases including `auto` are rejected before the process starts because
+WorkBuddy prefers `modelConfig` url/key over those env values.
 
-`managed_session` routes, currently WorkBuddy, use the client's existing login.
-The harness does not copy cookies or auth files. Single-turn runs disable session
-persistence; resume scenarios necessarily create a client-owned session in that
-managed profile. CI for those routes therefore requires a dedicated
-pre-authenticated host runner rather than a developer's everyday profile.
+`managed_session` routes, currently used by WorkBuddy's provisioned profile,
+keep the client's existing login. The harness does not copy cookies or auth
+files, and it does not apply the gateway isolation flags. Single-turn runs
+disable session persistence; resume scenarios necessarily create a
+client-owned session in that managed profile. CI for those routes therefore
+requires a dedicated pre-authenticated host runner rather than a developer's
+everyday profile.
 
 ## Why the legacy certifier remains
 

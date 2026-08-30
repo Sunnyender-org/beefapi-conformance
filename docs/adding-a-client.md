@@ -18,5 +18,17 @@ client uses managed authentication, model that explicitly as `managed_session`.
 
 WorkBuddy Desktop bundles `codebuddy`/`cbc`. The adapter uses print mode and
 stream JSON, supports `--model`, `--session-id`/`--resume`, and can accept a
-controlled settings JSON through `WORKBUDDY_CONFORMANCE_SETTINGS_JSON`.
-Provisioning a WorkBuddy private model remains outside this repository.
+controlled settings JSON through `WORKBUDDY_CONFORMANCE_SETTINGS_JSON` on
+`managed_session` routes.
+
+`gateway_token` cells isolate CodeBuddy/WorkBuddy auth, base URL, and config
+directories, pass the already derived request token as `CODEBUDDY_AUTH_TOKEN`,
+and require the argv pair `--setting-sources none`. Use the public model id.
+Do not point gateway cells at `auto` or another custom alias: that would load
+`modelConfig` url/key ahead of the isolated env. Do not write the token to
+disk or argv. If the installed CLI still prompts for login despite that env,
+report the client gap; do not fall back to a managed alias.
+
+Provisioning a WorkBuddy private model for `managed_session` remains outside
+this repository. Ordinary gateway acceptance does not require a
+WorkBuddy-specific BeefAPI backend.

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -15,8 +14,8 @@ _WIN_GIT_BASH = (
 
 
 def mock_agent_candidates() -> tuple[str, ...]:
-    """Python interpreter plus the mock fixture. Avoid shebang CreateProcess."""
-    return (sys.executable, str(MOCK_AGENT))
+    """Executable alternatives, not an argv vector; the mock adapter adds Python."""
+    return (str(MOCK_AGENT),)
 
 
 def posix_bash() -> str:

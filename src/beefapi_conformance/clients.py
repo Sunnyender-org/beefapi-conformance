@@ -268,12 +268,6 @@ class ClientCommand:
             argv = [self.binary]
             if self.binary.endswith(".py"):
                 argv = [sys.executable, self.binary]
-            else:
-                for candidate in self.cell.client.binary_candidates:
-                    expanded = os.path.expanduser(candidate)
-                    if expanded == self.binary or not expanded.endswith(".py"):
-                        continue
-                    argv.append(expanded)
             argv.append(prompt)
             return argv
         raise RuntimeError(f"unsupported client adapter: {adapter}")

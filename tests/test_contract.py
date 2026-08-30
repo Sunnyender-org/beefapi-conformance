@@ -2746,11 +2746,10 @@ class RunnerTests(unittest.TestCase):
 
 
 class PortableHelperTests(unittest.TestCase):
-    def test_mock_agent_candidates_are_interpreter_then_script(self):
+    def test_mock_agent_candidates_remain_executable_alternatives(self):
         candidates = mock_agent_candidates()
-        self.assertEqual(sys.executable, candidates[0])
-        self.assertEqual(str(MOCK_AGENT), candidates[1])
-        self.assertTrue(Path(candidates[1]).is_file())
+        self.assertEqual((str(MOCK_AGENT),), candidates)
+        self.assertTrue(Path(candidates[0]).is_file())
 
     def test_mock_command_uses_interpreter_plus_script_path(self):
         base = CommandTests().cell("mock")

@@ -161,7 +161,7 @@ class ClientCommand:
         workspace = str(self.root / "workspace")
         if adapter == "claude-code":
             permission_mode = (
-                "default"
+                "auto"
                 if "client.classifier" in self.cell.scenario.required_capabilities
                 else "bypassPermissions"
             )
@@ -176,6 +176,15 @@ class ClientCommand:
                 "--permission-mode",
                 permission_mode,
             ]
+            if permission_mode == "auto":
+                # Session-only: do not grant tool allow rules or change the
+                # user's classifier configuration. Requires Claude >=2.1.193.
+                args += [
+                    "--tools",
+                    "Bash",
+                    "--settings",
+                    json.dumps({"autoMode": {"classifyAllShell": True}}),
+                ]
             args += (
                 ["--session-id", self.session_id]
                 if turn_index == 1

@@ -212,7 +212,7 @@ def run_cell(
         )
         combined_output = "\n".join(item.output_tail for item in turn_results)
         permission_mode = (
-            "default"
+            "auto"
             if "client.classifier" in cell.scenario.required_capabilities
             else "bypassPermissions"
         )
@@ -1537,7 +1537,7 @@ def _apply_public_artifact_gate(
         stream=stream if isinstance(stream, dict) else None,
         attempts=attempts,
         permission_mode=(
-            "default"
+            "auto"
             if "client.classifier" in cell.scenario.required_capabilities
             else "bypassPermissions"
         ),
@@ -1648,8 +1648,6 @@ def _usage_log_payload(
         mcp_mode = other_dict.get("cursor_agent_v1_mcp_mode")
         if mcp_spans or mcp_mode:
             payload["mcp"] = {"mode": mcp_mode, "spans": mcp_spans or []}
-        if other_dict.get("cursor_agent_v1_classifier_invoked") is True:
-            payload["classifier"] = {"invoked": True}
     return payload
 
 

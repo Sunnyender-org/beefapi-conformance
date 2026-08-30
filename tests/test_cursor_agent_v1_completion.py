@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import subprocess
 import tempfile
 import threading
 import unittest
@@ -12,6 +13,8 @@ from unittest.mock import patch
 
 from beefapi_conformance.clients import ClientCommand
 from beefapi_conformance.cursor_agent_v1 import (
+    CLASSIFIER_CANARY,
+    CLASSIFIER_COMMAND,
     apply_completion_gates,
     correlate_id,
     evaluate_classifier,
@@ -1091,19 +1094,101 @@ class ServerToolStreamAndClassifierTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
-    def test_classifier_rejects_bypass_permissions(self):
-        self.assertEqual(
-            "fail",
-            evaluate_classifier("", permission_mode="bypassPermissions").status,
-        )
-        self.assertEqual(
-            "pass",
-            evaluate_classifier(
-                '{"type":"classifier","mode":"auto"}', permission_mode="default"
-            ).status,
-        )
+    def test_classifier_rejects_every_non_auto_permission_mode(self):
+        for mode in (None, "default", "manual", "bypassPermissions", "acceptEdits"):
+            with self.subTest(mode=mode):
+                result = evaluate_classifier(
+                    '{"type":"classifier","mode":"auto"}',
+                    {"classifier": {"invoked": True}},
+                    permission_mode=mode,
+                )
+                self.assertEqual("fail", result.status)
+                self.assertIn("explicit auto", result.detail)
 
-    def test_classifier_scenario_uses_claude_default_permission_mode(self):
+    def test_classifier_rejects_prose_errors_and_invented_receipts(self):
+        for output in (
+            "classifier invoked; auto-mode active",
+            "Error: auto_mode classifier unavailable",
+            '{"type":"classifier","mode":"auto"}',
+            '{"permissionMode":"default"}',
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "message": {
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": '{"type":"classifier","mode":"auto"}',
+                            }
+                        ]
+                    },
+                }
+            ),
+        ):
+            with self.subTest(output=output):
+                self.assertEqual(
+                    "fail",
+                    evaluate_classifier(
+                        output, {"classifier": {"invoked": True}}, "auto"
+                    ).status,
+                )
+
+    def test_classifier_checks_correlated_canary_but_does_not_infer_invocation(self):
+        events = [
+            {"type": "system", "subtype": "init", "permissionMode": "auto"},
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "Bash",
+                            "id": "canary-call",
+                            "input": {"command": CLASSIFIER_COMMAND},
+                        }
+                    ]
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "canary-call",
+                            "content": CLASSIFIER_CANARY + "\n",
+                            "is_error": False,
+                        }
+                    ]
+                },
+            },
+        ]
+
+        def evaluate():
+            return evaluate_classifier(
+                "\n".join(json.dumps(event) for event in events),
+                {"classifier": {"invoked": True}},
+                "auto",
+            )
+
+        result = evaluate()
+        self.assertEqual("fail", result.status)
+        self.assertIn("direct classifier invocation proof", result.detail)
+        self.assertIn("inferred only", result.detail)
+        tool_result = events[2]["message"]["content"][0]
+        for key, value in (
+            ("tool_use_id", "different-call"),
+            ("is_error", True),
+            ("content", "Error: " + CLASSIFIER_CANARY),
+        ):
+            original = tool_result[key]
+            tool_result[key] = value
+            self.assertIn("canary execution was not observed", evaluate().detail)
+            tool_result[key] = original
+        events[0]["permissionMode"] = "default"
+        self.assertIn("did not report active auto", evaluate().detail)
+
+    def test_classifier_scenario_uses_claude_auto_without_allow_rule(self):
         inventory = _type64_inventory()
         cell = next(
             item
@@ -1116,8 +1201,51 @@ class ServerToolStreamAndClassifierTests(unittest.TestCase):
             )
             args = command.command("hello", 1)
             self.assertIn("--permission-mode", args)
-            self.assertEqual("default", args[args.index("--permission-mode") + 1])
+            self.assertEqual("auto", args[args.index("--permission-mode") + 1])
             self.assertNotIn("bypassPermissions", args)
+            self.assertNotIn("--allowedTools", args)
+            self.assertEqual("Bash", args[args.index("--tools") + 1])
+            self.assertEqual(
+                {"autoMode": {"classifyAllShell": True}},
+                json.loads(args[args.index("--settings") + 1]),
+            )
+            self.assertTrue(cell.scenario.requires_local_tools)
+            self.assertIn("tool.shell", cell.scenario.required_capabilities)
+            self.assertIn(CLASSIFIER_COMMAND, cell.scenario.turns[0].prompt)
+            self.assertEqual(
+                ("tool_use", "tool_result"), cell.scenario.turns[0].expected_events
+            )
+
+    def test_classifier_canary_command_runs_only_in_temporary_fixture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = subprocess.run(
+                ["bash", "-c", CLASSIFIER_COMMAND],
+                cwd=tmp,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(CLASSIFIER_CANARY + "\n", completed.stdout)
+            self.assertEqual(
+                (CLASSIFIER_CANARY + "\n").encode(),
+                (Path(tmp) / "classifier-canary.txt").read_bytes(),
+            )
+
+    def test_classifier_scenario_requires_local_tool_opt_in(self):
+        cell = next(
+            item
+            for item in compile_matrix(_type64_inventory(), "release")
+            if item.scenario.id == "cursor-v1-claude-classifier"
+        )
+        with (
+            patch("beefapi_conformance.runner.resolve_binary", return_value="claude"),
+            patch("beefapi_conformance.runner._version", return_value="2.1.233"),
+            patch("beefapi_conformance.runner.subprocess.run") as execute,
+        ):
+            result = run_cell(cell, defer_server_evidence=True)
+        self.assertEqual("skip", result.status)
+        self.assertIn("--allow-local-tools", result.detail)
+        execute.assert_not_called()
 
 
 class LifecycleAndReportTests(unittest.TestCase):

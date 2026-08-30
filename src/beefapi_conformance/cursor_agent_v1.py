@@ -23,12 +23,11 @@ COMPLETION_TIERS = {"nightly", "release"}
 UNOBSERVABLE_FIELDS = ("prompt_tokens", "cache_tokens")
 ALLOWED_UNOBSERVABLE_QUALITIES = frozenset({"unknown", "estimated"})
 LOCAL_WEB_TOOLS = frozenset({"WebSearch", "WebFetch", "web_search", "web_fetch"})
-CLASSIFIER_MARKERS = (
-    "classifier",
-    '"permissionMode": "default"',
-    '"permissionMode":"default"',
-    "auto_mode",
-    "auto-mode",
+CLASSIFIER_CANARY = "BEEFAPI_CURSOR_V1_TOOL_CANARY"
+CLASSIFIER_COMMAND = (
+    "printf '%s\\n' "
+    + CLASSIFIER_CANARY
+    + " > classifier-canary.txt && cat classifier-canary.txt"
 )
 AGENT_V1_PUBLIC_ID = re.compile(r"resp_bf_agentv1_u[0-9]+_c[0-9]+_[A-Za-z0-9]+")
 TOOL_USE_LITERAL = re.compile(r"toolu_[A-Za-z0-9_]+")
@@ -538,19 +537,67 @@ def evaluate_classifier(
     evidence: dict[str, Any] | None = None,
     permission_mode: str | None = None,
 ) -> Evaluation:
-    if permission_mode == "bypassPermissions":
+    if permission_mode != "auto":
         return Evaluation(
             "fail",
-            "Claude Code auto-mode classifier cannot run under bypassPermissions",
+            "Claude Code classifier requires explicit auto permission mode",
         )
-    payload = evidence or {}
-    classifier = payload.get("classifier")
-    if isinstance(classifier, dict) and classifier.get("invoked") is True:
-        return Evaluation("pass")
-    lowered = output.lower()
-    if any(marker.lower() in lowered for marker in CLASSIFIER_MARKERS):
-        return Evaluation("pass")
-    return Evaluation("fail", "Claude Code auto-mode classifier was not observed")
+    observed_mode = None
+    pending: set[str] = set()
+    executed = False
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "system" and event.get("subtype") == "init":
+            observed_mode = event.get("permissionMode")
+        message = event.get("message")
+        if not isinstance(message, dict) or not isinstance(
+            message.get("content"), list
+        ):
+            continue
+        for block in message["content"]:
+            if not isinstance(block, dict):
+                continue
+            if (
+                event.get("type") == "assistant"
+                and block.get("type") == "tool_use"
+                and block.get("name") == "Bash"
+                and isinstance(block.get("input"), dict)
+                and block["input"].get("command") == CLASSIFIER_COMMAND
+                and isinstance(block.get("id"), str)
+                and block["id"]
+            ):
+                pending.add(block["id"])
+            elif (
+                event.get("type") == "user"
+                and block.get("type") == "tool_result"
+                and isinstance(block.get("tool_use_id"), str)
+                and block["tool_use_id"] in pending
+                and block.get("is_error", False) is False
+                and isinstance(block.get("content"), str)
+                and block["content"].strip() == CLASSIFIER_CANARY
+            ):
+                executed = True
+    if observed_mode != "auto":
+        return Evaluation(
+            "fail", "Claude Code did not report active auto permission mode"
+        )
+    if not executed:
+        return Evaluation("fail", "Claude Code Bash canary execution was not observed")
+    # auto + classifyAllShell + a real tool result is inferred coverage only.
+    # Released stream-json has no verified positive classifier-invocation
+    # receipt here. Assistant prose, invented event types, and gateway booleans
+    # cannot certify this client-internal action. Keep the release gate closed
+    # until a sourced, correlated client evidence adapter is available.
+    return Evaluation(
+        "fail",
+        "Bash canary executed in auto mode, but direct classifier invocation proof "
+        "is unavailable from the verified released CLI evidence; coverage is inferred only",
+    )
 
 
 def evaluate_disconnect(attempts: list[dict[str, Any]]) -> Evaluation:

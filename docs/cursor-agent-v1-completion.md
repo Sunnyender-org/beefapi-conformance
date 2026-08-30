@@ -56,8 +56,30 @@ completion.
 | Hosted web | Server-tool count, progress, and citations are present. Claude Code does not execute `WebSearch`/`WebFetch` itself. | Count-only receipts, missing citations/progress, or a local web-search tool_use. |
 | MCP | Spans correlate to real returned `tool_use` ids and match the declared serial or parallel contract. | Arbitrary `mcp` JSON, spans without matching tool ids, or serial/parallel mismatch. |
 | Thinking | First-byte is measured and the stream emits keepalive or progress during thinking-only time. | Silent wait until the final message. |
-| Classifier | Claude Code auto-mode runs without `bypassPermissions` and classifier evidence is observed. | Classifier scenario uses bypass mode or produces no classifier evidence. |
+| Classifier | Claude Code reports active `auto` mode, executes the Bash canary, and direct classifier invocation evidence is observed. | Wrong/fallback mode, missing/failed canary, or no direct classifier evidence. |
 | Lifecycle | Disconnect aborts an in-flight request then completes uniquely. Restart issues a new receipt hash. Receipt hashes do not collide across cells. | Reused receipt correlation, or a required abort never happens. |
+
+### Classifier instrument boundary
+
+The classifier cell requires `--allow-local-tools`. It requests only Bash in
+the runner's temporary fixture and writes/reads `classifier-canary.txt` with
+`printf` and `cat`. The driver passes `--permission-mode auto` and the
+session-only `--settings '{"autoMode":{"classifyAllShell":true}}'`; it does
+not add tool allow rules, bypass permissions, or change account/user settings.
+Claude Code 2.1.233 on macOS advertises `auto` in `--help`.
+[Official configuration documentation](https://code.claude.com/docs/en/auto-mode-config#route-all-shell-commands-through-the-classifier)
+requires 2.1.193+ for `classifyAllShell`. Availability still depends on the
+actual model/provider/settings, so requested mode is not observed mode.
+
+The evaluator checks a native `system/init` reporting `permissionMode=auto`
+and an exact Bash `tool_use` paired by id with its successful canary
+`tool_result`. These prove mode and tool execution, not direct classifier
+invocation. No positive classifier-invocation receipt from released CLI output
+has been verified for this instrument. This cell therefore **fails closed**
+even when those checks succeed, with an explicit direct-evidence gap. A future
+positive path needs a sourced, correlated client evidence adapter. Assistant
+prose, classifier error messages, invented `type=classifier` events, and a
+gateway `cursor_agent_v1_classifier_invoked` boolean cannot satisfy it.
 
 Reports persist `http_request_id_hash` (transport) and `receipt.id_hash`
 (billing) as `sha256:` plus 16 hex chars. Those identities are not interchangeable.

@@ -102,6 +102,9 @@ class ClientCommand:
                 (
                     "[models]",
                     f"default = {json.dumps(model)}",
+                    # Grok titles use a separate model, not models.default.
+                    # Keep that real side-call on the explicitly tested model.
+                    f"session_summary = {json.dumps(model)}",
                     f"[model.{json.dumps(model)}]",
                     f"model = {json.dumps(model)}",
                     f"base_url = {json.dumps(self.base_url + '/v1')}",

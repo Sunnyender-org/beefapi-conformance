@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import threading
+import tomllib
 import unittest
 from argparse import Namespace
 from dataclasses import replace
@@ -2087,11 +2088,27 @@ class CommandTests(unittest.TestCase):
             self.assertIn("disabled = [", config)
             self.assertIn("[plugins]", config)
             self.assertNotIn("sk-private-value", config)
+            models = tomllib.loads(config)["models"]
+            self.assertEqual(models["default"], models["session_summary"])
             env = command.environment()
             self.assertEqual("sk-private-value", env["BEEFAPI_CONFORMANCE_TOKEN"])
             self.assertNotIn("XAI_API_KEY", env)
             grok_command = command.command("hello", 1)
             self.assertIn("streaming-messages-json", grok_command)
+
+    def test_grok_title_uses_selected_client_alias_not_builtin_default(self):
+        cell = self.cell("grok-build")
+        cell = replace(
+            cell, model=replace(cell.model, aliases={cell.client.id: "custom-alias"})
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            command = ClientCommand(
+                cell, "/bin/echo", Path(tmp), "local-only", "http://localhost"
+            )
+            command.prepare()
+            config = tomllib.loads((Path(tmp) / "client-home/config.toml").read_text())
+            self.assertEqual(config["models"]["session_summary"], "custom-alias")
+            self.assertEqual(config["model"]["custom-alias"]["model"], "custom-alias")
 
     def test_grok_messages_stream_extracts_assistant_text(self):
         output = "\n".join(

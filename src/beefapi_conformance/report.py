@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -58,9 +59,8 @@ def classify(results: list[CellResult]) -> str:
 
 def write_report(report: dict[str, object], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "conformance.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    payload = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
+    _atomic_write_text(output_dir / "conformance.json", payload)
     suite = ElementTree.Element("testsuite", name="beefapi-conformance")
     results = report.get("results", [])
     suite.set("tests", str(len(results)))
@@ -82,6 +82,14 @@ def write_report(report: dict[str, object], output_dir: Path) -> None:
             ElementTree.SubElement(
                 case, "skipped", message=str(result.get("detail", ""))
             )
+    tmp_junit = output_dir / "junit.xml.tmp"
     ElementTree.ElementTree(suite).write(
-        output_dir / "junit.xml", encoding="utf-8", xml_declaration=True
+        tmp_junit, encoding="utf-8", xml_declaration=True
     )
+    os.replace(tmp_junit, output_dir / "junit.xml")
+
+
+def _atomic_write_text(path: Path, payload: str) -> None:
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    os.replace(tmp, path)

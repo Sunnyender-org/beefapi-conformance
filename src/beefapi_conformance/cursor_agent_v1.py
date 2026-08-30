@@ -32,6 +32,9 @@ CLASSIFIER_COMMAND = (
 AGENT_V1_PUBLIC_ID = re.compile(r"resp_bf_agentv1_u[0-9]+_c[0-9]+_[A-Za-z0-9]+")
 TOOL_USE_LITERAL = re.compile(r"toolu_[A-Za-z0-9_]+")
 RECEIPT_LITERAL = re.compile(r"cursor-agent-v1:[A-Za-z0-9:_-]+")
+RELAY_REQUEST_LITERAL = re.compile(
+    r"(\brequest[ _-]?id\s*[:=]\s*)([A-Za-z0-9_-]{12,})", re.IGNORECASE
+)
 RAW_ID_KEYS = frozenset(
     {
         "request_id",
@@ -99,7 +102,10 @@ def redact_correlation_ids(text: str) -> str:
         return text
     result = AGENT_V1_PUBLIC_ID.sub(lambda match: correlate_id(match.group(0)), text)
     result = TOOL_USE_LITERAL.sub(lambda match: correlate_id(match.group(0)), result)
-    return RECEIPT_LITERAL.sub(lambda match: correlate_id(match.group(0)), result)
+    result = RECEIPT_LITERAL.sub(lambda match: correlate_id(match.group(0)), result)
+    return RELAY_REQUEST_LITERAL.sub(
+        lambda match: match.group(1) + correlate_id(match.group(2)), result
+    )
 
 
 def redact_known_ids(text: str, raw_ids: Iterable[str]) -> str:

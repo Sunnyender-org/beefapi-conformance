@@ -165,7 +165,7 @@ def parse_assistant_message(output: str) -> dict[str, Any] | None:
 
 def parse_assistant_text(output: str) -> str:
     values: list[str] = []
-    for body in parse_json_objects(output):
+    for body in _assistant_message_bodies(output):
         content = body.get("content")
         if isinstance(content, list):
             for item in content:
@@ -181,11 +181,33 @@ def parse_assistant_text(output: str) -> str:
 
 
 def parse_stop_reason(output: str) -> str:
-    for body in parse_json_objects(output):
+    for body in _assistant_message_bodies(output):
         reason = body.get("stop_reason")
         if isinstance(reason, str) and reason:
             return reason
     return ""
+
+
+def raw_tool_use_blocks(output: str) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = []
+    for body in parse_json_objects(output):
+        for block in _content_blocks(body):
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                blocks.append(block)
+    return blocks
+
+
+def _assistant_message_bodies(output: str) -> list[dict[str, Any]]:
+    bodies: list[dict[str, Any]] = []
+    for body in parse_json_objects(output):
+        role = body.get("role")
+        if role != "assistant":
+            continue
+        content = body.get("content")
+        if role == "assistant" and isinstance(content, list):
+            bodies.append(body)
+            continue
+    return bodies
 
 
 def stage_a_payload(spec: dict[str, Any], model: str, prompt: str) -> dict[str, Any]:
@@ -223,6 +245,11 @@ def covering_tool_results(uses: list[ToolUse], *, marker: str) -> list[dict[str,
     return tool_results_for_uses(uses, marker=marker)
 
 
+def mixed_followup_text(marker: str) -> str:
+    """Ordinary consume-the-tool-result follow-up. Do not repeat a must-call prompt."""
+    return f"Consume the tool result and reply exactly {marker}."
+
+
 def stage_b_payload(
     stage_a: dict[str, Any],
     assistant: dict[str, Any],
@@ -238,7 +265,7 @@ def stage_b_payload(
         results = tool_results_for_uses(uses, marker=marker)
     user_content: list[dict[str, Any]] = list(results)
     if mode == "mixed":
-        user_content.append({"type": "text", "text": prompt})
+        user_content.append({"type": "text", "text": mixed_followup_text(marker)})
     payload = {
         "model": stage_a.get("model"),
         "max_tokens": stage_a.get("max_tokens", 256),
@@ -256,6 +283,22 @@ def stage_b_payload(
 def payload_hash(payload: object) -> str:
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return correlate_id(encoded.decode("utf-8"))[7:]
+
+
+def evaluate_none_terminal(output: str, marker: str) -> Evaluation:
+    """Stage B/C under tool_choice none: no tool_use, end_turn, marker in assistant text."""
+    if raw_tool_use_blocks(output):
+        return Evaluation("fail", "tool_choice none produced a tool_use")
+    if not _assistant_message_bodies(output):
+        return Evaluation("fail", "tool_choice none lacked an assistant message")
+    if parse_stop_reason(output) != "end_turn":
+        return Evaluation("fail", "tool_choice none did not stop with end_turn")
+    if marker not in parse_assistant_text(output):
+        return Evaluation(
+            "fail",
+            "assistant text did not contain the expected marker",
+        )
+    return Evaluation("pass")
 
 
 def terminal_semantics(output: str, status_code: int | None) -> dict[str, Any]:
@@ -563,6 +606,25 @@ def execute_tool_replay(
     last_status = status_b
     last_output = output_b
     stream = stream_b
+    none_terminal = evaluate_none_terminal(output_b, marker)
+    if not none_terminal.ok:
+        return ReplayResult(
+            status="fail",
+            detail=none_terminal.detail,
+            attempts=attempts,
+            tool_use_id_hashes=hashes,
+            tool_uses=uses,
+            stage_b_payload=stage_b,
+            last_output=last_output,
+            last_status=last_status,
+            stream=stream,
+            evidence={
+                "tool_replay": {
+                    "stage": "b",
+                    "tool_use_id_hashes": hashes,
+                }
+            },
+        )
     if offsets:
         pause = sleeper or _default_sleep
         for offset, delta in zip(offsets, sleep_deltas(offsets), strict=True):

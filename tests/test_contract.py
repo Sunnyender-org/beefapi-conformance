@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import http.server
 import json
 import os
@@ -7,10 +8,16 @@ import sys
 import tempfile
 import threading
 import unittest
+from argparse import Namespace
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from beefapi_conformance.cli import (
+    _build_run_report,
+    _write_run_checkpoint,
+    command_run,
+)
 from beefapi_conformance.clients import ClientCommand, assistant_text, resolve_binary
 from beefapi_conformance.inventory import build_live_inventory
 from beefapi_conformance.manifest import Inventory, load_inventory
@@ -26,7 +33,7 @@ from beefapi_conformance.model import (
     Turn,
 )
 from beefapi_conformance.redact import redact
-from beefapi_conformance.report import build_report
+from beefapi_conformance.report import build_report, write_report
 from beefapi_conformance.runner import (
     AGENT_V1_RESPONSE_ID,
     _beefapi_token_log_evidence,
@@ -924,6 +931,1026 @@ class ContractTests(unittest.TestCase):
             "first-tool", json.dumps(results[0].evidence["server_evidence"])
         )
 
+    def test_batch_evidence_rereads_empty_snapshot_until_final_receipt(self):
+        native = CommandTests().cell("codex")
+        route = replace(
+            native.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+        )
+        native = MatrixCell(
+            replace(native.client, id="codex-cli"),
+            route,
+            native.model,
+            native.scenario,
+        )
+        receipt = {
+            "usage_receipt_provider": "cursor-sdk-bridge",
+            "usage_receipt_state": "final",
+        }
+        old_log = {
+            "created_at": 100,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": "old",
+            "other": json.dumps({**receipt, "usage_receipt_id": "old"}),
+        }
+        final_log = {
+            **old_log,
+            "created_at": 200,
+            "request_id": "native-new",
+            "other": json.dumps({**receipt, "usage_receipt_id": "native"}),
+        }
+        result = CellResult(
+            native.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route.id,
+            native.model.id,
+            native.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_server_window": {
+                    "started_epoch": 199,
+                    "finished_epoch": 200,
+                },
+            },
+        )
+        responses = [
+            FakeResponse(
+                {"success": True, "data": [old_log]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {"success": True, "data": []},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {"success": True, "data": [old_log, final_log]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+        ]
+        with (
+            patch.dict(os.environ, {"TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=responses) as urlopen,
+            patch("time.sleep") as slept,
+        ):
+            sessions = prepare_batch_server_evidence([native])
+            finalize_batch_server_evidence([native], [result], sessions)
+        self.assertEqual("pass", result.status, result.detail)
+        self.assertEqual("pass", result.evidence["server_evidence"]["status"])
+        self.assertEqual(3, urlopen.call_count)
+        self.assertGreaterEqual(slept.call_count, 1)
+
+    def test_batch_evidence_duplicate_request_id_does_not_pass(self):
+        raw = CommandTests().cell("raw-http")
+        route = replace(
+            raw.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+        )
+        raw = MatrixCell(
+            replace(raw.client, id="raw-http"), route, raw.model, raw.scenario
+        )
+        receipt = {
+            "usage_receipt_provider": "cursor-sdk-bridge",
+            "usage_receipt_state": "final",
+        }
+        old_log = {
+            "created_at": 100,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": "old",
+            "other": json.dumps({**receipt, "usage_receipt_id": "old"}),
+        }
+
+        def log(request_id: str, receipt_id: str):
+            return {
+                **old_log,
+                "created_at": 201,
+                "request_id": request_id,
+                "other": json.dumps({**receipt, "usage_receipt_id": receipt_id}),
+            }
+
+        result = CellResult(
+            raw.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route.id,
+            raw.model.id,
+            raw.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_response_request_id": "raw-new",
+                "_server_window": {
+                    "started_epoch": 201,
+                    "finished_epoch": 201,
+                },
+            },
+        )
+        responses = [
+            FakeResponse(
+                {"success": True, "data": [old_log]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {
+                    "success": True,
+                    "data": [
+                        old_log,
+                        log("raw-new", "raw-a"),
+                        log("raw-new", "raw-b"),
+                    ],
+                },
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+        ]
+        with (
+            patch.dict(os.environ, {"TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=responses) as urlopen,
+            patch("time.sleep") as slept,
+        ):
+            sessions = prepare_batch_server_evidence([raw])
+            finalize_batch_server_evidence([raw], [result], sessions)
+        self.assertEqual("fail", result.status)
+        self.assertEqual("fail", result.evidence["server_evidence"]["status"])
+        self.assertEqual(2, urlopen.call_count)
+        slept.assert_not_called()
+        self.assertEqual(
+            2, result.evidence["server_evidence"].get("consume_match_count")
+        )
+        self.assertNotIn("raw-new", json.dumps(result.evidence["server_evidence"]))
+
+    def test_batch_snapshot_does_not_stitch_partial_session_reads(self):
+        cell_a = CommandTests().cell("raw-http")
+        cell_b = CommandTests().cell("raw-http")
+        receipt = {
+            "usage_receipt_provider": "cursor-sdk-bridge",
+            "usage_receipt_state": "final",
+        }
+        route_a = replace(
+            cell_a.route,
+            id="route-a",
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+            base_url="https://a.example",
+        )
+        route_b = replace(
+            cell_b.route,
+            id="route-b",
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+            base_url="https://b.example",
+        )
+        cell_a = MatrixCell(
+            replace(cell_a.client, id="raw-http-a"),
+            route_a,
+            cell_a.model,
+            cell_a.scenario,
+        )
+        cell_b = MatrixCell(
+            replace(cell_b.client, id="raw-http-b"),
+            route_b,
+            cell_b.model,
+            cell_b.scenario,
+        )
+
+        def log(request_id: str, created_at: int = 200):
+            return {
+                "created_at": created_at,
+                "type": 2,
+                "model_name": "model",
+                "channel": 252,
+                "group": "cursor-acceptance",
+                "request_id": request_id,
+                "other": json.dumps({**receipt, "usage_receipt_id": request_id}),
+            }
+
+        old = log("old", 100)
+        result_a = CellResult(
+            cell_a.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route_a.id,
+            cell_a.model.id,
+            cell_a.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_response_request_id": "req-a",
+            },
+        )
+        result_b = CellResult(
+            cell_b.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route_b.id,
+            cell_b.model.id,
+            cell_b.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_response_request_id": "req-b",
+            },
+        )
+        calls = {"a": 0, "b": 0}
+
+        def fake_urlopen(request, timeout=0):
+            host = "a" if "a.example" in request.full_url else "b"
+            calls[host] += 1
+            headers = {"X-New-Api-Commit": "commit-sha"}
+            if host == "a":
+                if calls[host] <= 2:
+                    return FakeResponse({"success": True, "data": [old]}, headers)
+                return FakeResponse(
+                    {"success": True, "data": [old, log("req-a")]}, headers
+                )
+            if calls[host] == 1:
+                return FakeResponse({"success": True, "data": [old]}, headers)
+            if calls[host] == 2:
+                return FakeResponse(
+                    {"success": True, "data": [old, log("req-b")]}, headers
+                )
+            raise OSError("session b token-log unavailable")
+
+        with (
+            patch.dict(os.environ, {"TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("time.sleep"),
+        ):
+            sessions = prepare_batch_server_evidence([cell_a, cell_b])
+            finalize_batch_server_evidence(
+                [cell_a, cell_b], [result_a, result_b], sessions
+            )
+        self.assertEqual("fail", result_a.status)
+        self.assertNotEqual(["pass", "pass"], [result_a.status, result_b.status])
+
+    def test_batch_conflict_stays_failed_after_later_clean_snapshot(self):
+        first = CommandTests().cell("raw-http")
+        second = CommandTests().cell("raw-http")
+        route = replace(
+            first.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+        )
+        first = MatrixCell(
+            replace(first.client, id="raw-x"), route, first.model, first.scenario
+        )
+        second = MatrixCell(
+            replace(second.client, id="raw-y"), route, second.model, second.scenario
+        )
+        receipt = {
+            "usage_receipt_provider": "cursor-sdk-bridge",
+            "usage_receipt_state": "final",
+        }
+
+        def log(request_id: str, extra: str = ""):
+            return {
+                "created_at": 200,
+                "type": 2,
+                "model_name": "model",
+                "channel": 252,
+                "group": "cursor-acceptance",
+                "request_id": request_id,
+                "other": json.dumps(
+                    {**receipt, "usage_receipt_id": request_id + extra}
+                ),
+            }
+
+        old = {**log("old"), "created_at": 100}
+        result_x = CellResult(
+            first.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route.id,
+            first.model.id,
+            first.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_response_request_id": "req-x",
+            },
+        )
+        result_y = CellResult(
+            second.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route.id,
+            second.model.id,
+            second.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_response_request_id": "req-y",
+            },
+        )
+        responses = [
+            FakeResponse(
+                {"success": True, "data": [old]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {
+                    "success": True,
+                    "data": [old, log("req-x", "-a"), log("req-x", "-b")],
+                },
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {
+                    "success": True,
+                    "data": [old, log("req-x"), log("req-y")],
+                },
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+        ]
+        with (
+            patch.dict(os.environ, {"TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=responses),
+            patch("time.sleep"),
+        ):
+            sessions = prepare_batch_server_evidence([first, second])
+            finalize_batch_server_evidence(
+                [first, second], [result_x, result_y], sessions
+            )
+        self.assertEqual("fail", result_x.status)
+        self.assertEqual("pass", result_y.status, result_y.detail)
+
+    def test_native_exact_ids_require_every_id_not_turn_count(self):
+        native = CommandTests().cell("codex")
+        route = replace(
+            native.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+        )
+        native = MatrixCell(
+            replace(native.client, id="codex-cli"),
+            route,
+            native.model,
+            native.scenario,
+        )
+        receipt = {
+            "usage_receipt_provider": "cursor-sdk-bridge",
+            "usage_receipt_state": "final",
+        }
+        old = {
+            "created_at": 100,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": "old",
+            "other": json.dumps({**receipt, "usage_receipt_id": "old"}),
+        }
+        only_a = {
+            **old,
+            "created_at": 200,
+            "request_id": "req-a",
+            "other": json.dumps({**receipt, "usage_receipt_id": "a"}),
+        }
+        result = CellResult(
+            native.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route.id,
+            native.model.id,
+            native.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_response_request_ids": ["req-a", "req-b"],
+                "_server_window": {"started_epoch": 199, "finished_epoch": 200},
+            },
+        )
+        seen = {"n": 0}
+
+        def fake_urlopen(request, timeout=0):
+            seen["n"] += 1
+            data = [old] if seen["n"] == 1 else [old, only_a]
+            return FakeResponse(
+                {"success": True, "data": data},
+                {"X-New-Api-Commit": "commit-sha"},
+            )
+
+        with (
+            patch.dict(os.environ, {"TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("time.sleep"),
+        ):
+            sessions = prepare_batch_server_evidence([native])
+            finalize_batch_server_evidence([native], [result], sessions)
+        self.assertEqual("fail", result.status)
+
+    def test_window_cell_cannot_steal_later_exact_request_id(self):
+        window_cell = CommandTests().cell("codex")
+        exact_cell = CommandTests().cell("raw-http")
+        route = replace(
+            window_cell.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+        )
+        window_cell = MatrixCell(
+            replace(window_cell.client, id="codex-cli"),
+            route,
+            window_cell.model,
+            window_cell.scenario,
+        )
+        exact_cell = MatrixCell(
+            replace(exact_cell.client, id="raw-http"),
+            route,
+            exact_cell.model,
+            exact_cell.scenario,
+        )
+        receipt = {
+            "usage_receipt_provider": "cursor-sdk-bridge",
+            "usage_receipt_state": "final",
+        }
+        old = {
+            "created_at": 100,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": "old",
+            "other": json.dumps({**receipt, "usage_receipt_id": "old"}),
+        }
+        shared = {
+            **old,
+            "created_at": 200,
+            "request_id": "req-b",
+            "other": json.dumps({**receipt, "usage_receipt_id": "b"}),
+        }
+        window_result = CellResult(
+            window_cell.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route.id,
+            window_cell.model.id,
+            window_cell.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_server_window": {"started_epoch": 200, "finished_epoch": 200},
+            },
+        )
+        exact_result = CellResult(
+            exact_cell.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route.id,
+            exact_cell.model.id,
+            exact_cell.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_response_request_id": "req-b",
+                "_server_window": {"started_epoch": 200, "finished_epoch": 200},
+            },
+        )
+        seen = {"n": 0}
+
+        def fake_urlopen(request, timeout=0):
+            seen["n"] += 1
+            data = [old] if seen["n"] == 1 else [old, shared]
+            return FakeResponse(
+                {"success": True, "data": data},
+                {"X-New-Api-Commit": "commit-sha"},
+            )
+
+        with (
+            patch.dict(os.environ, {"TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("time.sleep"),
+        ):
+            sessions = prepare_batch_server_evidence([window_cell, exact_cell])
+            finalize_batch_server_evidence(
+                [window_cell, exact_cell],
+                [window_result, exact_result],
+                sessions,
+            )
+        self.assertEqual("fail", window_result.status)
+        self.assertEqual("pass", exact_result.status, exact_result.detail)
+
+    def test_batch_empty_then_provisional_then_final_passes(self):
+        native = CommandTests().cell("codex")
+        route = replace(
+            native.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+        )
+        native = MatrixCell(
+            replace(native.client, id="codex-cli"),
+            route,
+            native.model,
+            native.scenario,
+        )
+        receipt = {
+            "usage_receipt_provider": "cursor-sdk-bridge",
+            "usage_receipt_state": "final",
+        }
+        old = {
+            "created_at": 100,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": "old",
+            "other": json.dumps({**receipt, "usage_receipt_id": "old"}),
+        }
+        provisional = {
+            **old,
+            "created_at": 200,
+            "request_id": "native-new",
+            "other": json.dumps(
+                {
+                    "usage_receipt_id": "native",
+                    "usage_receipt_state": "provisional",
+                }
+            ),
+        }
+        final = {
+            **old,
+            "created_at": 200,
+            "request_id": "native-new",
+            "other": json.dumps({**receipt, "usage_receipt_id": "native"}),
+        }
+        result = CellResult(
+            native.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route.id,
+            native.model.id,
+            native.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_server_window": {"started_epoch": 199, "finished_epoch": 200},
+            },
+        )
+        responses = [
+            FakeResponse(
+                {"success": True, "data": [old]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {"success": True, "data": []},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {"success": True, "data": [old, provisional]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {"success": True, "data": [old, final]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+        ]
+        with (
+            patch.dict(os.environ, {"TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=responses),
+            patch("time.sleep"),
+        ):
+            sessions = prepare_batch_server_evidence([native])
+            finalize_batch_server_evidence([native], [result], sessions)
+        self.assertEqual("pass", result.status, result.detail)
+
+    def test_batch_rejects_cross_route_model_and_token_logs(self):
+        native = CommandTests().cell("codex")
+        route = replace(
+            native.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+        )
+        native = MatrixCell(
+            replace(native.client, id="codex-cli"),
+            route,
+            native.model,
+            native.scenario,
+        )
+        receipt = {
+            "usage_receipt_provider": "cursor-sdk-bridge",
+            "usage_receipt_state": "final",
+        }
+        old = {
+            "created_at": 100,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": "old",
+            "other": json.dumps({**receipt, "usage_receipt_id": "old"}),
+        }
+        wrong_model = {
+            **old,
+            "created_at": 200,
+            "model_name": "other-model",
+            "request_id": "native-new",
+        }
+        wrong_channel = {
+            **old,
+            "created_at": 200,
+            "channel": 999,
+            "request_id": "native-new",
+        }
+        result = CellResult(
+            native.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route.id,
+            native.model.id,
+            native.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_response_request_id": "native-new",
+                "_server_window": {"started_epoch": 199, "finished_epoch": 200},
+            },
+        )
+        for alien in (wrong_model, wrong_channel):
+            with self.subTest(
+                channel=alien.get("channel"), model=alien.get("model_name")
+            ):
+                target = CellResult(
+                    result.cell_id,
+                    "pass",
+                    "client",
+                    "now",
+                    1,
+                    result.route_id,
+                    result.model_id,
+                    result.scenario_id,
+                    [],
+                    {
+                        "server_evidence": {"status": "deferred"},
+                        "_response_request_id": "native-new",
+                        "_server_window": {
+                            "started_epoch": 199,
+                            "finished_epoch": 200,
+                        },
+                    },
+                )
+                counter = {"n": 0}
+
+                def fake_urlopen(request, timeout=0, snapshot=alien, state=counter):
+                    state["n"] += 1
+                    data = [old] if state["n"] == 1 else [old, snapshot]
+                    return FakeResponse(
+                        {"success": True, "data": data},
+                        {"X-New-Api-Commit": "commit-sha"},
+                    )
+
+                with (
+                    patch.dict(os.environ, {"TOKEN": "token"}),
+                    patch("urllib.request.urlopen", side_effect=fake_urlopen),
+                    patch("time.sleep"),
+                ):
+                    sessions = prepare_batch_server_evidence([native])
+                    finalize_batch_server_evidence([native], [target], sessions)
+                self.assertEqual("fail", target.status)
+
+    def test_raw_http_without_request_id_does_not_claim_neighbor_logs(self):
+        raw = CommandTests().cell("raw-http")
+        route = replace(
+            raw.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+        )
+        raw = MatrixCell(
+            replace(raw.client, id="raw-http"), route, raw.model, raw.scenario
+        )
+        receipt = {
+            "usage_receipt_provider": "cursor-sdk-bridge",
+            "usage_receipt_state": "final",
+        }
+        neighbor = {
+            "created_at": 200,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": "neighbor-final",
+            "other": json.dumps({**receipt, "usage_receipt_id": "neighbor"}),
+        }
+        result = CellResult(
+            raw.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route.id,
+            raw.model.id,
+            raw.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_server_window": {"started_epoch": 199, "finished_epoch": 201},
+            },
+        )
+        responses = [
+            FakeResponse(
+                {"success": True, "data": []},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {"success": True, "data": [neighbor]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+        ]
+        with (
+            patch.dict(os.environ, {"TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=responses),
+            patch("time.sleep"),
+        ):
+            sessions = prepare_batch_server_evidence([raw])
+            finalize_batch_server_evidence([raw], [result], sessions)
+        self.assertEqual("fail", result.status)
+        self.assertIn(
+            "X-Oneapi-Request-Id", result.evidence["server_evidence"].get("detail", "")
+        )
+
+    def test_batch_error_redacts_opaque_token_and_raw_request_id(self):
+        canary_token = "OPAQUE-CANARY-TOKEN-9f3a7c"
+        canary_id = "req-canary-freeform-id-xyz"
+        raw = CommandTests().cell("raw-http")
+        route = replace(
+            raw.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+        )
+        raw = MatrixCell(
+            replace(raw.client, id="raw-http"), route, raw.model, raw.scenario
+        )
+        result = CellResult(
+            raw.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route.id,
+            raw.model.id,
+            raw.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_response_request_id": canary_id,
+            },
+        )
+        seen = {"n": 0}
+
+        def fake_urlopen(request, timeout=0):
+            seen["n"] += 1
+            if seen["n"] == 1:
+                return FakeResponse(
+                    {"success": True, "data": []},
+                    {"X-New-Api-Commit": "commit-sha"},
+                )
+            raise RuntimeError(
+                f"gateway rejected token={canary_token} request_id={canary_id}"
+            )
+
+        with (
+            patch.dict(os.environ, {"TOKEN": canary_token}),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("time.sleep"),
+        ):
+            sessions = prepare_batch_server_evidence([raw])
+            finalize_batch_server_evidence([raw], [result], sessions)
+        evidence = json.dumps(result.evidence)
+        self.assertEqual("fail", result.status)
+        self.assertNotIn(canary_token, evidence)
+        self.assertNotIn(canary_id, evidence)
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "report"
+            report = _build_run_report([result], "release", [raw])
+            write_report(report, output)
+            _write_run_checkpoint([result], "release", [raw], output)
+            dumped = (output / "conformance.json").read_text(encoding="utf-8")
+        self.assertNotIn(canary_token, dumped)
+        self.assertNotIn(canary_id, dumped)
+        self.assertNotIn(canary_token, json.dumps(report))
+
+    def test_type64_exact_ids_each_require_final_receipt(self):
+        native = CommandTests().cell("codex")
+        route = replace(
+            native.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+            channel_type=64,
+        )
+        native = MatrixCell(
+            replace(native.client, id="codex-cli"),
+            route,
+            native.model,
+            native.scenario,
+        )
+        receipt = {
+            "usage_receipt_provider": "cursor-agent-v1",
+            "usage_receipt_state": "final",
+        }
+        old = {
+            "created_at": 100,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": "old",
+            "other": json.dumps({**receipt, "usage_receipt_id": "old"}),
+        }
+        final_a = {
+            **old,
+            "created_at": 200,
+            "request_id": "req-a",
+            "other": json.dumps({**receipt, "usage_receipt_id": "a"}),
+        }
+        provisional_b = {
+            **old,
+            "created_at": 200,
+            "request_id": "req-b",
+            "other": json.dumps(
+                {
+                    "usage_receipt_id": "b",
+                    "usage_receipt_provider": "cursor-agent-v1",
+                    "usage_receipt_state": "provisional",
+                }
+            ),
+        }
+        result = CellResult(
+            native.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            route.id,
+            native.model.id,
+            native.scenario.id,
+            [],
+            {
+                "server_evidence": {"status": "deferred"},
+                "_response_request_ids": ["req-a", "req-b"],
+                "_server_window": {"started_epoch": 199, "finished_epoch": 200},
+            },
+        )
+        seen = {"n": 0}
+
+        def fake_urlopen(request, timeout=0):
+            seen["n"] += 1
+            data = [old] if seen["n"] == 1 else [old, final_a, provisional_b]
+            return FakeResponse(
+                {"success": True, "data": data},
+                {"X-New-Api-Commit": "commit-sha"},
+            )
+
+        with (
+            patch.dict(os.environ, {"TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("time.sleep"),
+        ):
+            sessions = prepare_batch_server_evidence([native])
+            finalize_batch_server_evidence([native], [result], sessions)
+        self.assertEqual("fail", result.status)
+
+    def test_overlapping_native_windows_both_fail(self):
+        first = CommandTests().cell("codex")
+        second = CommandTests().cell("grok-build")
+        route = replace(
+            first.route,
+            channel_id=252,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
+            release_evidence_required=True,
+        )
+        first = MatrixCell(
+            replace(first.client, id="codex-cli"),
+            route,
+            first.model,
+            first.scenario,
+        )
+        second = MatrixCell(
+            replace(second.client, id="grok-build"),
+            route,
+            second.model,
+            second.scenario,
+        )
+        receipt = {
+            "usage_receipt_provider": "cursor-sdk-bridge",
+            "usage_receipt_state": "final",
+        }
+        shared = {
+            "created_at": 200,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": "shared-window",
+            "other": json.dumps({**receipt, "usage_receipt_id": "shared"}),
+        }
+        old = {**shared, "created_at": 100, "request_id": "old"}
+        results = [
+            CellResult(
+                first.id,
+                "pass",
+                "client",
+                "now",
+                1,
+                route.id,
+                first.model.id,
+                first.scenario.id,
+                [],
+                {
+                    "server_evidence": {"status": "deferred"},
+                    "_server_window": {"started_epoch": 200, "finished_epoch": 200},
+                },
+            ),
+            CellResult(
+                second.id,
+                "pass",
+                "client",
+                "now",
+                1,
+                route.id,
+                second.model.id,
+                second.scenario.id,
+                [],
+                {
+                    "server_evidence": {"status": "deferred"},
+                    "_server_window": {"started_epoch": 200, "finished_epoch": 200},
+                },
+            ),
+        ]
+        responses = [
+            FakeResponse(
+                {"success": True, "data": [old]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {"success": True, "data": [old, shared]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+        ]
+        with (
+            patch.dict(os.environ, {"TOKEN": "token"}),
+            patch("urllib.request.urlopen", side_effect=responses),
+            patch("time.sleep"),
+        ):
+            sessions = prepare_batch_server_evidence([first, second])
+            finalize_batch_server_evidence([first, second], results, sessions)
+        self.assertEqual(["fail", "fail"], [item.status for item in results])
+        self.assertIn(
+            "ambiguous", results[0].evidence["server_evidence"].get("detail", "")
+        )
+
 
 class CommandTests(unittest.TestCase):
     def cell(self, adapter: str) -> MatrixCell:
@@ -1083,6 +2110,8 @@ class RunnerTests(unittest.TestCase):
                 status = 200 if roles == ["user", "system"] and is_claude_code else 400
                 body = json.dumps(
                     {
+                        "role": "assistant",
+                        "type": "message",
                         "content": [
                             {
                                 "type": "text",
@@ -1369,6 +2398,348 @@ class RunnerTests(unittest.TestCase):
         finally:
             os.environ.pop("RAW_HTTP_TEST_TOKEN", None)
             os.environ.pop("RAW_HTTP_EVIDENCE_COMMAND", None)
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_workspace_teardown_failure_keeps_cell_result(self):
+        binary = str(ROOT / "tests/fixtures/mock_agent.py")
+        client = Client(
+            "mock",
+            "Mock",
+            "mock",
+            (binary,),
+            ("--version",),
+            frozenset({"text", "tool.shell"}),
+            frozenset({"darwin"}),
+        )
+        route = Route(
+            "mock-route",
+            "Mock",
+            "managed_session",
+            None,
+            None,
+            None,
+            frozenset({"mock"}),
+            frozenset({"mock"}),
+            frozenset({"text", "tool.shell"}),
+            None,
+        )
+        model = Model(
+            "mock-model",
+            "Mock",
+            frozenset({"mock-route"}),
+            frozenset({"mock"}),
+            frozenset({"text", "tool.shell"}),
+            {},
+        )
+        scenario = Scenario(
+            "mock-scenario",
+            "Mock",
+            "pr",
+            "client",
+            None,
+            frozenset({"tool.shell"}),
+            10,
+            True,
+            (
+                Turn(
+                    "BEEFAPI_CONFORMANCE_TOOL_OK",
+                    "BEEFAPI_CONFORMANCE_TOOL_OK",
+                    ("BEEFAPI_CONFORMANCE_FILE_OK",),
+                ),
+            ),
+        )
+        with patch(
+            "beefapi_conformance.runner.shutil.rmtree",
+            side_effect=OSError(errno.ENOTEMPTY, "Directory not empty"),
+        ):
+            result = run_cell(
+                MatrixCell(client, route, model, scenario), allow_local_tools=True
+            )
+        self.assertEqual("fail", result.status)
+        self.assertIn("infrastructure", result.detail)
+        self.assertEqual(1, len(result.turns))
+        self.assertEqual("pass", result.turns[0].status)
+        self.assertEqual(
+            "workspace_cleanup_failed",
+            result.evidence["infrastructure"]["teardown"],
+        )
+
+    def test_cli_checkpoint_redacts_private_ids_and_marks_unfinished(self):
+        canary_token = "OPAQUE-CANARY-TOKEN-9f3a7c"
+        cell = CommandTests().cell("mock")
+        result = CellResult(
+            cell.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            cell.route.id,
+            cell.model.id,
+            cell.scenario.id,
+            [],
+            {
+                "_response_request_ids": ["req-raw-secret"],
+                "_replay_attempts": [{"_http_request_id": "req-raw-secret"}],
+                "server_evidence": {
+                    "status": "deferred",
+                    "detail": f"leaked {canary_token} req-raw-secret",
+                },
+            },
+            f"leaked {canary_token}",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "report"
+            args = Namespace(
+                tier="pr",
+                allow_local_tools=False,
+                require_server_evidence=True,
+                max_cells=10,
+                fail_fast=False,
+                output=str(output),
+            )
+            with (
+                patch.dict(os.environ, {"TOKEN": canary_token}),
+                patch("beefapi_conformance.cli._matrix", return_value=[cell]),
+                patch("beefapi_conformance.cli.run_cell", return_value=result),
+                patch(
+                    "beefapi_conformance.cli.prepare_batch_server_evidence",
+                    return_value={
+                        ("https://example.invalid", "TOKEN"): {"token": canary_token}
+                    },
+                ),
+                patch(
+                    "beefapi_conformance.cli.finalize_batch_server_evidence",
+                    side_effect=RuntimeError("token-log unavailable"),
+                ),
+                self.assertRaises(RuntimeError),
+            ):
+                command_run(args)
+            dumped = (output / "conformance.json").read_text(encoding="utf-8")
+            payload = json.loads(dumped)
+            self.assertTrue(payload["unfinished"])
+            self.assertEqual("failed", payload["classification"])
+            self.assertNotIn("req-raw-secret", dumped)
+            self.assertNotIn(canary_token, dumped)
+            self.assertNotIn("_replay_attempts", dumped)
+            self.assertNotIn("_http_request_id", dumped)
+            self.assertNotIn("_response_request_ids", dumped)
+
+    def test_cli_checkpoint_is_unfinished_and_not_a_final_pass(self):
+        cell = CommandTests().cell("mock")
+        result = CellResult(
+            cell.id,
+            "pass",
+            "client",
+            "now",
+            1,
+            cell.route.id,
+            cell.model.id,
+            cell.scenario.id,
+            [],
+            {"server_evidence": {"status": "deferred"}},
+        )
+        writes: list[dict] = []
+
+        def capture(report, output_dir):
+            writes.append(json.loads(json.dumps(report)))
+            write_report(report, output_dir)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            args = Namespace(
+                tier="pr",
+                allow_local_tools=False,
+                require_server_evidence=False,
+                max_cells=10,
+                fail_fast=False,
+                output=str(Path(tmp) / "report"),
+            )
+            with (
+                patch("beefapi_conformance.cli._matrix", return_value=[cell]),
+                patch("beefapi_conformance.cli.run_cell", return_value=result),
+                patch("beefapi_conformance.cli.write_report", side_effect=capture),
+            ):
+                code = command_run(args)
+        self.assertEqual(0, code)
+        self.assertGreaterEqual(len(writes), 2)
+        checkpoint = writes[0]
+        final = writes[-1]
+        self.assertTrue(checkpoint["unfinished"])
+        self.assertEqual("failed", checkpoint["classification"])
+        self.assertNotEqual("passed", checkpoint["classification"])
+        self.assertFalse(final.get("unfinished"))
+        self.assertEqual("passed", final["classification"])
+
+    def test_raw_http_marker_in_error_or_tool_input_is_not_a_pass(self):
+        marker = "BEEFAPI_ASSISTANT_BODY_OK"
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("content-length", "0"))
+                self.rfile.read(length)
+                payload = {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_01Leak",
+                            "name": "lookup",
+                            "input": {"q": marker},
+                        },
+                        {"type": "text", "text": "nope"},
+                    ],
+                    "error": {"message": marker},
+                    "stop_reason": "tool_use",
+                }
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = Client(
+                "raw-http",
+                "HTTP",
+                "raw-http",
+                ("python3",),
+                ("--version",),
+                frozenset({"text", "messages"}),
+                frozenset({"darwin"}),
+            )
+            route = Route(
+                "route",
+                "Route",
+                "gateway_token",
+                f"http://127.0.0.1:{server.server_port}",
+                None,
+                "RAW_HTTP_TEST_TOKEN",
+                frozenset({"raw-http"}),
+                frozenset({"messages"}),
+                frozenset({"text", "messages"}),
+                None,
+            )
+            model = Model(
+                "model",
+                "Model",
+                frozenset({route.id}),
+                frozenset({client.id}),
+                frozenset({"text", "messages"}),
+                {},
+            )
+            scenario = Scenario.parse(
+                {
+                    "id": "messages-text",
+                    "name": "Messages",
+                    "tier": "pr",
+                    "kind": "http",
+                    "protocol": "messages",
+                    "http_endpoint": "/v1/messages",
+                    "required_capabilities": ["messages"],
+                    "turns": [
+                        {
+                            "prompt": f"Reply exactly {marker}.",
+                            "marker": marker,
+                            "expected_events": [],
+                        }
+                    ],
+                }
+            )
+            os.environ["RAW_HTTP_TEST_TOKEN"] = "plain-test-token"
+            result = run_cell(MatrixCell(client, route, model, scenario))
+            self.assertEqual("fail", result.status)
+        finally:
+            os.environ.pop("RAW_HTTP_TEST_TOKEN", None)
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_raw_http_assistant_body_marker_still_passes(self):
+        marker = "BEEFAPI_ASSISTANT_BODY_OK"
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("content-length", "0"))
+                self.rfile.read(length)
+                payload = {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": marker}],
+                    "stop_reason": "end_turn",
+                }
+                body = json.dumps(payload).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            client = Client(
+                "raw-http",
+                "HTTP",
+                "raw-http",
+                ("python3",),
+                ("--version",),
+                frozenset({"text", "messages"}),
+                frozenset({"darwin"}),
+            )
+            route = Route(
+                "route",
+                "Route",
+                "gateway_token",
+                f"http://127.0.0.1:{server.server_port}",
+                None,
+                "RAW_HTTP_TEST_TOKEN",
+                frozenset({"raw-http"}),
+                frozenset({"messages"}),
+                frozenset({"text", "messages"}),
+                None,
+            )
+            model = Model(
+                "model",
+                "Model",
+                frozenset({route.id}),
+                frozenset({client.id}),
+                frozenset({"text", "messages"}),
+                {},
+            )
+            scenario = Scenario.parse(
+                {
+                    "id": "messages-text",
+                    "name": "Messages",
+                    "tier": "pr",
+                    "kind": "http",
+                    "protocol": "messages",
+                    "http_endpoint": "/v1/messages",
+                    "required_capabilities": ["messages"],
+                    "turns": [
+                        {
+                            "prompt": f"Reply exactly {marker}.",
+                            "marker": marker,
+                            "expected_events": [],
+                        }
+                    ],
+                }
+            )
+            os.environ["RAW_HTTP_TEST_TOKEN"] = "plain-test-token"
+            result = run_cell(MatrixCell(client, route, model, scenario))
+            self.assertEqual("pass", result.status, result.detail)
+        finally:
+            os.environ.pop("RAW_HTTP_TEST_TOKEN", None)
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)

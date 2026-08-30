@@ -19,9 +19,13 @@ static assistant history. `tool_replay.py` drives public Messages traffic:
    `content` array.
 2. Stage B rebuilds `messages` as original user, that assistant message, then a
    user turn of `tool_result` blocks whose `tool_use_id` values are only the ids
-   returned by that parked Run. Mixed adds a text block on the same user turn.
-   Historical extras from a prior completed tool call are out of scope unless a
-   genuine preliminary stage is added later.
+   returned by that parked Run. Mixed adds a text block on the same user turn
+   that consumes the tool result and requires the marker; it does not repeat the
+   original must-call prompt. Stage B sends `tool_choice: none`. Any Stage B
+   `tool_use` fails. Stage B must `end_turn` with the marker in assistant text;
+   a marker only in tool input or `tool_result` is not a pass. Historical extras
+   from a prior completed tool call are out of scope unless a genuine
+   preliminary stage is added later.
 3. Stage C POSTs the exact Stage B payload at absolute elapsed offsets +23s and
    +180s (sleeps 23s, then 157s). Stage B's HTTP request id must resolve to
    exactly one consume log and one final `receipt.id_hash`. Every Stage C exact
@@ -52,7 +56,7 @@ completion.
 |---|---|---|
 | Usage | `observed_usage` and `billing_estimate` are both present and distinct. Type64 input/cache quality is `unknown` or `estimated`. | Flat `prompt_tokens: 0` / `cache_tokens: 0` treated as measured. Observed quality `measured` for unobservable fields. |
 | Tool catalog | Caller canaries (`Bash`, `Read`, `beefapi_conformance_canary`) remain visible. | Cursor native shell/fs names appear in the visible catalog (`Shell`, `ReadFile`, `DeleteFile`, `edit_file`, `list_dir`). |
-| Tool results | Stage A returns a live `tool_use` id. Stage B sends that exact assistant history plus a real `tool_result` for those ids only. Stage C at absolute +23s/+180s replays Stage B. Stage B has exactly one consume log/receipt. Stage C adds zero consume logs and no new receipt (`replay_without_consume` / `no_new_charge`). | Static `toolu_conformance_*` history. Invented `toolu_historical_routed_*` ids. Marker-only custom-tool answers. Copied receipts on C. Stage C consume log or new receipt. Stage B missing or ambiguous. Covering-set without a real two-call parked batch (blocked). |
+| Tool results | Stage A returns a live `tool_use` id. Stage B sends that exact assistant history plus a real `tool_result` for those ids only, with `tool_choice: none`. Mixed adds an ordinary consume-the-result follow-up that requires the marker. Stage B must `end_turn` with the marker in assistant text and zero `tool_use` blocks. Stage C at absolute +23s/+180s replays Stage B. Stage B has exactly one consume log/receipt. Stage C adds zero consume logs and no new receipt (`replay_without_consume` / `no_new_charge`). | Static `toolu_conformance_*` history. Invented `toolu_historical_routed_*` ids. Marker-only custom-tool answers. Marker only in tool input/`tool_result`. Stage B `tool_use` under `tool_choice: none`. Copied receipts on C. Stage C consume log or new receipt. Stage B missing or ambiguous. Duplicate/conflicting consume logs. Covering-set without a real two-call parked batch (blocked). |
 | Hosted web | Server-tool count, progress, and citations are present. Claude Code does not execute `WebSearch`/`WebFetch` itself. | Count-only receipts, missing citations/progress, or a local web-search tool_use. |
 | MCP | Spans correlate to real returned `tool_use` ids and match the declared serial or parallel contract. | Arbitrary `mcp` JSON, spans without matching tool ids, or serial/parallel mismatch. |
 | Thinking | First-byte is measured and the stream emits keepalive or progress during thinking-only time. | Silent wait until the final message. |

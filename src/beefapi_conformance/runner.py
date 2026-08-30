@@ -4,11 +4,13 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -29,6 +31,7 @@ from .model import CellResult, MatrixCell, TurnResult
 from .redact import redact
 from .tool_replay import (
     evaluate_mcp_spans,
+    evaluate_none_terminal,
     evaluate_replay_identity,
     execute_tool_replay,
     parse_assistant_text,
@@ -110,7 +113,9 @@ def run_cell(
             cell, "skip", started_at, started, version, [], "route base URL is missing"
         )
 
-    with tempfile.TemporaryDirectory(prefix="beefapi-conformance-") as tmp:
+    tmp = tempfile.mkdtemp(prefix="beefapi-conformance-")
+    result: CellResult | None = None
+    try:
         root = Path(tmp)
         workspace = root / "workspace"
         workspace.mkdir()
@@ -245,9 +250,42 @@ def run_cell(
         ):
             status = "fail"
             detail = "release tier requires passing server evidence"
-        return _result(
+        result = _result(
             cell, status, started_at, started, version, turn_results, detail, evidence
         )
+    finally:
+        try:
+            shutil.rmtree(tmp)
+        except OSError:
+            if result is None:
+                result = _result(
+                    cell,
+                    "fail",
+                    started_at,
+                    started,
+                    version,
+                    [],
+                    "infrastructure failure: workspace cleanup failed",
+                    {"infrastructure": {"teardown": "workspace_cleanup_failed"}},
+                )
+            else:
+                evidence = dict(result.evidence)
+                evidence["infrastructure"] = {"teardown": "workspace_cleanup_failed"}
+                result.evidence = evidence
+                if result.status == "pass":
+                    result.status = "fail"
+                    result.detail = "infrastructure failure: workspace cleanup failed"
+    if result is None:
+        result = _result(
+            cell,
+            "fail",
+            started_at,
+            started,
+            version,
+            [],
+            "infrastructure failure: client workspace aborted",
+        )
+    return result
 
 
 def _run_http_cell(
@@ -386,7 +424,7 @@ def _run_http_cell(
         passed = (
             status_code is not None
             and 200 <= status_code < 300
-            and (turn.marker in response_text or turn.marker in sanitized)
+            and turn.marker in response_text
             and not missing
         )
         mcp = _mcp_from_http_body(output)
@@ -514,9 +552,13 @@ def _run_tool_replay_http_cell(
     response_text = parse_assistant_text(replay.last_output)
     missing = [item for item in turn.expected_events if item not in sanitized]
     http_ok = replay.last_status is not None and 200 <= replay.last_status < 300
-    marker_ok = turn.marker in response_text or turn.marker in sanitized
+    none_terminal = evaluate_none_terminal(replay.last_output, turn.marker)
+    marker_ok = none_terminal.ok and turn.marker in response_text
     status = replay.status
     detail = replay.detail
+    if status == "pass" and not none_terminal.ok:
+        status = "fail"
+        detail = none_terminal.detail
     if status == "pass" and not (http_ok and marker_ok and not missing):
         status = "fail"
         detail = (
@@ -722,6 +764,139 @@ def _replay_no_new_charge_evidence(
     }
 
 
+def _replay_receipt_diagnostics(
+    attempts: list[dict[str, object]],
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "replay": _replay_no_new_charge_evidence(attempts),
+    }
+    stage_b = [
+        item for item in attempts if isinstance(item, dict) and item.get("stage") == "b"
+    ]
+    if stage_b:
+        payload["consume_match_count"] = stage_b[0].get("consume_match_count")
+        state = stage_b[0].get("receipt_state")
+        if state:
+            payload["receipt_state"] = state
+    return payload
+
+
+def _replay_receipt_gap(attempts: list[dict[str, object]]) -> str:
+    """Classify Stage B/C receipt evidence as ok, missing, or conflict."""
+    stage_b = [
+        item for item in attempts if isinstance(item, dict) and item.get("stage") == "b"
+    ]
+    if not stage_b:
+        return "missing"
+    for item in stage_b:
+        matches = item.get("consume_match_count")
+        if matches is None or matches == 0:
+            return "missing"
+        if not isinstance(matches, int) or matches != 1:
+            return "conflict"
+        if not item.get("receipt_hash"):
+            if str(item.get("receipt_state") or "") == "final":
+                return "conflict"
+            return "missing"
+    for item in attempts:
+        if not isinstance(item, dict) or item.get("stage") != "c":
+            continue
+        matches = item.get("consume_match_count")
+        if isinstance(matches, int) and matches > 0:
+            return "conflict"
+        if item.get("receipt_hash"):
+            return "conflict"
+    return "ok"
+
+
+def _exact_request_ids(request_id: str, request_ids: object) -> list[str]:
+    if request_id:
+        return [request_id]
+    return [
+        str(item).strip()
+        for item in (request_ids or [])
+        if isinstance(item, str) and str(item).strip()
+    ]
+
+
+def _cell_exact_ids(result: CellResult) -> list[str]:
+    return _exact_request_ids(
+        str(result.evidence.get("_response_request_id", "") or ""),
+        result.evidence.get("_response_request_ids", []),
+    )
+
+
+def _batch_secrets(
+    sessions: dict[tuple[str, str], dict[str, object]],
+) -> tuple[str, ...]:
+    return tuple(
+        str(session.get("token") or "")
+        for session in sessions.values()
+        if str(session.get("token") or "")
+    )
+
+
+def _known_request_ids(results: list[CellResult]) -> list[str]:
+    ids: list[str] = []
+    for result in results:
+        ids.extend(_cell_exact_ids(result))
+        attempts = result.evidence.get("_replay_attempts")
+        if isinstance(attempts, list):
+            for item in attempts:
+                if not isinstance(item, dict):
+                    continue
+                raw = str(item.get("_http_request_id") or "")
+                if raw:
+                    ids.append(raw)
+    return ids
+
+
+def _redact_batch_error(
+    text: str,
+    sessions: dict[tuple[str, str], dict[str, object]],
+    results: list[CellResult],
+) -> str:
+    return redact_known_ids(
+        redact(text, _batch_secrets(sessions)),
+        _known_request_ids(results),
+    )
+
+
+def _mark_overlapping_window_cells(
+    cells: list[MatrixCell],
+    result_by_id: dict[str, CellResult],
+    sticky_conflict: dict[str, dict[str, object]],
+) -> None:
+    grouped: dict[tuple[str, str], list[tuple[str, int, int]]] = {}
+    for cell in cells:
+        if cell.route.evidence_provider != "beefapi_token_log":
+            continue
+        if cell.client.adapter == "raw-http":
+            continue
+        result = result_by_id.get(cell.id)
+        if result is None or _cell_exact_ids(result):
+            continue
+        window = result.evidence.get("_server_window", {})
+        if not isinstance(window, dict):
+            continue
+        started = int(window.get("started_epoch", 0) or 0)
+        finished = int(window.get("finished_epoch", 0) or 0)
+        grouped.setdefault(_batch_session_key(cell), []).append(
+            (cell.id, started, finished)
+        )
+    for items in grouped.values():
+        for index, (left_id, left_start, left_end) in enumerate(items):
+            for right_id, right_start, right_end in items[index + 1 :]:
+                if left_end < right_start or right_end < left_start:
+                    continue
+                extra = {
+                    "detail": "overlapping native evidence windows are ambiguous",
+                    "diagnostics": {},
+                }
+                sticky_conflict.setdefault(left_id, extra)
+                sticky_conflict.setdefault(right_id, extra)
+
+
 def _bind_replay_server_evidence(
     cell: MatrixCell,
     attempts: list[dict[str, object]],
@@ -738,12 +913,14 @@ def _bind_replay_server_evidence(
     if fence is None:
         return {"status": "fail", "detail": "pre-call token-log fence was unavailable"}
     last_detail = "matching usage log not found"
+    diagnostics: dict[str, object] = {}
     for attempt in range(8):
         try:
             logs, commit = _fetch_token_logs(base_url.rstrip("/"), token)
             bind_replay_attempt_receipts(
                 cell, attempts, logs, commit, started_epoch, fence
             )
+            diagnostics = _replay_receipt_diagnostics(attempts)
             bound = [
                 item.get("_bound_payload")
                 for item in attempts
@@ -753,11 +930,13 @@ def _bind_replay_server_evidence(
             ]
             if bound:
                 payload = dict(bound[0])
-                payload["replay"] = _replay_no_new_charge_evidence(attempts)
+                payload.update(diagnostics)
                 return payload
             last_detail = (
                 "stage B request id did not resolve to exactly one final receipt"
             )
+            if _replay_receipt_gap(attempts) == "conflict":
+                return {"status": "fail", "detail": last_detail, **diagnostics}
         except (
             OSError,
             TimeoutError,
@@ -768,7 +947,7 @@ def _bind_replay_server_evidence(
             last_detail = redact(str(exc), (token,))
         if attempt < 7:
             time.sleep(1)
-    return {"status": "fail", "detail": last_detail}
+    return {"status": "fail", "detail": last_detail, **diagnostics}
 
 
 def _scrub_private_replay_fields(
@@ -968,8 +1147,21 @@ def _http_response_text(protocol: str | None, output: str) -> str:
             if fragment:
                 fragments.append(fragment)
         return "\n".join(fragments)
+    if isinstance(body, dict) and (
+        body.get("role") == "user" or body.get("type") == "error"
+    ):
+        return ""
     values: list[str] = []
     if protocol == "messages":
+        if not isinstance(body, dict):
+            return ""
+        if body.get("type") == "content_block_delta":
+            delta = body.get("delta")
+            if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                return delta.get("text") if isinstance(delta.get("text"), str) else ""
+            return ""
+        if body.get("role") != "assistant":
+            return ""
         content = body.get("content", []) if isinstance(body, dict) else []
         for item in content if isinstance(content, list) else []:
             if (
@@ -1117,6 +1309,13 @@ def _beefapi_token_log_evidence(
                 evidence_fence,
                 expected_request_id,
             )
+            match_ids = [str(item.get("request_id", "")).strip() for item in matches]
+            if len(match_ids) != len(set(match_ids)):
+                return {
+                    "status": "fail",
+                    "detail": "conflicting consume logs for one request id",
+                    "consume_match_count": len(matches),
+                }
             minimum_count = 1 if expected_request_id else len(cell.scenario.turns)
             if len(matches) >= minimum_count:
                 payloads = [_usage_log_payload(cell, item, commit) for item in matches]
@@ -1144,7 +1343,6 @@ def _matching_usage_logs(
         return []
     model_names = {cell.model.id, cell.model.client_model(cell.client.id)}
     matches: list[dict[str, object]] = []
-    seen_request_ids: set[str] = set()
     for log in logs:
         if not isinstance(log, dict):
             continue
@@ -1166,9 +1364,6 @@ def _matching_usage_logs(
             continue
         if cell.route.group and str(log.get("group", "")) != cell.route.group:
             continue
-        if request_id in seen_request_ids and expected_request_id is None:
-            continue
-        seen_request_ids.add(request_id)
         matches.append(log)
     return matches
 
@@ -1253,170 +1448,109 @@ def finalize_batch_server_evidence(
     results: list[CellResult],
     sessions: dict[tuple[str, str], dict[str, object]],
 ) -> None:
-    """Resolve a serialized production run with one bounded post-run snapshot."""
-    final_logs: dict[tuple[str, str], list[dict[str, object]]] = {}
-    final_commits: dict[tuple[str, str], str] = {}
+    """Resolve a serialized production run from one complete post-run snapshot."""
     last_error = "batch token-log evidence was unavailable"
+    complete_logs: dict[tuple[str, str], list[dict[str, object]]] | None = None
+    complete_commits: dict[tuple[str, str], str] | None = None
+    result_by_id = {result.cell_id: result for result in results}
+    sticky_conflict: dict[str, dict[str, object]] = {}
+    reserved: dict[tuple[str, str], set[str]] = {key: set() for key in sessions}
+    owners: dict[tuple[tuple[str, str], str], list[str]] = {}
+    for cell in cells:
+        if cell.route.evidence_provider != "beefapi_token_log":
+            continue
+        key = _batch_session_key(cell)
+        result = result_by_id[cell.id]
+        for request_id in _cell_exact_ids(result):
+            reserved.setdefault(key, set()).add(request_id)
+            owners.setdefault((key, request_id), []).append(cell.id)
+    for cell_ids in owners.values():
+        if len(cell_ids) < 2:
+            continue
+        extra = {"consume_match_count": len(cell_ids)}
+        for cell_id in cell_ids:
+            sticky_conflict.setdefault(
+                cell_id,
+                {
+                    "detail": "conflicting consume logs for one request id",
+                    "diagnostics": extra,
+                },
+            )
+    _mark_overlapping_window_cells(cells, result_by_id, sticky_conflict)
+
     for attempt in range(8):
         try:
-            for key, session in sessions.items():
-                logs, commit = _fetch_token_logs(key[0], str(session["token"]))
-                typed_logs = [item for item in logs if isinstance(item, dict)]
-                final_logs[key] = typed_logs
-                final_commits[key] = commit
-            break
+            round_logs, round_commits = _fetch_session_snapshots(sessions)
         except (OSError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
-            last_error = redact(str(exc))
-        if attempt < 7:
-            time.sleep(1)
-    else:
+            last_error = _redact_batch_error(str(exc), sessions, results)
+            if attempt < 7:
+                time.sleep(1)
+            continue
+        complete_logs, complete_commits = round_logs, round_commits
+        any_missing = False
+        allocated = {key: set(ids) for key, ids in reserved.items()}
+        for cell in cells:
+            if cell.route.evidence_provider != "beefapi_token_log":
+                continue
+            result = result_by_id[cell.id]
+            key = _batch_session_key(cell)
+            match = _match_batch_cell(
+                cell,
+                result,
+                complete_logs[key],
+                complete_commits[key],
+                sessions[key]["fence"],
+                reserved.get(key, set()),
+                allocated.setdefault(key, set()),
+            )
+            allocated[key].update(match.get("claimed_ids") or set())
+            if match["status"] == "conflict":
+                sticky_conflict.setdefault(
+                    cell.id,
+                    {
+                        "detail": match.get("detail") or "",
+                        "diagnostics": match.get("diagnostics") or {},
+                    },
+                )
+            elif cell.id not in sticky_conflict and match["status"] == "missing":
+                any_missing = True
+        if not any_missing or attempt == 7:
+            break
+        time.sleep(1)
+
+    if complete_logs is None or complete_commits is None:
         for result in results:
             _set_batch_evidence_failure(result, last_error)
         return
 
-    result_by_id = {result.cell_id: result for result in results}
-    used_request_ids: dict[tuple[str, str], set[str]] = {key: set() for key in sessions}
-
-    # Allocate in serialized execution order. Every row in a native cell's
-    # execution window is reserved, including rows from failed cells, so a tool
-    # loop cannot leak leftover evidence into the following cell.
+    allocated = {key: set(ids) for key, ids in reserved.items()}
     for cell in cells:
         result = result_by_id[cell.id]
         if cell.route.evidence_provider != "beefapi_token_log":
             continue
         key = _batch_session_key(cell)
-        window = result.evidence.pop("_server_window", {})
-        started_epoch = int(window.get("started_epoch", 0) or 0)
-        finished_epoch = int(window.get("finished_epoch", 0) or 0)
-        request_id = str(result.evidence.pop("_response_request_id", "") or "")
-        request_ids = result.evidence.pop("_response_request_ids", [])
-
-        if cell.client.adapter == "raw-http" and cell.scenario.tool_replay:
-            _finalize_replay_batch_evidence(
-                cell,
-                result,
-                final_logs[key],
-                final_commits[key],
-                sessions[key]["fence"],
-                used_request_ids[key],
-                request_id,
-                request_ids,
-            )
-            continue
-
-        if cell.client.adapter == "raw-http":
-            exact_ids = (
-                [request_id]
-                if request_id
-                else [
-                    str(item).strip()
-                    for item in request_ids
-                    if isinstance(item, str) and str(item).strip()
-                ]
-            )
-            matches = [
-                log
-                for exact in exact_ids
-                for log in _matching_usage_logs(
-                    cell,
-                    final_logs[key],
-                    0,
-                    sessions[key]["fence"],
-                    exact,
-                )
-            ]
-            used_request_ids[key].update(
-                str(item.get("request_id", "")) for item in matches
-            )
-            if result.status != "pass":
-                continue
-            if not exact_ids:
-                _set_batch_evidence_failure(
-                    result, "raw HTTP response did not expose X-Oneapi-Request-Id"
-                )
-                continue
-            if len(matches) != len(exact_ids):
-                _set_batch_evidence_failure(
-                    result,
-                    "raw HTTP request id did not resolve to exactly one consume log",
-                )
-                continue
-            payloads = [
-                _usage_log_payload(cell, item, final_commits[key]) for item in matches
-            ]
-            payload = dict(payloads[0])
-            if len(payloads) > 1:
-                payload["requests"] = payloads
-            result.evidence["server_evidence"] = payload
-            if any(item.get("status") != "pass" for item in payloads):
-                _set_batch_evidence_failure(result, str(payload.get("detail", "")))
-            else:
-                _apply_public_artifact_gate(cell, result)
-            continue
-
-        exact_request_ids = [
-            str(item).strip()
-            for item in request_ids
-            if isinstance(item, str) and str(item).strip()
-        ]
-        if exact_request_ids:
-            candidates = [
-                log
-                for exact_request_id in exact_request_ids
-                for log in _matching_usage_logs(
-                    cell,
-                    final_logs[key],
-                    0,
-                    sessions[key]["fence"],
-                    exact_request_id,
-                )
-            ]
-        else:
-            candidates = _matching_usage_logs(
-                cell,
-                final_logs[key],
-                started_epoch,
-                sessions[key]["fence"],
-            )
-            candidates = [
-                item
-                for item in candidates
-                if int(item.get("created_at", 0) or 0) <= finished_epoch
-            ]
-        candidates = [
-            item
-            for item in candidates
-            if str(item.get("request_id", "")) not in used_request_ids[key]
-        ]
-        candidates.sort(key=lambda item: int(item.get("created_at", 0) or 0))
-        used_request_ids[key].update(
-            str(item.get("request_id", "")) for item in candidates
+        match = _match_batch_cell(
+            cell,
+            result,
+            complete_logs[key],
+            complete_commits[key],
+            sessions[key]["fence"],
+            reserved.get(key, set()),
+            allocated.setdefault(key, set()),
         )
-        if result.status != "pass":
-            continue
-        required = len(cell.scenario.turns)
-        if len(candidates) < required:
-            _set_batch_evidence_failure(
-                result,
-                f"batch evidence found {len(candidates)} consume logs; {required} required",
-            )
-            continue
-        payloads = [
-            _usage_log_payload(cell, item, final_commits[key]) for item in candidates
-        ]
-        final_payloads = [item for item in payloads if item.get("status") == "pass"]
-        if len(final_payloads) < required:
-            _set_batch_evidence_failure(
-                result,
-                f"batch evidence found {len(final_payloads)} final receipts; {required} required",
-            )
-            continue
-        payload = dict(final_payloads[0])
-        if len(final_payloads) > 1:
-            payload["requests"] = final_payloads
-        payload["provisional_count"] = len(payloads) - len(final_payloads)
-        result.evidence["server_evidence"] = payload
-        _apply_public_artifact_gate(cell, result)
+        allocated[key].update(match.get("claimed_ids") or set())
+        prior = sticky_conflict.get(cell.id)
+        if prior is not None:
+            match = {
+                **match,
+                "status": "conflict",
+                "payload": None,
+                "detail": prior.get("detail") or match.get("detail") or "",
+                "diagnostics": prior.get("diagnostics")
+                or match.get("diagnostics")
+                or {},
+            }
+        _commit_batch_match(cell, result, match)
 
 
 def _batch_session_key(cell: MatrixCell) -> tuple[str, str]:
@@ -1441,60 +1575,316 @@ def _fetch_token_logs(base_url: str, token: str) -> tuple[list[dict[str, object]
     return [item for item in logs if isinstance(item, dict)], commit
 
 
-def _finalize_replay_batch_evidence(
+def _fetch_session_snapshots(
+    sessions: dict[tuple[str, str], dict[str, object]],
+) -> tuple[dict[tuple[str, str], list[dict[str, object]]], dict[tuple[str, str], str]]:
+    round_logs: dict[tuple[str, str], list[dict[str, object]]] = {}
+    round_commits: dict[tuple[str, str], str] = {}
+    for key, session in sessions.items():
+        logs, commit = _fetch_token_logs(key[0], str(session["token"]))
+        round_logs[key] = [item for item in logs if isinstance(item, dict)]
+        round_commits[key] = commit
+    return round_logs, round_commits
+
+
+def _match_batch_cell(
     cell: MatrixCell,
     result: CellResult,
     logs: list[dict[str, object]],
     commit: str,
     fence: object,
-    used_request_ids: set[str],
-    request_id: str,
-    request_ids: object,
-) -> None:
-    exact_ids = (
-        [request_id]
-        if request_id
-        else [
-            str(item).strip()
-            for item in (request_ids or [])
-            if isinstance(item, str) and str(item).strip()
-        ]
+    reserved_exact: set[str],
+    allocated: set[str],
+) -> dict[str, object]:
+    typed_fence = fence if isinstance(fence, set) else set()
+    exact_ids = _cell_exact_ids(result)
+    claimed = set(exact_ids)
+    window = result.evidence.get("_server_window", {})
+    started_epoch = (
+        int(window.get("started_epoch", 0) or 0) if isinstance(window, dict) else 0
     )
+    finished_epoch = (
+        int(window.get("finished_epoch", 0) or 0) if isinstance(window, dict) else 0
+    )
+    if cell.client.adapter == "raw-http" and cell.scenario.tool_replay:
+        return _match_replay_cell(cell, result, logs, commit, typed_fence, claimed)
+    if cell.client.adapter == "raw-http":
+        if not exact_ids:
+            return {
+                "status": "conflict",
+                "payload": None,
+                "diagnostics": {},
+                "claimed_ids": set(),
+                "detail": "raw HTTP response did not expose X-Oneapi-Request-Id",
+            }
+        return _match_exact_request_ids(
+            cell, result, logs, commit, typed_fence, exact_ids
+        )
+    if exact_ids:
+        return _match_exact_request_ids(
+            cell, result, logs, commit, typed_fence, exact_ids
+        )
+    return _match_window_logs(
+        cell,
+        result,
+        logs,
+        commit,
+        typed_fence,
+        started_epoch,
+        finished_epoch,
+        reserved_exact,
+        allocated,
+    )
+
+
+def _match_replay_cell(
+    cell: MatrixCell,
+    result: CellResult,
+    logs: list[dict[str, object]],
+    commit: str,
+    fence: set[str],
+    claimed: set[str],
+) -> dict[str, object]:
     attempts = result.evidence.get("_replay_attempts")
     typed_attempts = (
         [item for item in attempts if isinstance(item, dict)]
         if isinstance(attempts, list)
         else []
     )
-    typed_fence = fence if isinstance(fence, set) else set()
-    bind_replay_attempt_receipts(cell, typed_attempts, logs, commit, 0, typed_fence)
-    used_request_ids.update(exact_ids)
-    if result.status == "pass":
-        if not exact_ids:
-            _set_batch_evidence_failure(
-                result, "raw HTTP response did not expose X-Oneapi-Request-Id"
+    bind_replay_attempt_receipts(cell, typed_attempts, logs, commit, 0, fence)
+    diagnostics = _replay_receipt_diagnostics(typed_attempts)
+    base = {
+        "payload": None,
+        "diagnostics": diagnostics,
+        "claimed_ids": claimed,
+        "attempts": typed_attempts,
+        "detail": "",
+    }
+    if result.status != "pass":
+        return {**base, "status": "skip"}
+    if not claimed:
+        return {
+            **base,
+            "status": "conflict",
+            "detail": "raw HTTP response did not expose X-Oneapi-Request-Id",
+        }
+    identity = (
+        evaluate_replay_identity(typed_attempts, require_receipts=True)
+        if cell.scenario.retry_offsets_seconds
+        else _evaluate_single_stage_receipts(typed_attempts)
+    )
+    if identity.ok:
+        bound = [
+            item.get("_bound_payload")
+            for item in typed_attempts
+            if item.get("stage") == "b" and isinstance(item.get("_bound_payload"), dict)
+        ]
+        payload = dict(bound[0]) if bound else None
+        if payload is not None:
+            payload.update(diagnostics)
+        return {**base, "status": "ok", "payload": payload}
+    gap = _replay_receipt_gap(typed_attempts)
+    status = "missing" if gap == "missing" else "conflict"
+    return {**base, "status": status, "detail": identity.detail}
+
+
+def _match_exact_request_ids(
+    cell: MatrixCell,
+    result: CellResult,
+    logs: list[dict[str, object]],
+    commit: str,
+    fence: set[str],
+    exact_ids: list[str],
+) -> dict[str, object]:
+    rows_by_id = {
+        request_id: _matching_usage_logs(cell, logs, 0, fence, request_id)
+        for request_id in exact_ids
+    }
+    claimed = set(exact_ids)
+    consume_match_count = sum(len(rows) for rows in rows_by_id.values())
+    diagnostics: dict[str, object] = {"consume_match_count": consume_match_count}
+    base = {
+        "payload": None,
+        "diagnostics": diagnostics,
+        "claimed_ids": claimed,
+        "detail": "",
+    }
+    if result.status != "pass":
+        return {**base, "status": "skip"}
+    if any(len(rows) > 1 for rows in rows_by_id.values()):
+        return {
+            **base,
+            "status": "conflict",
+            "detail": "conflicting consume logs for one request id",
+        }
+    if any(len(rows) == 0 for rows in rows_by_id.values()):
+        return {
+            **base,
+            "status": "missing",
+            "detail": "request id did not resolve to exactly one consume log",
+        }
+    ordered = [rows_by_id[request_id][0] for request_id in exact_ids]
+    payloads = [_usage_log_payload(cell, item, commit) for item in ordered]
+    finals = [item for item in payloads if item.get("status") == "pass"]
+    if cell.client.adapter == "raw-http":
+        if any(item.get("status") != "pass" for item in payloads):
+            state = str((payloads[0].get("receipt") or {}).get("state") or "")
+            if state:
+                diagnostics["receipt_state"] = state
+            not_final = any(
+                str((item.get("receipt") or {}).get("state") or "") != "final"
+                for item in payloads
             )
-        else:
-            identity = (
-                evaluate_replay_identity(typed_attempts, require_receipts=True)
-                if cell.scenario.retry_offsets_seconds
-                else _evaluate_single_stage_receipts(typed_attempts)
-            )
-            if identity is not None and not identity.ok:
-                _set_batch_evidence_failure(result, identity.detail)
-            else:
-                bound = [
-                    item.get("_bound_payload")
-                    for item in typed_attempts
-                    if item.get("stage") == "b"
-                    and isinstance(item.get("_bound_payload"), dict)
-                ]
-                if bound:
-                    payload = dict(bound[0])
-                    payload["replay"] = _replay_no_new_charge_evidence(typed_attempts)
-                    result.evidence["server_evidence"] = payload
-                _apply_public_artifact_gate(cell, result, typed_attempts)
+            return {
+                **base,
+                "status": "missing" if not_final else "conflict",
+                "detail": str(
+                    payloads[0].get("detail") or "usage receipt is not final"
+                ),
+                "diagnostics": diagnostics,
+            }
+        payload = dict(payloads[0])
+        if len(payloads) > 1:
+            payload["requests"] = payloads
+        payload.update(diagnostics)
+        return {**base, "status": "ok", "payload": payload}
+    if cell.route.channel_type == 64:
+        if any(item.get("status") != "pass" for item in payloads):
+            state = ""
+            if payloads:
+                state = str((payloads[0].get("receipt") or {}).get("state") or "")
+            if state:
+                diagnostics["receipt_state"] = state
+            return {
+                **base,
+                "status": "missing",
+                "detail": "type64 exact request id is not a unique final receipt",
+                "diagnostics": diagnostics,
+            }
+        payload = dict(payloads[0])
+        if len(payloads) > 1:
+            payload["requests"] = payloads
+        payload["provisional_count"] = 0
+        payload.update(diagnostics)
+        return {**base, "status": "ok", "payload": payload}
+    required = len(cell.scenario.turns)
+    if len(finals) < required:
+        state = ""
+        if payloads:
+            state = str((payloads[0].get("receipt") or {}).get("state") or "")
+        if state:
+            diagnostics["receipt_state"] = state
+        return {
+            **base,
+            "status": "missing",
+            "detail": (
+                f"batch evidence found {len(finals)} final receipts; {required} required"
+            ),
+            "diagnostics": diagnostics,
+        }
+    payload = dict(finals[0])
+    if len(finals) > 1:
+        payload["requests"] = finals
+    payload["provisional_count"] = len(payloads) - len(finals)
+    payload.update(diagnostics)
+    return {**base, "status": "ok", "payload": payload}
+
+
+def _match_window_logs(
+    cell: MatrixCell,
+    result: CellResult,
+    logs: list[dict[str, object]],
+    commit: str,
+    fence: set[str],
+    started_epoch: int,
+    finished_epoch: int,
+    reserved_exact: set[str],
+    allocated: set[str],
+) -> dict[str, object]:
+    blocked = reserved_exact | allocated
+    candidates = [
+        item
+        for item in _matching_usage_logs(cell, logs, started_epoch, fence)
+        if int(item.get("created_at", 0) or 0) <= finished_epoch
+        and str(item.get("request_id", "")).strip() not in blocked
+    ]
+    candidates.sort(key=lambda item: int(item.get("created_at", 0) or 0))
+    counts = Counter(str(item.get("request_id", "")).strip() for item in candidates)
+    claimed = {item for item in counts if item}
+    diagnostics: dict[str, object] = {
+        "consume_match_count": len(candidates),
+    }
+    base = {
+        "payload": None,
+        "diagnostics": diagnostics,
+        "claimed_ids": claimed,
+        "detail": "",
+    }
+    if result.status != "pass":
+        return {**base, "status": "skip"}
+    if any(count > 1 for count in counts.values()):
+        return {
+            **base,
+            "status": "conflict",
+            "detail": "conflicting consume logs for one request id",
+        }
+    required = len(cell.scenario.turns)
+    if len(claimed) < required:
+        return {
+            **base,
+            "status": "missing",
+            "detail": (
+                f"batch evidence found {len(claimed)} consume logs; {required} required"
+            ),
+        }
+    payloads = [_usage_log_payload(cell, item, commit) for item in candidates]
+    finals = [item for item in payloads if item.get("status") == "pass"]
+    if len(finals) < required:
+        return {
+            **base,
+            "status": "missing",
+            "detail": (
+                f"batch evidence found {len(finals)} final receipts; {required} required"
+            ),
+        }
+    payload = dict(finals[0])
+    if len(finals) > 1:
+        payload["requests"] = finals
+    payload["provisional_count"] = len(payloads) - len(finals)
+    payload.update(diagnostics)
+    return {**base, "status": "ok", "payload": payload}
+
+
+def _commit_batch_match(
+    cell: MatrixCell, result: CellResult, match: dict[str, object]
+) -> None:
+    _redact_result_correlation_text(result)
+    status = str(match.get("status") or "")
+    diagnostics = (
+        match.get("diagnostics") if isinstance(match.get("diagnostics"), dict) else {}
+    )
+    attempts = match.get("attempts")
+    typed_attempts = (
+        [item for item in attempts if isinstance(item, dict)]
+        if isinstance(attempts, list)
+        else None
+    )
+    if status == "ok":
+        payload = match.get("payload")
+        if isinstance(payload, dict):
+            result.evidence["server_evidence"] = payload
+            _apply_public_artifact_gate(cell, result, typed_attempts)
+    elif status != "skip":
+        extra = diagnostics if diagnostics else None
+        _set_batch_evidence_failure(
+            result,
+            str(match.get("detail") or "server evidence was not unique and final"),
+            extra,
+        )
     _scrub_private_replay_fields(result.evidence, typed_attempts)
+    result.evidence.pop("_server_window", None)
+    result.evidence.pop("_response_request_id", None)
+    result.evidence.pop("_response_request_ids", None)
 
 
 def _evaluate_single_stage_receipts(attempts: list[dict[str, object]]):
@@ -1547,12 +1937,30 @@ def _apply_public_artifact_gate(
         result.detail = public.detail
 
 
-def _set_batch_evidence_failure(result: CellResult, detail: str) -> None:
+def _redact_result_correlation_text(result: CellResult) -> list[str]:
+    # Consume the in-memory mapping before finalization removes private fields.
+    raw_ids = _known_request_ids([result])
+    for turn in result.turns:
+        turn.output_tail = redact_known_ids(turn.output_tail, raw_ids)
+    result.detail = redact_known_ids(result.detail, raw_ids)
+    return raw_ids
+
+
+def _set_batch_evidence_failure(
+    result: CellResult, detail: str, extra: dict[str, object] | None = None
+) -> None:
+    detail = redact_known_ids(detail, _redact_result_correlation_text(result))
     result.evidence.pop("_response_request_id", None)
     result.evidence.pop("_response_request_ids", None)
     result.evidence.pop("_replay_attempts", None)
     result.evidence.pop("_server_window", None)
-    result.evidence["server_evidence"] = {"status": "fail", "detail": detail}
+    payload: dict[str, object] = {"status": "fail", "detail": detail}
+    if extra:
+        for key, value in extra.items():
+            if key == "status":
+                continue
+            payload[key] = value
+    result.evidence["server_evidence"] = payload
     if result.status == "pass":
         result.status = "fail"
         result.detail = "nightly/release tier requires passing server evidence"

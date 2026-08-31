@@ -72,6 +72,15 @@ closed when a route marked `release_evidence_required` has no valid collector.
 HTTP success, a local unit test, push, deployment, or one clean text turn cannot
 substitute for this set.
 
+`natural-skill-discovery` covers the released Claude Code tool loop with a
+natural discovery request, not forced tool names or a requested answer marker.
+The runner creates two isolated skill files, requires actual local tool events
+and file-only evidence, and checks both skill names in a nonempty successful
+terminal result. An earlier assistant promise or successful directory listing
+followed by an empty final result fails. The initial client scope is Claude Code;
+other native clients retain their existing scenarios until their terminal
+event validators are covered.
+
 Type64 usage evidence must distinguish `observed_usage` from `billing_estimate`.
 The currently deployed adapter does not expose authoritative per-HTTP input and
 cache tokens: they remain `unknown` or `estimated`, never a measured zero.

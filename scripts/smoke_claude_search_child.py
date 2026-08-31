@@ -64,6 +64,7 @@ def stream(message: dict) -> bytes:
 
 class SearchFixture(http.server.BaseHTTPRequestHandler):
     records: ClassVar[list[dict]] = []
+    child_mode: ClassVar[str] = "success"
 
     def log_message(self, *_args):
         pass
@@ -87,6 +88,7 @@ class SearchFixture(http.server.BaseHTTPRequestHandler):
             "model": body.get("model"),
             "tool_names": [t.get("name") for t in tools],
             "tool_result_ids": [r.get("tool_use_id") for r in results],
+            "result_is_error": any(r.get("is_error") for r in results),
         }
         if child:
             # Only this synthetic fixture's request is retained, never headers.
@@ -102,6 +104,18 @@ class SearchFixture(http.server.BaseHTTPRequestHandler):
                 )
                 if k in body
             }
+            if self.child_mode == "http-error":
+                self.records.append(record)
+                return self.reply(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "invalid_request_error",
+                            "message": "fixture-search-error",
+                        },
+                    },
+                    status=400,
+                )
             content = [
                 {
                     "type": "server_tool_use",
@@ -127,6 +141,9 @@ class SearchFixture(http.server.BaseHTTPRequestHandler):
                     "text": "Deterministic fixture result https://example.com/",
                 },
             ]
+            if self.child_mode == "empty":
+                content[1]["content"] = []
+                content[2]["text"] = "No search results were found."
             stop = "end_turn"
         elif results:
             record["result_contains_fixture"] = "example.com" in json.dumps(results)
@@ -157,9 +174,9 @@ class SearchFixture(http.server.BaseHTTPRequestHandler):
         }
         self.reply(message, body.get("stream", False))
 
-    def reply(self, message, streaming=False):
+    def reply(self, message, streaming=False, status=200):
         data = stream(message) if streaming else json.dumps(message).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header(
             "content-type", "text/event-stream" if streaming else "application/json"
         )
@@ -174,8 +191,12 @@ def main():
     parser.add_argument("--ssh-target", help="Optional authorized Windows SSH target")
     parser.add_argument("--identity", help="SSH identity file path (not contents)")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--child-mode", choices=("success", "empty", "http-error"), default="success"
+    )
     args = parser.parse_args()
     SearchFixture.records = []
+    SearchFixture.child_mode = args.child_mode
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), SearchFixture)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -308,13 +329,21 @@ exit $code
                     check=False,
                 )
         children = [r for r in SearchFixture.records if r["kind"] == "child"]
-        resumes = [r for r in SearchFixture.records if r.get("result_contains_fixture")]
+        resumes = [
+            r
+            for r in SearchFixture.records
+            if r.get("kind") == "main"
+            and "toolu_fixture" in r.get("tool_result_ids", [])
+        ]
+        valid_result = any(parent_result_matches(args.child_mode, r) for r in resumes)
         evidence = {
             "scope": "deterministic-client-only-not-live-search-or-TUI",
             "client_exit": result.returncode,
+            "child_mode": args.child_mode,
             "requests": SearchFixture.records,
             "child_observed": bool(children),
             "main_resume_observed": bool(resumes),
+            "parent_result_valid": valid_result,
             "terminal_marker": MARKER in result.stdout.decode(errors="replace"),
         }
         args.output.write_text(
@@ -324,13 +353,21 @@ exit $code
         assert result.returncode == 0, (result.stdout + result.stderr).decode(
             errors="replace"
         )[-3000:]
-        assert children and resumes and evidence["terminal_marker"], (
+        assert children and resumes and valid_result and evidence["terminal_marker"], (
             "Missing official WebSearch child or main resume"
         )
     finally:
         server.shutdown()
         server.server_close()
         thread.join(3)
+
+
+def parent_result_matches(mode: str, record: dict) -> bool:
+    if mode == "http-error":
+        return record.get("result_is_error") is True
+    if record.get("result_is_error") is not False:
+        return False
+    return record.get("result_contains_fixture") is (mode == "success")
 
 
 if __name__ == "__main__":

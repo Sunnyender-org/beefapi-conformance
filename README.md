@@ -118,6 +118,11 @@ the official WebSearch wrapper's typed child request and result round-trip,
 not real internet search, production billing, or interactive tool-card display.
 Those remain separate release evidence requirements.
 
+Repeat with `--child-mode empty` and `--child-mode http-error` to verify that
+the real client returns an empty result or a tool error, respectively, and
+still resumes its main conversation. These are injected fixture outcomes,
+not evidence that a live provider failed.
+
 - `pr`: deterministic schemas, fixtures, protocol transforms, and dry matrix.
 - `merge`: representative real clients, route families, and tool behavior.
 - `nightly`: all active model/channel pairs plus compact, resume, retry, and

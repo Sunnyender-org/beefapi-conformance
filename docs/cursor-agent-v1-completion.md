@@ -64,7 +64,7 @@ completion.
 | Usage | `observed_usage` and `billing_estimate` are both present and distinct. Type64 input/cache quality is `unknown` or `estimated`. | Flat `prompt_tokens: 0` / `cache_tokens: 0` treated as measured. Observed quality `measured` for unobservable fields. |
 | Tool catalog | Caller canaries (`Bash`, `Read`, `beefapi_conformance_canary`) remain visible. | Cursor native shell/fs names appear in the visible catalog (`Shell`, `ReadFile`, `DeleteFile`, `edit_file`, `list_dir`). |
 | Tool results | Stage A returns a live `tool_use` id. Stage B sends that exact assistant history plus a real `tool_result` for those ids only, with `tool_choice: none`. Mixed adds an ordinary consume-the-result follow-up that requires the marker. Stage B must `end_turn` with the marker in assistant text and zero `tool_use` blocks. Stage C at absolute +23s/+180s replays Stage B. Stage B has exactly one consume log/receipt. Stage C adds zero consume logs and no new receipt (`replay_without_consume` / `no_new_charge`). | Static `toolu_conformance_*` history. Invented `toolu_historical_routed_*` ids. Marker-only custom-tool answers. Marker only in tool input/`tool_result`. Stage B `tool_use` under `tool_choice: none`. Copied receipts on C. Stage C consume log or new receipt. Stage B missing or ambiguous. Duplicate/conflicting consume logs. Covering-set without a real two-call parked batch (blocked). |
-| Hosted web | Server-tool count, progress, and citations are present. Claude Code does not execute `WebSearch`/`WebFetch` itself. | Count-only receipts, missing citations/progress, or a local web-search tool_use. |
+| Hosted web | Server-tool count, progress, and citations are present. Claude Code's ordinary `WebSearch` wrapper is permitted only with a correlated typed type64 search child and matching returned tool result. Cursor performs the internet search. | Count-only receipts, missing citations/progress, uncorrelated caller search, another provider serving the child, or a missing/violated search cap. |
 | MCP | Spans correlate to real returned `tool_use` ids and match the declared serial or parallel contract. | Arbitrary `mcp` JSON, spans without matching tool ids, or serial/parallel mismatch. |
 | Thinking | First-byte is measured and the stream emits keepalive or progress during thinking-only time. | Silent wait until the final message. |
 | Classifier | Claude Code reports active `auto` mode, executes the Bash canary, and direct classifier invocation evidence is observed. | Wrong/fallback mode, missing/failed canary, or no direct classifier evidence. |
@@ -103,6 +103,29 @@ release. Anthropic hosted web-search blocks are not required from Codex, Grok,
 or WorkBuddy.
 
 ## Critical gates
+
+### Claude Code search-wrapper contract (Owner approved 2026-08-31)
+
+Main conversation `tool_use(WebSearch)` belongs to Claude Code. Its child
+Messages request declares `web_search_20250305`, `tool_choice: tool/web_search`
+and `max_uses`. Type64 executes that search on Cursor and returns native
+server-tool blocks. Claude Code consumes them, renders its own search progress,
+and returns the matching ordinary tool result to the main conversation.
+Do not turn a completed hosted call into a fabricated caller tool invocation.
+WebFetch remains separate; this change does not disable its domain safety check
+or authorize rerouting arbitrary client HTTPS requests.
+
+`scripts/smoke_claude_search_child.py` captures this contract with a real released
+Claude Code binary and an isolated **synthetic** API, optionally on authorized
+Windows SSH. It is a client-protocol fixture, not a live search or TUI pass.
+Production acceptance additionally needs the child's actual type64 route,
+native search/results, resumed caller tool identity, and ledger readback.
+The `child_search` collector payload carries hashed child HTTP and caller/result
+identities, `tool_type`, `channel_type`, `max_uses`, `stop_reason`, and
+`result_is_error`; the server's search count must not exceed that cap.
+Interactive Windows search card/query/count must be inspected separately;
+stream-json, assistant prose, and a successful HTTP response cannot prove it.
+
 
 Critical advertised type64 capabilities must be planned and executed on nightly
 and release. Skip from a missing binary, missing credential, or missing

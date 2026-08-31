@@ -1,0 +1,14 @@
+{
+  "provenance": "Windows Claude Code 2.1.251, isolated synthetic API, 2026-08-31; model pinned by acceptance invocation; not production search evidence",
+  "request": {
+    "model": "claude-opus-5",
+    "system": [
+      {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+      {"type": "text", "text": "You are an assistant for performing a web search tool use"}
+    ],
+    "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
+    "tool_choice": {"type": "tool", "name": "web_search"},
+    "thinking": {"type": "disabled"},
+    "messages": [{"role": "user", "content": [{"type": "text", "text": "Perform a web search for the query: beefapi deterministic search fixture"}]}]
+  }
+}

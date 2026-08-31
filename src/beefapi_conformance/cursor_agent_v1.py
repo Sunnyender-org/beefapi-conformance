@@ -386,14 +386,57 @@ def evaluate_hosted_search(
     citation_count: int,
     progress_event_count: int,
     client_output: str = "",
+    child_search: dict[str, Any] | None = None,
+    require_child: bool = False,
 ) -> Evaluation:
     local_web = _local_web_tools_executed(client_output)
-    if local_web:
+    if require_child and local_web != {"WebSearch"}:
+        return Evaluation(
+            "fail", "Claude Code search lacks its observed caller wrapper"
+        )
+    if local_web and (local_web != {"WebSearch"} or not isinstance(child_search, dict)):
         return Evaluation(
             "fail",
-            "Cursor native WebSearch/WebFetch must surface as server-tool "
-            f"progress; client executed {sorted(local_web)}",
+            "Client search needs correlated Cursor-native child evidence; "
+            f"client executed {sorted(local_web)}",
         )
+    if local_web:
+        from .tool_replay import parse_tool_uses
+
+        child = child_search or {}
+        call_id = child.get("caller_tool_id_hash", "")
+        observed = {
+            correlate_id(tool.id)
+            for tool in parse_tool_uses(client_output)
+            if tool.name == "WebSearch"
+        }
+        if observed != {call_id}:
+            return Evaluation(
+                "fail", "search child identity does not match the client tool call"
+            )
+        if not re.fullmatch(
+            r"sha256:[a-f0-9]{16}", str(call_id)
+        ) or call_id != child.get("result_tool_id_hash"):
+            return Evaluation("fail", "search wrapper tool result is not correlated")
+        if not re.fullmatch(
+            r"sha256:[a-f0-9]{16}", str(child.get("http_request_id_hash", ""))
+        ):
+            return Evaluation("fail", "missing search child HTTP identity")
+        if (
+            child.get("tool_type") != "web_search_20250305"
+            or child.get("channel_type") != 64
+        ):
+            return Evaluation("fail", "search child was not a typed type64 search")
+        limit = child.get("max_uses")
+        if type(limit) is not int or limit < 1 or web_search_call_count > limit:
+            return Evaluation(
+                "fail", "search child exceeded or omitted its declared cap"
+            )
+        if (
+            child.get("stop_reason") != "end_turn"
+            or child.get("result_is_error") is not False
+        ):
+            return Evaluation("fail", "search child or caller result did not complete")
     if web_search_call_count < 1:
         return Evaluation("fail", "native web search has no observed search call")
     if progress_event_count < 1:
@@ -795,12 +838,18 @@ def evaluate_public_artifacts(
         and cell.client.id not in NON_HOSTED_WEB_CLIENTS
     ):
         usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
-        if payload.get("status") in {"pass", "fail"} or usage:
+        if (
+            payload.get("status") in {"pass", "fail"}
+            or usage
+            or cell.client.id == "claude-code"
+        ):
             hosted = evaluate_hosted_search(
                 web_search_call_count=int(usage.get("web_search_call_count") or 0),
                 citation_count=int(usage.get("citation_count") or 0),
                 progress_event_count=int(usage.get("progress_event_count") or 0),
                 client_output=output,
+                child_search=payload.get("child_search"),
+                require_child=cell.client.id == "claude-code",
             )
             if not hosted.ok:
                 details.append(hosted.detail)

@@ -387,8 +387,13 @@ def evaluate_hosted_search(
     progress_event_count: int,
     client_output: str = "",
     child_search: dict[str, Any] | None = None,
+    require_child: bool = False,
 ) -> Evaluation:
     local_web = _local_web_tools_executed(client_output)
+    if require_child and local_web != {"WebSearch"}:
+        return Evaluation(
+            "fail", "Claude Code search lacks its observed caller wrapper"
+        )
     if local_web and (local_web != {"WebSearch"} or not isinstance(child_search, dict)):
         return Evaluation(
             "fail",
@@ -833,13 +838,18 @@ def evaluate_public_artifacts(
         and cell.client.id not in NON_HOSTED_WEB_CLIENTS
     ):
         usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
-        if payload.get("status") in {"pass", "fail"} or usage:
+        if (
+            payload.get("status") in {"pass", "fail"}
+            or usage
+            or cell.client.id == "claude-code"
+        ):
             hosted = evaluate_hosted_search(
                 web_search_call_count=int(usage.get("web_search_call_count") or 0),
                 citation_count=int(usage.get("citation_count") or 0),
                 progress_event_count=int(usage.get("progress_event_count") or 0),
                 client_output=output,
                 child_search=payload.get("child_search"),
+                require_child=cell.client.id == "claude-code",
             )
             if not hosted.ok:
                 details.append(hosted.detail)

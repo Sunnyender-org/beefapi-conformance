@@ -2,11 +2,46 @@ import importlib.util
 import json
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
-from beefapi_conformance.cursor_agent_v1 import correlate_id, evaluate_hosted_search
+from beefapi_conformance.cursor_agent_v1 import (
+    correlate_id,
+    evaluate_hosted_search,
+    evaluate_public_artifacts,
+)
 
 
 class ClaudeSearchChildTests(unittest.TestCase):
+    def test_real_claude_cell_cannot_pass_on_counts_without_client_trace(self):
+        cell = SimpleNamespace(
+            client=SimpleNamespace(id="claude-code"),
+            route=SimpleNamespace(channel_type=64),
+            scenario=SimpleNamespace(
+                id="native-web-search",
+                evidence_requirements=(),
+                retry_offsets_seconds=(),
+                mcp_mode=None,
+            ),
+        )
+        evidence = {
+            "usage": {
+                "web_search_call_count": 1,
+                "citation_count": 2,
+                "progress_event_count": 3,
+            }
+        }
+        for output in ("", "Web Search did 1 search", "unparsed output"):
+            self.assertEqual(
+                "fail",
+                evaluate_public_artifacts(
+                    cell, output=output, evidence=evidence
+                ).status,
+            )
+        cell.client.id = "raw-http"
+        self.assertEqual(
+            "pass", evaluate_public_artifacts(cell, evidence=evidence).status
+        )
+
     def evidence(self):
         return {
             "caller_tool_id_hash": correlate_id("toolu_fixture"),

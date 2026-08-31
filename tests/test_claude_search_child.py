@@ -130,6 +130,38 @@ class ClaudeSearchChildTests(unittest.TestCase):
         self.assertEqual({"query": "fixture"}, json.loads(deltas[0]["partial_json"]))
         self.assertEqual("fixture", deltas[1]["text"])
         self.assertEqual("message_stop", events[-1]["type"])
+        self.assertTrue(
+            module.parent_result_matches(
+                "success", {"result_is_error": False, "result_contains_fixture": True}
+            )
+        )
+        self.assertTrue(
+            module.parent_result_matches(
+                "empty", {"result_is_error": False, "result_contains_fixture": False}
+            )
+        )
+        self.assertTrue(
+            module.parent_result_matches(
+                "http-error",
+                {"result_is_error": True, "result_contains_fixture": False},
+            )
+        )
+        self.assertFalse(
+            module.parent_result_matches(
+                "success", {"result_is_error": True, "result_contains_fixture": True}
+            )
+        )
+        self.assertFalse(
+            module.parent_result_matches(
+                "empty", {"result_is_error": True, "result_contains_fixture": False}
+            )
+        )
+        self.assertFalse(
+            module.parent_result_matches(
+                "http-error",
+                {"result_is_error": False, "result_contains_fixture": False},
+            )
+        )
 
 
 if __name__ == "__main__":

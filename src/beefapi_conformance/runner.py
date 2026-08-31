@@ -15,6 +15,7 @@ from collections import Counter
 from datetime import UTC, datetime
 from pathlib import Path
 
+from . import natural_tools
 from .clients import ClientCommand, assistant_text, resolve_binary
 from .cursor_agent_v1 import (
     NON_HOSTED_WEB_CLIENTS,
@@ -201,6 +202,8 @@ def run_cell(
         workspace.mkdir()
         marker_bytes = b"BEEFAPI_CONFORMANCE_FILE_OK\n"
         (workspace / "marker.txt").write_bytes(marker_bytes)
+        if cell.scenario.id == natural_tools.SCENARIO:
+            natural_tools.prepare(workspace)
         token = _request_token(cell, base_token)
         command = ClientCommand(cell, binary, root, token, base_url)
         command.prepare()
@@ -235,6 +238,8 @@ def run_cell(
                     if not any(event in output for event in group)
                 )
                 answer = assistant_text(cell.client.adapter, output)
+                if cell.scenario.id == natural_tools.SCENARIO:
+                    missing.extend(natural_tools.missing_evidence(output))
                 status = (
                     "pass"
                     if completed.returncode == 0

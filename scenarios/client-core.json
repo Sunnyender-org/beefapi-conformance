@@ -1,6 +1,19 @@
 {
   "scenarios": [
     {
+      "id": "natural-skill-discovery",
+      "name": "Natural Claude Code discovery must continue after local tools",
+      "tier": "release",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["tool.shell", "client.trailing_system"],
+      "timeout_seconds": 240,
+      "requires_local_tools": true,
+      "turns": [
+        {"prompt": "看看这个目录里有什么可用的工具或者 skill，读一下说明，告诉我各自适合做什么。不修改任何文件。", "marker": "repo-audit", "expected_events": ["document-index"]}
+      ]
+    },
+    {
       "id": "text-turn",
       "name": "One native client text turn",
       "tier": "pr",

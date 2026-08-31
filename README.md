@@ -103,6 +103,21 @@ and normalized trajectories. See [architecture](docs/architecture.md).
 
 ## Evidence levels
 
+For the Claude Code search-child regression, run the released binary against
+an isolated local fixture (no provider requests):
+
+```bash
+.venv/bin/python scripts/smoke_claude_search_child.py \
+  --claude /absolute/path/to/claude --output /tmp/claude-search-child.json
+```
+
+For an explicitly authorized Windows host, add `--ssh-target`, `--identity`
+and its Windows `--claude` path. Only a dummy token enters the temporary client
+configuration; the script removes its owned workspace afterward. This checks
+the official WebSearch wrapper's typed child request and result round-trip,
+not real internet search, production billing, or interactive tool-card display.
+Those remain separate release evidence requirements.
+
 - `pr`: deterministic schemas, fixtures, protocol transforms, and dry matrix.
 - `merge`: representative real clients, route families, and tool behavior.
 - `nightly`: all active model/channel pairs plus compact, resume, retry, and

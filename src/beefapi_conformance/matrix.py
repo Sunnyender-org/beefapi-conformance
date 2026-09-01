@@ -75,13 +75,13 @@ def representative_matrix(cells: list[MatrixCell]) -> list[MatrixCell]:
     route_index = {route.id: index for index, route in enumerate(routes)}
     model_index = {model.id: index for index, model in enumerate(models)}
     client_ids = [client.id for client in native_clients]
-    deep_scenarios = ["local-tool-read", "session-resume", "native-web-search"]
+    deep_scenarios = ["tool-loop", "session-resume", "web-search", "long-stream"]
     selected: dict[str, MatrixCell] = {}
     for cell in cells:
         scenario_id = cell.scenario.id
         if cell.client.adapter == "raw-http":
             if (
-                scenario_id == "responses-text"
+                scenario_id == "responses-stream"
                 or cell.model.id == cell.route.test_model
             ):
                 selected[cell.id] = cell

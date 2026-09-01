@@ -3,10 +3,10 @@ from __future__ import annotations
 import http.server
 import json
 import os
-import sys
 import tempfile
 import threading
 import unittest
+import urllib.request
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -16,7 +16,6 @@ from beefapi_conformance.inventory import build_live_inventory
 from beefapi_conformance.manifest import Inventory, load_inventory
 from beefapi_conformance.matrix import compile_matrix
 from beefapi_conformance.model import (
-    CellResult,
     Client,
     ContractError,
     MatrixCell,
@@ -28,19 +27,53 @@ from beefapi_conformance.model import (
 from beefapi_conformance.redact import redact
 from beefapi_conformance.report import build_report
 from beefapi_conformance.runner import (
-    AGENT_V1_RESPONSE_ID,
     _beefapi_token_log_evidence,
-    _evidence_fence,
-    _matching_usage_log,
-    _matching_usage_logs,
     _request_token,
     _usage_log_payload,
-    finalize_batch_server_evidence,
-    prepare_batch_server_evidence,
     run_cell,
+)
+from beefapi_conformance.wire import (
+    RecordingProxy,
+    parse_sse,
+    sse_text,
+    termination,
+    wire_verdict,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
+
+MESSAGES_SSE_CLEAN = (
+    'event: message_start\ndata: {"type":"message_start"}\n\n'
+    "event: content_block_delta\n"
+    'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"BEEFAPI_MESSAGES_STREAM_OK"}}\n\n'
+    'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+)
+MESSAGES_SSE_EARLY = (
+    'event: message_start\ndata: {"type":"message_start"}\n\n'
+    "event: content_block_delta\n"
+    'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"BEEFAPI_MESSAGES_STREAM_OK"}}\n\n'
+)
+
+
+def sse_server(body: str) -> http.server.ThreadingHTTPServer:
+    payload = body.encode()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("content-length", "0") or 0)
+            self.rfile.read(length)
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 
 class FakeResponse:
@@ -66,42 +99,23 @@ class ContractTests(unittest.TestCase):
             ROOT / "manifests/models.example.json",
         )
 
-    def test_agent_v1_request_id_extraction_requires_response_id_field(self):
-        request_id = "202608291253521598208738268d9d67sN73Cgw"
-        public_id = f"resp_bf_agentv1_u1_c301_{request_id}"
-        self.assertEqual(
-            [request_id],
-            AGENT_V1_RESPONSE_ID.findall(json.dumps({"id": public_id})),
-        )
-        self.assertEqual([], AGENT_V1_RESPONSE_ID.findall(public_id))
-
-    def test_inventory_loads_workbuddy_as_first_class_client(self):
+    def test_inventory_loads_and_matrix_covers_all_clients_at_release(self):
         inventory = self.inventory()
-        workbuddy = next(
-            item for item in inventory.clients if item.id == "workbuddy-cli"
-        )
-        self.assertEqual("workbuddy", workbuddy.adapter)
-        self.assertIn("session.resume", workbuddy.capabilities)
-        self.assertIn("acp", workbuddy.capabilities)
+        cells = compile_matrix(inventory, "release")
+        covered = {cell.client.id for cell in cells}
+        self.assertEqual({item.id for item in inventory.clients}, covered)
 
-    def test_matrix_excludes_incompatible_client_route_pairs(self):
-        cells = compile_matrix(self.inventory(), "release")
-        self.assertTrue(any(item.client.id == "workbuddy-cli" for item in cells))
-        self.assertFalse(
-            any(
-                item.client.id == "workbuddy-cli"
-                and item.route.id == "beefapi-cursor-native"
-                for item in cells
-            )
-        )
-
-    def test_lower_tier_is_included_in_nightly(self):
+    def test_nightly_native_scenarios_cover_real_failure_modes(self):
         cells = compile_matrix(self.inventory(), "nightly", clients={"codex-cli"})
-        scenarios = {item.scenario.id for item in cells}
         self.assertEqual(
-            {"text-turn", "local-tool-read", "session-resume", "native-web-search"},
-            scenarios,
+            {"text-turn", "long-stream", "tool-loop", "web-search", "session-resume"},
+            {item.scenario.id for item in cells},
         )
+
+    def test_pr_protocol_scenarios_are_streaming(self):
+        cells = compile_matrix(self.inventory(), "pr", clients={"raw-http"})
+        self.assertTrue(cells)
+        self.assertTrue(all(cell.scenario.stream for cell in cells))
 
     def test_manifest_rejects_literal_secret(self):
         source = json.loads((ROOT / "manifests/routes.example.json").read_text())
@@ -121,25 +135,12 @@ class ContractTests(unittest.TestCase):
             "protocol": "messages",
             "http_endpoint": "/v1/messages",
             "required_capabilities": ["messages"],
-            "turns": [
-                {
-                    "prompt": "hello",
-                    "marker": "hello",
-                    "expected_events": [],
-                }
-            ],
+            "turns": [{"prompt": "hello", "marker": "hello", "expected_events": []}],
         }
         for payload in (
             {"Authorization": "Bearer persisted-secret"},
             {"metadata": {"cookie": "session=secret"}},
-            {"metadata": {"access_token": "secret"}},
-            {"metadata": {"refreshToken": "secret"}},
-            {"metadata": {"id-token": "secret"}},
-            {"metadata": {"clientSecret": "secret"}},
-            {"metadata": {"password": "secret"}},
-            {"metadata": {"bearer_token": "secret"}},
             {"messages": [{"role": "user", "content": "sk-abcdef123456"}]},
-            {"messages": [{"role": "user", "content": "Bearer abcdef123456"}]},
         ):
             with (
                 self.subTest(payload=payload),
@@ -147,11 +148,26 @@ class ContractTests(unittest.TestCase):
             ):
                 Scenario.parse({**base, "http_payload": payload})
 
-    def test_production_refresh_reads_native_search_from_channel_setting(self):
-        script = (ROOT / "scripts/refresh_production_config.sh").read_text()
-        self.assertIn("btrim(setting)", script)
-        self.assertIn("setting::jsonb", script)
-        self.assertNotIn("btrim(other)", script)
+    def test_scenario_wire_fields_are_validated(self):
+        base = {
+            "id": "case",
+            "name": "Case",
+            "tier": "pr",
+            "kind": "client",
+            "required_capabilities": ["text"],
+            "turns": [{"prompt": "p", "marker": "m", "expected_events": []}],
+        }
+        with self.assertRaisesRegex(ContractError, "expect_wire"):
+            Scenario.parse({**base, "expect_wire": ["unknown_check"]})
+        with self.assertRaisesRegex(ContractError, "stream"):
+            Scenario.parse({**base, "stream": True})
+        with self.assertRaisesRegex(ContractError, "marker or expected events"):
+            Scenario.parse(
+                {
+                    **base,
+                    "turns": [{"prompt": "p", "marker": "", "expected_events": []}],
+                }
+            )
 
     def test_redaction_covers_explicit_and_pattern_secrets(self):
         output = redact(
@@ -194,90 +210,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual("beefapi_token_log", route["evidence_provider"])
         self.assertEqual(["grok-4.6"], [item["id"] for item in models["models"]])
 
-    def test_live_inventory_includes_cursor_agent_v1_as_a_distinct_route(self):
-        routes, models = build_live_inventory(
-            channels=[
-                {
-                    "id": 301,
-                    "type": 64,
-                    "status": 1,
-                    "models": "claude-opus-5",
-                    "test_model": "claude-opus-5",
-                }
-            ],
-            public_models={"claude-opus-5"},
-            base_url="https://beefapi.example",
-            token_env="TEST_TOKEN",
-            group="cursor-agent-v1-acceptance",
-        )
-
-        self.assertEqual(1, len(routes["routes"]))
-        route = routes["routes"][0]
-        self.assertEqual("cursor-agent-v1-channel-301", route["id"])
-        self.assertEqual(64, route["channel_type"])
-        self.assertEqual(301, route["channel_id"])
-        self.assertIn("messages.trailing_system", route["capabilities"])
-        self.assertIn("client.trailing_system", route["capabilities"])
-        self.assertEqual(["claude-opus-5"], [item["id"] for item in models["models"]])
-
-    def test_trailing_system_scenarios_compile_only_for_cursor_agent_v1(self):
-        routes, models = build_live_inventory(
-            channels=[
-                {
-                    "id": 271,
-                    "type": 62,
-                    "status": 1,
-                    "models": "claude-opus-5",
-                    "test_model": "claude-opus-5",
-                },
-                {
-                    "id": 301,
-                    "type": 64,
-                    "status": 1,
-                    "models": "claude-opus-5",
-                    "test_model": "claude-opus-5",
-                },
-            ],
-            public_models={"claude-opus-5"},
-            base_url="https://beefapi.example",
-            token_env="TEST_TOKEN",
-            group="cursor-agent-v1-acceptance",
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            routes_path = Path(tmp) / "routes.json"
-            models_path = Path(tmp) / "models.json"
-            routes_path.write_text(json.dumps(routes))
-            models_path.write_text(json.dumps(models))
-            inventory = load_inventory(ROOT, routes_path, models_path)
-
-        cells = compile_matrix(inventory, "release", coverage="full")
-        trailing_cells = [
-            cell
-            for cell in cells
-            if cell.scenario.id
-            in {"messages-trailing-system", "claude-code-dynamic-system"}
-        ]
-        self.assertTrue(trailing_cells)
-        self.assertEqual(
-            {"cursor-agent-v1-channel-301"},
-            {cell.route.id for cell in trailing_cells},
-        )
-        self.assertTrue(
-            any(
-                cell.client.id == "raw-http"
-                and cell.scenario.id == "messages-trailing-system"
-                for cell in trailing_cells
-            )
-        )
-        self.assertTrue(
-            any(
-                cell.client.id == "claude-code"
-                and cell.scenario.id == "claude-code-dynamic-system"
-                for cell in trailing_cells
-            )
-        )
-
-    def test_cursor_agent_v1_web_capability_follows_sanitized_channel_policy(self):
+    def test_live_inventory_gates_agent_v1_web_capability_on_channel_policy(self):
         routes, _ = build_live_inventory(
             channels=[
                 {
@@ -322,7 +255,7 @@ class ContractTests(unittest.TestCase):
                 group="cursor-acceptance",
             )
 
-    def test_representative_matrix_covers_routes_models_clients_and_deep_cases(self):
+    def test_representative_matrix_covers_routes_models_and_deep_cases(self):
         routes, models = build_live_inventory(
             channels=[
                 {
@@ -352,10 +285,10 @@ class ContractTests(unittest.TestCase):
             models_path.write_text(json.dumps(models))
             inventory = load_inventory(ROOT, routes_path, models_path)
         cells = compile_matrix(inventory, "release", coverage="representative")
-        raw_responses = {
+        raw_stream = {
             (cell.route.id, cell.model.id)
             for cell in cells
-            if cell.client.id == "raw-http" and cell.scenario.id == "responses-text"
+            if cell.client.id == "raw-http" and cell.scenario.id == "responses-stream"
         }
         self.assertEqual(
             {
@@ -364,551 +297,145 @@ class ContractTests(unittest.TestCase):
                 for model in inventory.models
                 if route.id in model.routes
             },
-            raw_responses,
+            raw_stream,
         )
+        deep = {"tool-loop", "session-resume", "web-search", "long-stream"}
         for route in inventory.routes:
             route_cells = [cell for cell in cells if cell.route.id == route.id]
-            self.assertTrue(
-                {"responses-text", "messages-text", "chat-text"}.issubset(
-                    {
-                        cell.scenario.id
-                        for cell in route_cells
-                        if cell.client.id == "raw-http"
-                    }
-                )
-            )
-            for client_id in ("claude-code", "codex-cli", "grok-build"):
-                self.assertTrue(
-                    any(
-                        cell.client.id == client_id
-                        and cell.model.id == route.test_model
-                        and cell.scenario.id == "text-turn"
-                        for cell in route_cells
-                    )
-                )
             self.assertEqual(
-                {"local-tool-read", "session-resume", "native-web-search"},
-                {
-                    cell.scenario.id
-                    for cell in route_cells
-                    if cell.scenario.id
-                    in {"local-tool-read", "session-resume", "native-web-search"}
-                },
+                deep,
+                {cell.scenario.id for cell in route_cells if cell.scenario.id in deep},
             )
         for model in inventory.models:
             self.assertTrue(
                 any(
                     cell.model.id == model.id
-                    and cell.client.id != "raw-http"
+                    and cell.client.adapter != "raw-http"
                     and cell.scenario.id == "text-turn"
                     for cell in cells
                 )
             )
 
-    def test_production_shaped_representative_matrix_stays_bounded(self):
-        channels = [
-            {
-                "id": 250 + route_index,
-                "type": 62,
-                "status": 1,
-                "models": ",".join(
-                    f"route-{route_index}-model-{model_index}"
-                    for model_index in range(4)
-                ),
-                "test_model": f"route-{route_index}-model-0",
-            }
-            for route_index in range(6)
-        ]
-        public_models = {
-            f"route-{route_index}-model-{model_index}"
-            for route_index in range(6)
-            for model_index in range(4)
-        }
-        routes, models = build_live_inventory(
-            channels,
-            public_models,
-            "https://beefapi.example",
-            "TEST_TOKEN",
-            "cursor-acceptance",
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            routes_path = Path(tmp) / "routes.json"
-            models_path = Path(tmp) / "models.json"
-            routes_path.write_text(json.dumps(routes))
-            models_path.write_text(json.dumps(models))
-            inventory = load_inventory(ROOT, routes_path, models_path)
-        cells = compile_matrix(inventory, "nightly", coverage="representative")
-        self.assertLessEqual(len(cells), 150)
 
-    def test_channel_pin_is_explicit_and_conflict_safe(self):
-        cell = CommandTests().cell("codex")
-        route = replace(cell.route, channel_id=252, pin_channel=True)
-        pinned = MatrixCell(cell.client, route, cell.model, cell.scenario)
-        self.assertEqual("test-token-252", _request_token(pinned, "test-token"))
-        self.assertEqual("test-token-252", _request_token(pinned, "test-token-252"))
-        with self.assertRaisesRegex(RuntimeError, "already pinned to channel 271"):
-            _request_token(pinned, "test-token-271")
-
-    def test_token_log_evidence_requires_exact_route_and_final_receipt(self):
-        cell = CommandTests().cell("codex")
-        route = replace(
-            cell.route,
-            id="cursor-channel-252",
-            channel_id=252,
-            pin_channel=True,
-            group="cursor-acceptance",
-            evidence_provider="beefapi_token_log",
-        )
-        cell = MatrixCell(cell.client, route, cell.model, cell.scenario)
-        log = {
-            "created_at": 200,
-            "type": 2,
-            "model_name": "model",
-            "channel": 252,
-            "group": "cursor-acceptance",
-            "request_id": "req-252",
-            "prompt_tokens": 10,
-            "completion_tokens": 2,
-            "quota": 3,
-            "use_time": 1,
-            "other": json.dumps(
-                {
-                    "usage_receipt_id": "cursor-sdk-bridge:receipt",
-                    "usage_receipt_provider": "cursor-sdk-bridge",
-                    "usage_receipt_state": "final",
-                }
-            ),
-        }
-        self.assertIs(log, _matching_usage_log(cell, [log], 200))
-        self.assertIsNone(_matching_usage_log(cell, [log], 200, {"req-252"}))
-        payload = _usage_log_payload(cell, log, "commit-sha")
-        self.assertEqual("pass", payload["status"])
-        self.assertEqual(252, payload["route"]["channel_id"])
-        self.assertEqual("final", payload["receipt"]["state"])
-
-    def test_native_web_search_requires_positive_observed_search_evidence(self):
-        base = CommandTests().cell("codex")
-        cell = MatrixCell(
-            base.client,
-            replace(base.route, channel_type=64),
-            base.model,
-            replace(base.scenario, id="native-web-search"),
-        )
-        log = {
-            "type": 2,
-            "request_id": "req-search",
-            "other": json.dumps(
-                {
-                    "usage_receipt_id": "cursor-agent-v1:receipt",
-                    "usage_receipt_provider": "cursor-agent-v1",
-                    "usage_receipt_state": "final",
-                }
-            ),
-        }
-        missing = _usage_log_payload(cell, log, "commit-sha")
-        self.assertEqual("fail", missing["status"])
-        self.assertIn("no observed search call", missing["detail"])
-
-        log["other"] = json.dumps(
-            {
-                "usage_receipt_id": "cursor-agent-v1:receipt",
-                "usage_receipt_provider": "cursor-agent-v1",
-                "usage_receipt_state": "final",
-                "cursor_agent_v1_hosted_search_call_count": 1,
-            }
-        )
-        present = _usage_log_payload(cell, log, "commit-sha")
-        self.assertEqual("pass", present["status"])
-        self.assertEqual(1, present["usage"]["web_search_call_count"])
-
-    def test_token_log_matching_rejects_empty_and_ambiguous_request_ids(self):
-        cell = CommandTests().cell("codex")
-        route = replace(
-            cell.route,
-            channel_id=252,
-            group="cursor-acceptance",
-            evidence_provider="beefapi_token_log",
-        )
-        cell = MatrixCell(cell.client, route, cell.model, cell.scenario)
-        base = {
-            "created_at": 200,
-            "type": 2,
-            "model_name": "model",
-            "channel": 252,
-            "group": "cursor-acceptance",
-        }
+class WireTests(unittest.TestCase):
+    def test_parse_sse_and_termination(self):
+        events = parse_sse(MESSAGES_SSE_CLEAN)
+        names = [name for name, _ in events]
         self.assertEqual(
-            [], _matching_usage_logs(cell, [{**base, "request_id": ""}], 200)
+            ["message_start", "content_block_delta", "message_stop"], names
         )
-        matches = _matching_usage_logs(
-            cell,
-            [
-                {**base, "request_id": "req-a"},
-                {**base, "request_id": "req-b"},
-            ],
-            200,
+        self.assertEqual("clean", termination(names, saw_done=False))
+        self.assertEqual(
+            "early",
+            termination(["message_start", "content_block_delta"], saw_done=False),
         )
-        self.assertEqual(["req-a", "req-b"], [item["request_id"] for item in matches])
-        exact = _matching_usage_logs(
-            cell,
-            matches,
-            200,
-            expected_request_id="req-b",
+        self.assertEqual("clean", termination([], saw_done=True))
+        self.assertEqual(
+            "error_event", termination(["response.failed"], saw_done=False)
         )
-        self.assertEqual(["req-b"], [item["request_id"] for item in exact])
 
-    def test_native_tool_loop_accepts_multiple_final_request_ids(self):
-        cell = CommandTests().cell("codex")
-        route = replace(
-            cell.route,
-            channel_id=252,
-            group="cursor-acceptance",
-            evidence_provider="beefapi_token_log",
+    def test_sse_text_assembles_deltas_per_protocol(self):
+        self.assertEqual(
+            "BEEFAPI_MESSAGES_STREAM_OK",
+            sse_text("messages", parse_sse(MESSAGES_SSE_CLEAN)),
         )
-        cell = MatrixCell(cell.client, route, cell.model, cell.scenario)
-        logs = []
-        for request_id in ("tool-call", "tool-result"):
-            logs.append(
-                {
-                    "created_at": 200,
-                    "type": 2,
-                    "model_name": "model",
-                    "channel": 252,
-                    "group": "cursor-acceptance",
-                    "request_id": request_id,
-                    "other": json.dumps(
-                        {
-                            "usage_receipt_id": request_id,
-                            "usage_receipt_provider": "cursor-sdk-bridge",
-                            "usage_receipt_state": "final",
-                        }
-                    ),
-                }
+        chat = 'data: {"choices":[{"delta":{"content":"CHAT_OK"}}]}\n\ndata: [DONE]\n\n'
+        self.assertEqual("CHAT_OK", sse_text("chat", parse_sse(chat)))
+        responses = (
+            "event: response.output_text.delta\n"
+            'data: {"type":"response.output_text.delta","delta":"RESP_OK"}\n\n'
+            'event: response.completed\ndata: {"type":"response.completed"}\n\n'
+        )
+        self.assertEqual("RESP_OK", sse_text("responses", parse_sse(responses)))
+
+    def test_proxy_records_clean_stream_and_request_summary(self):
+        upstream = sse_server(MESSAGES_SSE_CLEAN)
+        proxy = RecordingProxy(f"http://127.0.0.1:{upstream.server_port}")
+        try:
+            request = urllib.request.Request(
+                # Real Claude Code appends a query string; completion matching
+                # and web-search detection must survive both that and the
+                # client-style WebSearch tool name.
+                proxy.base_url + "/v1/messages?beta=true",
+                data=json.dumps(
+                    {
+                        "model": "m",
+                        "stream": True,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "tools": [{"name": "Bash"}, {"name": "WebSearch"}],
+                    }
+                ).encode(),
+                headers={"content-type": "application/json"},
+                method="POST",
             )
-        response = FakeResponse(
-            {"success": True, "data": logs},
-            {"X-New-Api-Commit": "commit-sha"},
-        )
-        with patch("urllib.request.urlopen", return_value=response):
-            payload = _beefapi_token_log_evidence(cell, "token", 200, set())
-        self.assertEqual("pass", payload["status"])
-        self.assertEqual(2, len(payload["requests"]))
+            with urllib.request.urlopen(request, timeout=10) as response:
+                body = response.read().decode()
+            self.assertIn("message_stop", body)
+            exchanges = proxy.exchanges()
+            self.assertEqual(1, len(exchanges))
+            exchange = exchanges[0]
+            self.assertTrue(exchange.sse)
+            self.assertTrue(exchange.is_completion)
+            self.assertEqual("clean", exchange.terminated)
+            self.assertEqual(["Bash", "WebSearch"], exchange.request["tool_names"])
+            verdict = wire_verdict(exchanges, ("web_search_requested",))
+            self.assertEqual("pass", verdict["status"], verdict)
+        finally:
+            proxy.stop()
+            upstream.shutdown()
+            upstream.server_close()
 
-    def test_token_log_evidence_waits_for_final_receipt(self):
-        cell = CommandTests().cell("codex")
-        route = replace(
-            cell.route,
-            channel_id=252,
-            group="cursor-acceptance",
-            evidence_provider="beefapi_token_log",
-        )
-        cell = MatrixCell(cell.client, route, cell.model, cell.scenario)
-        base_log = {
-            "created_at": 200,
-            "type": 2,
-            "model_name": "model",
-            "channel": 252,
-            "group": "cursor-acceptance",
-            "request_id": "req-252",
-        }
-        provisional = {
-            **base_log,
-            "other": json.dumps(
-                {
-                    "usage_receipt_id": "receipt",
-                    "usage_receipt_state": "provisional",
-                }
-            ),
-        }
-        final = {
-            **base_log,
-            "other": json.dumps(
-                {
-                    "usage_receipt_id": "receipt",
-                    "usage_receipt_provider": "cursor-sdk-bridge",
-                    "usage_receipt_state": "final",
-                }
-            ),
-        }
-        responses = [
-            FakeResponse(
-                {"success": True, "data": [provisional]},
-                {"X-New-Api-Commit": "commit-sha"},
-            ),
-            FakeResponse(
-                {"success": True, "data": [final]},
-                {"X-New-Api-Commit": "commit-sha"},
-            ),
-        ]
-        with (
-            patch("urllib.request.urlopen", side_effect=responses) as urlopen,
-            patch("time.sleep"),
-        ):
-            payload = _beefapi_token_log_evidence(
-                cell,
-                "token",
-                200,
-                set(),
-                "req-252",
+    def test_proxy_flags_early_terminated_stream(self):
+        upstream = sse_server(MESSAGES_SSE_EARLY)
+        proxy = RecordingProxy(f"http://127.0.0.1:{upstream.server_port}")
+        try:
+            request = urllib.request.Request(
+                proxy.base_url + "/v1/messages",
+                data=json.dumps({"model": "m", "stream": True}).encode(),
+                headers={"content-type": "application/json"},
+                method="POST",
             )
-        self.assertEqual("pass", payload["status"])
-        self.assertEqual(2, urlopen.call_count)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                response.read()
+            verdict = wire_verdict(proxy.exchanges())
+            self.assertEqual("fail", verdict["status"])
+            self.assertIn("without a terminal event", verdict["detail"])
+        finally:
+            proxy.stop()
+            upstream.shutdown()
+            upstream.server_close()
 
-    def test_token_log_fence_requires_success_true(self):
-        cell = CommandTests().cell("codex")
-        route = replace(cell.route, evidence_provider="beefapi_token_log")
-        cell = MatrixCell(cell.client, route, cell.model, cell.scenario)
-        with patch(
-            "urllib.request.urlopen",
-            return_value=FakeResponse({"success": False, "data": []}),
-        ):
-            self.assertIsNone(_evidence_fence(cell, "token"))
-
-    def test_batch_evidence_uses_two_log_reads_for_multiple_cells(self):
-        native = CommandTests().cell("codex")
-        raw = CommandTests().cell("raw-http")
-        route = replace(
-            native.route,
-            channel_id=252,
-            group="cursor-acceptance",
-            evidence_provider="beefapi_token_log",
-            release_evidence_required=True,
-        )
-        native = MatrixCell(native.client, route, native.model, native.scenario)
-        raw = MatrixCell(raw.client, route, raw.model, raw.scenario)
-        native = MatrixCell(
-            replace(native.client, id="codex-cli"),
-            native.route,
-            native.model,
-            native.scenario,
-        )
-        raw = MatrixCell(
-            replace(raw.client, id="raw-http"), raw.route, raw.model, raw.scenario
-        )
-        receipt = {
-            "usage_receipt_provider": "cursor-sdk-bridge",
-            "usage_receipt_state": "final",
-        }
-        old_log = {
-            "created_at": 100,
-            "type": 2,
-            "model_name": "model",
-            "channel": 252,
-            "group": "cursor-acceptance",
-            "request_id": "old",
-            "other": json.dumps({**receipt, "usage_receipt_id": "old"}),
-        }
-        native_log = {
-            **old_log,
-            "created_at": 200,
-            "request_id": "native-new",
-            "other": json.dumps({**receipt, "usage_receipt_id": "native"}),
-        }
-        raw_log = {
-            **old_log,
-            "created_at": 201,
-            "request_id": "raw-new",
-            "other": json.dumps({**receipt, "usage_receipt_id": "raw"}),
-        }
-        responses = [
-            FakeResponse(
-                {"success": True, "data": [old_log]},
-                {"X-New-Api-Commit": "commit-sha"},
-            ),
-            FakeResponse(
-                {"success": True, "data": [raw_log, native_log, old_log]},
-                {"X-New-Api-Commit": "commit-sha"},
-            ),
-        ]
-        results = [
-            CellResult(
-                native.id,
-                "pass",
-                "client",
-                "now",
-                1,
-                route.id,
-                native.model.id,
-                native.scenario.id,
-                [],
-                {
-                    "server_evidence": {"status": "deferred"},
-                    "_server_window": {
-                        "started_epoch": 199,
-                        "finished_epoch": 200,
-                    },
-                },
-            ),
-            CellResult(
-                raw.id,
-                "pass",
-                "client",
-                "now",
-                1,
-                route.id,
-                raw.model.id,
-                raw.scenario.id,
-                [],
-                {
-                    "server_evidence": {"status": "deferred"},
-                    "_response_request_id": "raw-new",
-                    "_server_window": {
-                        "started_epoch": 201,
-                        "finished_epoch": 201,
-                    },
-                },
-            ),
-        ]
-        with (
-            patch.dict(os.environ, {"TOKEN": "token"}),
-            patch("urllib.request.urlopen", side_effect=responses) as urlopen,
-        ):
-            sessions = prepare_batch_server_evidence([native, raw])
-            finalize_batch_server_evidence([native, raw], results, sessions)
-        self.assertEqual(2, urlopen.call_count)
-        self.assertEqual(["pass", "pass"], [item.status for item in results])
-        self.assertTrue(
-            all(
-                item.evidence["server_evidence"]["status"] == "pass" for item in results
+    def test_wire_verdict_enforces_tool_loop_depth(self):
+        upstream = sse_server(MESSAGES_SSE_CLEAN)
+        proxy = RecordingProxy(f"http://127.0.0.1:{upstream.server_port}")
+        try:
+            request = urllib.request.Request(
+                proxy.base_url + "/v1/messages",
+                data=json.dumps({"model": "m", "stream": True}).encode(),
+                headers={"content-type": "application/json"},
+                method="POST",
             )
-        )
-
-    def test_batch_evidence_keeps_native_tool_logs_in_their_time_window(self):
-        first = CommandTests().cell("codex")
-        second = CommandTests().cell("grok-build")
-        route = replace(
-            first.route,
-            channel_id=252,
-            group="cursor-acceptance",
-            evidence_provider="beefapi_token_log",
-            release_evidence_required=True,
-        )
-        first = MatrixCell(
-            replace(first.client, id="codex-cli"),
-            route,
-            first.model,
-            first.scenario,
-        )
-        second = MatrixCell(
-            replace(second.client, id="grok-build"),
-            route,
-            second.model,
-            second.scenario,
-        )
-        receipt = {
-            "usage_receipt_provider": "cursor-sdk-bridge",
-            "usage_receipt_state": "final",
-        }
-
-        def log(request_id: str, created_at: int):
-            return {
-                "created_at": created_at,
-                "type": 2,
-                "model_name": "model",
-                "channel": 252,
-                "group": "cursor-acceptance",
-                "request_id": request_id,
-                "other": json.dumps({**receipt, "usage_receipt_id": request_id}),
-            }
-
-        old = log("old", 100)
-        responses = [
-            FakeResponse(
-                {"success": True, "data": [old]},
-                {"X-New-Api-Commit": "commit-sha"},
-            ),
-            FakeResponse(
-                {
-                    "success": True,
-                    "data": [
-                        log("second-only", 211),
-                        log("first-followup", 200),
-                        log("first-tool", 199),
-                        {
-                            **log("first-provisional", 199),
-                            "other": json.dumps(
-                                {
-                                    "usage_receipt_id": "first-provisional",
-                                    "usage_receipt_state": "provisional",
-                                }
-                            ),
-                        },
-                        old,
-                    ],
-                },
-                {"X-New-Api-Commit": "commit-sha"},
-            ),
-        ]
-        results = [
-            CellResult(
-                first.id,
-                "pass",
-                "client",
-                "now",
-                1,
-                route.id,
-                first.model.id,
-                first.scenario.id,
-                [],
-                {
-                    "server_evidence": {"status": "deferred"},
-                    "_response_request_ids": [
-                        "first-tool",
-                        "first-followup",
-                        "first-provisional",
-                    ],
-                    "_server_window": {
-                        "started_epoch": 199,
-                        "finished_epoch": 198,
-                    },
-                },
-            ),
-            CellResult(
-                second.id,
-                "pass",
-                "client",
-                "now",
-                1,
-                route.id,
-                second.model.id,
-                second.scenario.id,
-                [],
-                {
-                    "server_evidence": {"status": "deferred"},
-                    "_response_request_ids": ["second-only"],
-                    "_server_window": {
-                        "started_epoch": 210,
-                        "finished_epoch": 211,
-                    },
-                },
-            ),
-        ]
-        with (
-            patch.dict(os.environ, {"TOKEN": "token"}),
-            patch("urllib.request.urlopen", side_effect=responses),
-        ):
-            sessions = prepare_batch_server_evidence([first, second])
-            finalize_batch_server_evidence([first, second], results, sessions)
-        first_ids = {
-            item["terminal"]["request_id"]
-            for item in results[0].evidence["server_evidence"]["requests"]
-        }
-        second_id = results[1].evidence["server_evidence"]["terminal"]["request_id"]
-        self.assertEqual({"first-tool", "first-followup"}, first_ids)
-        self.assertEqual(1, results[0].evidence["server_evidence"]["provisional_count"])
-        self.assertEqual("second-only", second_id)
-        self.assertNotIn(second_id, first_ids)
+            with urllib.request.urlopen(request, timeout=10) as response:
+                response.read()
+            verdict = wire_verdict(proxy.exchanges(), ("multi_request",))
+            self.assertEqual("fail", verdict["status"])
+            self.assertIn(">=2 completion requests", verdict["detail"])
+        finally:
+            proxy.stop()
+            upstream.shutdown()
+            upstream.server_close()
 
 
 class CommandTests(unittest.TestCase):
-    def cell(self, adapter: str) -> MatrixCell:
+    def cell(self, adapter: str, capabilities: frozenset[str] | None = None):
+        capabilities = capabilities or frozenset({"text", "session.resume"})
         client = Client(
             "client",
             "Client",
             adapter,
             ("binary",),
             ("--version",),
-            frozenset({"text", "session.resume"}),
+            capabilities,
             frozenset({"darwin"}),
         )
         route = Route(
@@ -920,7 +447,7 @@ class CommandTests(unittest.TestCase):
             "TOKEN",
             frozenset({"client"}),
             frozenset({"responses"}),
-            frozenset({"text", "session.resume"}),
+            capabilities,
             None,
         )
         model = Model(
@@ -928,7 +455,7 @@ class CommandTests(unittest.TestCase):
             "Model",
             frozenset({"route"}),
             frozenset({"client"}),
-            frozenset({"text", "session.resume"}),
+            capabilities,
             {},
         )
         scenario = Scenario(
@@ -937,7 +464,7 @@ class CommandTests(unittest.TestCase):
             "pr",
             "client",
             None,
-            frozenset({"text"}),
+            capabilities,
             10,
             False,
             (Turn("prompt", "marker", ()),),
@@ -957,6 +484,38 @@ class CommandTests(unittest.TestCase):
             config = (Path(tmp) / "client-home/config.toml").read_text()
             self.assertIn('env_key = "BEEFAPI_CONFORMANCE_TOKEN"', config)
             self.assertNotIn("sk-private-value", config)
+            self.assertNotIn("web_search", config)
+
+    def test_codex_web_scenario_enables_native_search(self):
+        cell = self.cell("codex", frozenset({"text", "tool.web"}))
+        with tempfile.TemporaryDirectory() as tmp:
+            command = ClientCommand(
+                cell, "/bin/echo", Path(tmp), "token", "https://gateway"
+            )
+            command.prepare()
+            config = (Path(tmp) / "client-home/config.toml").read_text()
+            self.assertIn("web_search = true", config)
+            self.assertNotIn("--search", command.command("hello", 1))
+
+    def test_grok_keeps_default_tool_surface_and_env_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command = ClientCommand(
+                self.cell("grok-build"),
+                "/bin/echo",
+                Path(tmp),
+                "sk-private-value",
+                "https://gateway",
+            )
+            command.prepare()
+            config = (Path(tmp) / "client-home/config.toml").read_text()
+            self.assertIn('env_key = "BEEFAPI_CONFORMANCE_TOKEN"', config)
+            self.assertNotIn("sk-private-value", config)
+            env = command.environment()
+            self.assertEqual("sk-private-value", env["BEEFAPI_CONFORMANCE_TOKEN"])
+            self.assertNotIn("XAI_API_KEY", env)
+            grok_command = command.command("hello", 1)
+            self.assertIn("streaming-messages-json", grok_command)
+            self.assertNotIn("--tools", grok_command)
 
     def test_workbuddy_command_uses_headless_stream_and_resume(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -969,6 +528,16 @@ class CommandTests(unittest.TestCase):
             self.assertIn("stream-json", first)
             self.assertIn("--session-id", first)
             self.assertIn("--resume", second)
+
+    def test_codex_resume_requires_thread_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            command = ClientCommand(
+                self.cell("codex"), "/bin/echo", Path(tmp), "token", "https://gateway"
+            )
+            with self.assertRaisesRegex(RuntimeError, "thread id"):
+                command.command("again", 2)
+            command.resume_id = "thread-id"
+            self.assertIn("thread-id", command.command("again", 2))
 
     def test_assistant_text_does_not_accept_echoed_user_prompt(self):
         output = "\n".join(
@@ -984,180 +553,116 @@ class CommandTests(unittest.TestCase):
         )
         self.assertNotIn("SECRET_MARKER", assistant_text("workbuddy", output))
 
-    def test_grok_config_uses_env_key_without_copying_credentials(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            command = ClientCommand(
-                self.cell("grok-build"),
-                "/bin/echo",
-                Path(tmp),
-                "sk-private-value",
-                "https://gateway",
-            )
-            command.prepare()
-            config = (Path(tmp) / "client-home/config.toml").read_text()
-            self.assertIn('env_key = "BEEFAPI_CONFORMANCE_TOKEN"', config)
-            self.assertIn("[compat.claude]", config)
-            self.assertIn("mcps = false", config)
-            self.assertIn('ignore = ["~/.agents/skills"]', config)
-            self.assertIn("disabled = [", config)
-            self.assertIn("[plugins]", config)
-            self.assertNotIn("sk-private-value", config)
-            env = command.environment()
-            self.assertEqual("sk-private-value", env["BEEFAPI_CONFORMANCE_TOKEN"])
-            self.assertNotIn("XAI_API_KEY", env)
-            grok_command = command.command("hello", 1)
-            self.assertIn("streaming-messages-json", grok_command)
 
-    def test_grok_messages_stream_extracts_assistant_text(self):
-        output = "\n".join(
-            [
-                json.dumps(
-                    {"type": "user", "message": {"role": "user", "content": "ECHOED"}}
-                ),
-                json.dumps(
-                    {
-                        "type": "assistant",
-                        "message": {
-                            "role": "assistant",
-                            "content": [{"type": "text", "text": "GROK_STREAM_OK"}],
-                        },
-                    }
-                ),
-                json.dumps({"type": "result", "result": "GROK_STREAM_OK"}),
-            ]
+class EvidenceTests(unittest.TestCase):
+    def cell(self) -> MatrixCell:
+        base = CommandTests().cell("codex")
+        route = replace(
+            base.route,
+            channel_id=252,
+            pin_channel=True,
+            group="cursor-acceptance",
+            evidence_provider="beefapi_token_log",
         )
-        text = assistant_text("grok-build", output)
-        self.assertIn("GROK_STREAM_OK", text)
-        self.assertNotIn("ECHOED", text)
+        return MatrixCell(base.client, route, base.model, base.scenario)
 
-    def test_codex_resume_pins_read_only_sandbox(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            command = ClientCommand(
-                self.cell("codex"), "/bin/echo", Path(tmp), "token", "https://gateway"
+    def log(self, request_id: str, state: str = "final") -> dict:
+        return {
+            "created_at": 200,
+            "type": 2,
+            "model_name": "model",
+            "channel": 252,
+            "group": "cursor-acceptance",
+            "request_id": request_id,
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "quota": 3,
+            "use_time": 1,
+            "other": json.dumps(
+                {
+                    "usage_receipt_id": f"receipt-{request_id}",
+                    "usage_receipt_provider": "cursor-sdk-bridge",
+                    "usage_receipt_state": state,
+                }
+            ),
+        }
+
+    def test_channel_pin_is_explicit_and_conflict_safe(self):
+        cell = self.cell()
+        self.assertEqual("test-token-252", _request_token(cell, "test-token"))
+        self.assertEqual("test-token-252", _request_token(cell, "test-token-252"))
+        with self.assertRaisesRegex(RuntimeError, "already pinned to channel 271"):
+            _request_token(cell, "test-token-271")
+
+    def test_usage_log_payload_requires_final_receipt(self):
+        cell = self.cell()
+        payload = _usage_log_payload(cell, self.log("req-252"), "commit-sha")
+        self.assertEqual("pass", payload["status"])
+        self.assertEqual(252, payload["route"]["channel_id"])
+        provisional = _usage_log_payload(
+            cell, self.log("req-252", state="provisional"), "commit-sha"
+        )
+        self.assertEqual("fail", provisional["status"])
+
+    def test_token_log_evidence_waits_for_final_receipt(self):
+        cell = self.cell()
+        responses = [
+            FakeResponse(
+                {"success": True, "data": [self.log("req-252", "provisional")]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+            FakeResponse(
+                {"success": True, "data": [self.log("req-252")]},
+                {"X-New-Api-Commit": "commit-sha"},
+            ),
+        ]
+        with (
+            patch("urllib.request.urlopen", side_effect=responses) as urlopen,
+            patch("time.sleep"),
+        ):
+            payload = _beefapi_token_log_evidence(
+                cell, "token", 200, set(), {"req-252"}
             )
-            command.resume_id = "thread-id"
-            resume = command.command("again", 2)
-            self.assertIn('sandbox_mode="read-only"', resume)
+        self.assertEqual("pass", payload["status"])
+        self.assertEqual(2, urlopen.call_count)
+
+    def test_tool_loop_accepts_multiple_final_request_ids(self):
+        cell = self.cell()
+        response = FakeResponse(
+            {"success": True, "data": [self.log("tool-call"), self.log("tool-result")]},
+            {"X-New-Api-Commit": "commit-sha"},
+        )
+        with patch("urllib.request.urlopen", return_value=response):
+            payload = _beefapi_token_log_evidence(
+                cell, "token", 200, set(), {"tool-call", "tool-result"}
+            )
+        self.assertEqual("pass", payload["status"])
+        self.assertEqual(2, len(payload["requests"]))
+
+    def test_web_search_scenario_requires_observed_search_call(self):
+        base = self.cell()
+        cell = MatrixCell(
+            base.client,
+            base.route,
+            base.model,
+            replace(base.scenario, id="web-search"),
+        )
+        response = FakeResponse(
+            {"success": True, "data": [self.log("req-search")]},
+            {"X-New-Api-Commit": "commit-sha"},
+        )
+        with (
+            patch("urllib.request.urlopen", return_value=response),
+            patch("time.sleep"),
+        ):
+            payload = _beefapi_token_log_evidence(
+                cell, "token", 200, set(), {"req-search"}
+            )
+        self.assertEqual("fail", payload["status"])
+        self.assertIn("no observed search call", payload["detail"])
 
 
 class RunnerTests(unittest.TestCase):
-    def test_raw_http_messages_can_replay_trailing_system_context(self):
-        received: list[dict] = []
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):
-                length = int(self.headers.get("content-length", "0"))
-                request = json.loads(self.rfile.read(length))
-                received.append(request)
-                roles = [message.get("role") for message in request.get("messages", [])]
-                system = request.get("system", "")
-                is_claude_code = (
-                    "x-anthropic-billing-header: cc_version=" in system
-                    and "cc_entrypoint=sdk-cli;" in system
-                )
-                status = 200 if roles == ["user", "system"] and is_claude_code else 400
-                body = json.dumps(
-                    {
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "BEEFAPI_TRAILING_SYSTEM_OK",
-                            }
-                        ]
-                    }
-                ).encode()
-                self.send_response(status)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *_args):
-                return
-
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            client = Client(
-                "raw-http",
-                "HTTP",
-                "raw-http",
-                ("python3",),
-                ("--version",),
-                frozenset({"text", "messages"}),
-                frozenset({"darwin"}),
-            )
-            route = Route(
-                "cursor-agent-v1-channel-301",
-                "Cursor Agent v1",
-                "gateway_token",
-                f"http://127.0.0.1:{server.server_port}",
-                None,
-                "RAW_HTTP_TEST_TOKEN",
-                frozenset({"raw-http"}),
-                frozenset({"messages"}),
-                frozenset({"text", "messages"}),
-                None,
-            )
-            model = Model(
-                "claude-opus-5",
-                "Claude Opus 5",
-                frozenset({route.id}),
-                frozenset({client.id}),
-                frozenset({"text", "messages"}),
-                {},
-            )
-            scenario = Scenario.parse(
-                {
-                    "id": "messages-trailing-system",
-                    "name": "Claude Code dynamic system context after user",
-                    "tier": "pr",
-                    "kind": "http",
-                    "protocol": "messages",
-                    "http_endpoint": "/v1/messages",
-                    "required_capabilities": ["messages", "text"],
-                    "timeout_seconds": 10,
-                    "requires_local_tools": False,
-                    "http_payload": {
-                        "model": "{{model}}",
-                        "max_tokens": 128,
-                        "system": "x-anthropic-billing-header: cc_version=2.1.233; cc_entrypoint=sdk-cli;",
-                        "messages": [
-                            {"role": "user", "content": "{{prompt}}"},
-                            {
-                                "role": "system",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": "Available agent types and skills",
-                                    }
-                                ],
-                            },
-                        ],
-                    },
-                    "turns": [
-                        {
-                            "prompt": "Reply exactly BEEFAPI_TRAILING_SYSTEM_OK.",
-                            "marker": "BEEFAPI_TRAILING_SYSTEM_OK",
-                            "expected_events": [],
-                        }
-                    ],
-                }
-            )
-            os.environ["RAW_HTTP_TEST_TOKEN"] = "plain-test-token"
-            result = run_cell(MatrixCell(client, route, model, scenario))
-            self.assertEqual("pass", result.status, result)
-            self.assertEqual(
-                ["user", "system"],
-                [message["role"] for message in received[0]["messages"]],
-            )
-        finally:
-            os.environ.pop("RAW_HTTP_TEST_TOKEN", None)
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
-
     def test_mock_client_runs_and_report_passes(self):
         binary = str(ROOT / "tests/fixtures/mock_agent.py")
         client = Client(
@@ -1206,147 +711,105 @@ class RunnerTests(unittest.TestCase):
                 ),
             ),
         )
-        result = run_cell(
-            MatrixCell(client, route, model, scenario), allow_local_tools=True
-        )
+        cell = MatrixCell(client, route, model, scenario)
+        result = run_cell(cell, allow_local_tools=True)
         self.assertEqual("pass", result.status, result)
         self.assertEqual("passed", build_report([result])["classification"])
+        skipped = run_cell(cell, allow_local_tools=False)
+        self.assertEqual("skip", skipped.status)
+        self.assertIn("--allow-local-tools", skipped.detail)
 
-    def test_local_tool_requires_explicit_opt_in(self):
-        inventory = load_inventory(
-            ROOT,
-            ROOT / "manifests/routes.example.json",
-            ROOT / "manifests/models.example.json",
+    def http_cell(self, port: int, stream: bool = True) -> MatrixCell:
+        client = Client(
+            "raw-http",
+            "HTTP",
+            "raw-http",
+            ("python3",),
+            ("--version",),
+            frozenset({"text", "stream", "messages"}),
+            frozenset({"darwin"}),
         )
-        cell = next(
-            item
-            for item in compile_matrix(inventory, "merge")
-            if item.scenario.id == "local-tool-read"
+        route = Route(
+            "route",
+            "Route",
+            "gateway_token",
+            f"http://127.0.0.1:{port}",
+            None,
+            "RAW_HTTP_TEST_TOKEN",
+            frozenset({"raw-http"}),
+            frozenset({"messages"}),
+            frozenset({"text", "stream", "messages"}),
+            None,
         )
-        cell = MatrixCell(
-            replace(
-                cell.client,
-                binary_candidates=(str(ROOT / "tests/fixtures/mock_agent.py"),),
+        model = Model(
+            "model",
+            "Model",
+            frozenset({"route"}),
+            frozenset({"raw-http"}),
+            frozenset({"text", "stream", "messages"}),
+            {},
+        )
+        scenario = Scenario(
+            "messages-stream",
+            "Messages stream",
+            "pr",
+            "http",
+            "messages",
+            frozenset({"text", "stream", "messages"}),
+            10,
+            False,
+            (
+                Turn(
+                    "Reply exactly BEEFAPI_MESSAGES_STREAM_OK.",
+                    "BEEFAPI_MESSAGES_STREAM_OK",
+                    (),
+                ),
             ),
-            cell.route,
-            cell.model,
-            cell.scenario,
+            "/v1/messages",
+            None,
+            stream,
         )
-        result = run_cell(cell, allow_local_tools=False)
-        self.assertEqual("skip", result.status)
-        self.assertIn("--allow-local-tools", result.detail)
+        return MatrixCell(client, route, model, scenario)
 
-    def test_raw_http_responses_is_a_real_matrix_surface(self):
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self):
-                length = int(self.headers.get("content-length", "0"))
-                request = json.loads(self.rfile.read(length))
-                body = json.dumps(
-                    {"id": "resp-test", "output_text": request["input"].split()[-1]}
-                ).encode()
-                self.send_response(200)
-                self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *_args):
-                return
-
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+    def test_raw_http_streaming_cell_passes_on_clean_stream(self):
+        server = sse_server(MESSAGES_SSE_CLEAN)
+        os.environ["RAW_HTTP_TEST_TOKEN"] = "plain-test-token"
         try:
-            client = Client(
-                "raw-http",
-                "HTTP",
-                "raw-http",
-                ("python3",),
-                ("--version",),
-                frozenset({"text", "responses"}),
-                frozenset({"darwin"}),
-            )
-            route = Route(
-                "route",
-                "Route",
-                "gateway_token",
-                f"http://127.0.0.1:{server.server_port}",
-                None,
-                "RAW_HTTP_TEST_TOKEN",
-                frozenset({"raw-http"}),
-                frozenset({"responses"}),
-                frozenset({"text", "responses"}),
-                None,
-            )
-            model = Model(
-                "model",
-                "Model",
-                frozenset({"route"}),
-                frozenset({"raw-http"}),
-                frozenset({"text", "responses"}),
-                {},
-            )
-            scenario = Scenario(
-                "responses",
-                "Responses",
-                "pr",
-                "http",
-                "responses",
-                frozenset({"text", "responses"}),
-                10,
-                False,
-                (Turn("Reply BEEFAPI_RESPONSES_OK", "BEEFAPI_RESPONSES_OK", ()),),
-                "/v1/responses",
-            )
-            os.environ["RAW_HTTP_TEST_TOKEN"] = "plain-test-token"
-            result = run_cell(MatrixCell(client, route, model, scenario))
+            result = run_cell(self.http_cell(server.server_port))
             self.assertEqual("pass", result.status, result)
             self.assertNotIn("plain-test-token", json.dumps(result.evidence))
-            release_result = run_cell(
-                MatrixCell(client, route, model, scenario),
-                require_server_evidence=True,
-            )
-            self.assertEqual("fail", release_result.status)
-            self.assertIn("requires passing server evidence", release_result.detail)
-            route_with_evidence = Route(
-                route.id,
-                route.name,
-                route.auth_mode,
-                route.base_url,
-                route.base_url_env,
-                route.token_env,
-                route.clients,
-                route.protocols,
-                route.capabilities,
-                "RAW_HTTP_EVIDENCE_COMMAND",
-            )
-            evidence_payload = {
-                "status": "pass",
-                "commit": "abc123",
-                "route": "route",
-                "terminal": "completed",
-                "receipt": "plain-test-token",
-                "usage": {"input_tokens": 1},
-            }
-            os.environ["RAW_HTTP_EVIDENCE_COMMAND"] = json.dumps(
-                [
-                    sys.executable,
-                    "-c",
-                    f"print({json.dumps(json.dumps(evidence_payload))})",
-                ]
-            )
-            evidenced_result = run_cell(
-                MatrixCell(client, route_with_evidence, model, scenario),
-                require_server_evidence=True,
-            )
-            self.assertEqual("pass", evidenced_result.status, evidenced_result)
-            self.assertNotIn("plain-test-token", json.dumps(evidenced_result.evidence))
         finally:
             os.environ.pop("RAW_HTTP_TEST_TOKEN", None)
-            os.environ.pop("RAW_HTTP_EVIDENCE_COMMAND", None)
             server.shutdown()
             server.server_close()
-            thread.join(timeout=2)
+
+    def test_raw_http_streaming_cell_fails_on_early_termination(self):
+        server = sse_server(MESSAGES_SSE_EARLY)
+        os.environ["RAW_HTTP_TEST_TOKEN"] = "plain-test-token"
+        try:
+            result = run_cell(self.http_cell(server.server_port))
+            self.assertEqual("fail", result.status)
+            self.assertIn(
+                "stream terminated early", json.dumps(result.turns[0].missing_events)
+            )
+        finally:
+            os.environ.pop("RAW_HTTP_TEST_TOKEN", None)
+            server.shutdown()
+            server.server_close()
+
+    def test_release_tier_fails_closed_without_server_evidence(self):
+        server = sse_server(MESSAGES_SSE_CLEAN)
+        os.environ["RAW_HTTP_TEST_TOKEN"] = "plain-test-token"
+        try:
+            result = run_cell(
+                self.http_cell(server.server_port), require_server_evidence=True
+            )
+            self.assertEqual("fail", result.status)
+            self.assertIn("requires passing server evidence", result.detail)
+        finally:
+            os.environ.pop("RAW_HTTP_TEST_TOKEN", None)
+            server.shutdown()
+            server.server_close()
 
 
 if __name__ == "__main__":

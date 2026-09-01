@@ -8,17 +8,12 @@ import sys
 from pathlib import Path
 
 from .clients import resolve_binary
-from .harbor import harbor_binary, validate_harbor_tasks
 from .inventory import sync_live_inventory
 from .manifest import load_inventory
 from .matrix import compile_matrix
 from .model import ContractError
 from .report import build_report, write_report
-from .runner import (
-    finalize_batch_server_evidence,
-    prepare_batch_server_evidence,
-    run_cell,
-)
+from .runner import run_cell
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -55,7 +50,7 @@ def _matrix(args: argparse.Namespace):
 
 def command_validate(args: argparse.Namespace) -> int:
     inventory = _inventory(args)
-    errors = validate_harbor_tasks(ROOT)
+    errors: list[str] = []
     release_cells = compile_matrix(inventory, "release")
     covered_clients = {cell.client.id for cell in release_cells}
     missing_clients = sorted({item.id for item in inventory.clients} - covered_clients)
@@ -88,7 +83,6 @@ def command_doctor(args: argparse.Namespace) -> int:
             }
             for item in inventory.clients
         ],
-        "harbor": harbor_binary(),
         "route_secrets": {
             route.id: bool(os.environ.get(route.token_env or ""))
             if route.token_env
@@ -134,16 +128,12 @@ def command_run(args: argparse.Namespace) -> int:
         "nightly",
         "release",
     }
-    batch_evidence = (
-        prepare_batch_server_evidence(cells) if require_server_evidence else {}
-    )
     for cell in cells:
         print(f"RUN {cell.id}", file=sys.stderr)
         result = run_cell(
             cell,
             allow_local_tools=args.allow_local_tools,
             require_server_evidence=require_server_evidence,
-            defer_server_evidence=bool(batch_evidence),
         )
         results.append(result)
         print(
@@ -151,8 +141,6 @@ def command_run(args: argparse.Namespace) -> int:
         )
         if args.fail_fast and result.status == "fail":
             break
-    if batch_evidence:
-        finalize_batch_server_evidence(cells[: len(results)], results, batch_evidence)
     report = build_report(results)
     write_report(report, Path(args.output))
     print(json.dumps(report["summary"], indent=2))

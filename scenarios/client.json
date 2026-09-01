@@ -1,0 +1,85 @@
+{
+  "scenarios": [
+    {
+      "id": "text-turn",
+      "name": "One native client text turn",
+      "tier": "pr",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["text"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "turns": [
+        {"prompt": "Reply exactly BEEFAPI_CONFORMANCE_TEXT_OK.", "marker": "BEEFAPI_CONFORMANCE_TEXT_OK", "expected_events": []}
+      ]
+    },
+    {
+      "id": "long-stream",
+      "name": "Long streamed answer must not truncate or drop the stream",
+      "tier": "merge",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["text", "stream"],
+      "timeout_seconds": 420,
+      "requires_local_tools": false,
+      "turns": [
+        {
+          "prompt": "Write a numbered list of exactly 80 one-sentence facts about cattle breeds, one per line, numbered 1. to 80., then on the final line reply exactly BEEFAPI_LONG_STREAM_OK.",
+          "marker": "BEEFAPI_LONG_STREAM_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "tool-loop",
+      "name": "Multi-step native tool loop: read, derive, write, read back",
+      "tier": "merge",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["tool.shell"],
+      "timeout_seconds": 420,
+      "requires_local_tools": true,
+      "expect_wire": ["multi_request"],
+      "turns": [
+        {
+          "prompt": "Complete these steps in order using your tools, one step at a time: 1) read {{workspace}}/marker.txt, 2) create {{workspace}}/loop.txt containing the marker you read followed by the suffix _LOOPED, 3) read {{workspace}}/loop.txt back to verify it. Then reply exactly BEEFAPI_TOOL_LOOP_OK.",
+          "marker": "BEEFAPI_TOOL_LOOP_OK",
+          "expected_events": ["BEEFAPI_CONFORMANCE_FILE_OK"]
+        }
+      ]
+    },
+    {
+      "id": "web-search",
+      "name": "Native web search must be offered to and used by the client",
+      "tier": "merge",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["tool.web"],
+      "timeout_seconds": 300,
+      "requires_local_tools": false,
+      "expect_wire": ["web_search_requested"],
+      "turns": [
+        {
+          "prompt": "You must run your web search tool before answering, even if you already know the answer. Search the web for the title of the page at example.com, then reply with the title and end with BEEFAPI_CONFORMANCE_WEB_OK.",
+          "marker": "BEEFAPI_CONFORMANCE_WEB_OK",
+          "expected_events": [],
+          "expected_any_events": [["\"name\":\"WebSearch\"", "\"name\":\"web_search\"", "\"type\":\"web_search\"", "web_search_call", "server_tool_use"]]
+        }
+      ]
+    },
+    {
+      "id": "session-resume",
+      "name": "Two-turn native session continuation",
+      "tier": "nightly",
+      "kind": "client",
+      "protocol": null,
+      "required_capabilities": ["session.resume"],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "turns": [
+        {"prompt": "Remember nonce BLUE-CATTLE-742 and reply exactly BEEFAPI_CONFORMANCE_RESUME_1_OK.", "marker": "BEEFAPI_CONFORMANCE_RESUME_1_OK", "expected_events": []},
+        {"prompt": "Reply with the nonce from the previous turn followed by BEEFAPI_CONFORMANCE_RESUME_2_OK.", "marker": "BEEFAPI_CONFORMANCE_RESUME_2_OK", "expected_events": ["BLUE-CATTLE-742"]}
+      ]
+    }
+  ]
+}

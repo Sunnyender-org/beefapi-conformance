@@ -20,8 +20,6 @@ CURSOR_CAPABILITIES = [
     "responses",
     "messages",
     "chat",
-    "compact",
-    "images",
 ]
 CURSOR_AGENT_V1_CAPABILITIES = [
     "text",
@@ -32,8 +30,6 @@ CURSOR_AGENT_V1_CAPABILITIES = [
     "responses",
     "messages",
     "chat",
-    "messages.trailing_system",
-    "client.trailing_system",
 ]
 
 

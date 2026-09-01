@@ -29,11 +29,9 @@ matrix process. Package managers and client installers never inherit it.
 
 ## Evidence
 
-The runner takes one token-log fence before the serialized matrix and one
-bounded final snapshot after it. It accepts only newly created consume logs
-matching the exact model, group, and pinned channel. This avoids the production
-critical-read limit while still keeping old rows outside the run. Release
-evidence requires:
+Each cell takes a token-log fence before it runs and polls a bounded snapshot
+after it. It accepts only newly created consume logs matching the exact model,
+group, and pinned channel. Release evidence requires:
 
 - current `X-New-Api-Commit`;
 - expected channel id and group;
@@ -41,13 +39,17 @@ evidence requires:
 - final usage receipt;
 - prompt/completion/quota/use-time values.
 
-This prevents a recent earlier request from satisfying a new cell.
-Raw HTTP cells additionally bind the response `X-Oneapi-Request-Id` exactly.
-Native tool loops may legitimately create several requests per turn, so their
-isolation boundary is the dedicated Key plus serialized workflow concurrency;
-all rows in the fenced window are assigned to that cell, and it must contain at
-least one final receipt per client turn. Intermediate provisional rows are
-counted as evidence but never substitute for a final receipt.
+This prevents a recent earlier request from satisfying a new cell. Raw HTTP
+cells bind the response `X-Oneapi-Request-Id` exactly; native cells bind the
+request ids observed in client output when the route exposes them. Native tool
+loops may legitimately create several requests per turn and must contain at
+least one final receipt per client turn. Provisional rows never substitute for
+a final receipt. The `web-search` scenario additionally requires a positive
+server-side search call count.
+
+Wire capture is the second evidence channel: every native cell runs through a
+local recording proxy, and its report carries per-request stream termination,
+timing gaps, and declared tool names alongside the receipt data.
 
 ## WorkBuddy boundary
 

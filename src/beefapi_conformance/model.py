@@ -217,12 +217,20 @@ class Turn:
             raise ContractError(
                 "turn.expected_any_events must be an array of string arrays"
             )
+        marker = raw.get("marker", "")
+        if not isinstance(marker, str):
+            raise ContractError("turn.marker must be a string")
+        if not marker and not events and not any_events:
+            raise ContractError("turn needs a marker or expected events")
         return cls(
             _required(raw, "prompt"),
-            _required(raw, "marker"),
+            marker,
             tuple(events),
             tuple(tuple(group) for group in any_events),
         )
+
+
+WIRE_EXPECTATIONS = {"multi_request", "web_search_requested"}
 
 
 @dataclass(frozen=True)
@@ -238,6 +246,8 @@ class Scenario:
     turns: tuple[Turn, ...]
     http_endpoint: str | None = None
     http_payload: dict[str, Any] | None = None
+    stream: bool = False
+    expect_wire: tuple[str, ...] = ()
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Scenario:
@@ -264,6 +274,18 @@ class Scenario:
             )
         if http_payload is not None:
             _validate_http_payload_credentials(http_payload)
+        stream = bool(raw.get("stream", False))
+        if stream and kind != "http":
+            raise ContractError("scenario.stream applies only to HTTP scenarios")
+        expect_wire = raw.get("expect_wire", [])
+        if not isinstance(expect_wire, list) or not set(expect_wire) <= (
+            WIRE_EXPECTATIONS
+        ):
+            raise ContractError(
+                f"scenario.expect_wire entries must be in {sorted(WIRE_EXPECTATIONS)}"
+            )
+        if expect_wire and kind != "client":
+            raise ContractError("scenario.expect_wire applies only to client scenarios")
         return cls(
             id=_required(raw, "id"),
             name=_required(raw, "name"),
@@ -280,6 +302,8 @@ class Scenario:
             turns=tuple(Turn.parse(item) for item in turns_raw),
             http_endpoint=endpoint,
             http_payload=http_payload,
+            stream=stream,
+            expect_wire=tuple(expect_wire),
         )
 
 

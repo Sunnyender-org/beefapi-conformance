@@ -20,8 +20,6 @@ CURSOR_CAPABILITIES = [
     "responses",
     "messages",
     "chat",
-    "compact",
-    "images",
 ]
 CURSOR_AGENT_V1_CAPABILITIES = [
     "text",
@@ -32,15 +30,6 @@ CURSOR_AGENT_V1_CAPABILITIES = [
     "responses",
     "messages",
     "chat",
-    "messages.trailing_system",
-    "client.trailing_system",
-    "cursor.agent_v1",
-    "stream.progress",
-    "mcp.serial",
-    "mcp.parallel",
-    "client.classifier",
-    "lifecycle.disconnect",
-    "lifecycle.restart",
 ]
 
 
@@ -92,7 +81,6 @@ def build_live_inventory(
             channel.get("cursor_agent_v1_native_web_search", False)
         ):
             capabilities.append("tool.web")
-            capabilities.append("tool.web.hosted")
         model_ids = [
             item.strip()
             for item in str(channel.get("models", "")).split(",")

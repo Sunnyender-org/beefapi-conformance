@@ -5,7 +5,7 @@
       "name": "Cursor Composer 2.5",
       "routes": ["beefapi-cursor-native"],
       "clients": ["raw-http", "claude-code", "codex-cli", "grok-build"],
-      "capabilities": ["text", "stream", "tool.shell", "tool.custom", "tool.web", "session.resume", "responses", "messages", "chat", "compact", "images"],
+      "capabilities": ["text", "stream", "tool.shell", "tool.custom", "tool.web", "session.resume", "responses", "messages", "chat"],
       "aliases": {}
     },
     {
@@ -13,7 +13,7 @@
       "name": "Provisioned WorkBuddy test model placeholder",
       "routes": ["workbuddy-managed"],
       "clients": ["workbuddy-cli"],
-      "capabilities": ["text", "stream", "tool.shell", "tool.web", "session.resume", "acp", "images"],
+      "capabilities": ["text", "stream", "tool.shell", "tool.web", "session.resume"],
       "aliases": {"workbuddy-cli": "auto"}
     }
   ]

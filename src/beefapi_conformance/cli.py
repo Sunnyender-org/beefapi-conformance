@@ -1,30 +1,19 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import os
 import platform
 import sys
-import time
 from pathlib import Path
 
 from .clients import resolve_binary
-from .cursor_agent_v1 import missing_critical_executions, redact_known_ids
-from .harbor import harbor_binary, validate_harbor_tasks
 from .inventory import sync_live_inventory
 from .manifest import load_inventory
 from .matrix import compile_matrix
 from .model import ContractError
-from .redact import redact
 from .report import build_report, write_report
-from .runner import (
-    _known_request_ids,
-    finalize_batch_server_evidence,
-    native_window_schedule_gap,
-    prepare_batch_server_evidence,
-    run_cell,
-)
+from .runner import run_cell
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -61,23 +50,12 @@ def _matrix(args: argparse.Namespace):
 
 def command_validate(args: argparse.Namespace) -> int:
     inventory = _inventory(args)
-    errors = validate_harbor_tasks(ROOT)
+    errors: list[str] = []
     release_cells = compile_matrix(inventory, "release")
-    representative_cells = compile_matrix(
-        inventory, "release", coverage="representative"
-    )
     covered_clients = {cell.client.id for cell in release_cells}
     missing_clients = sorted({item.id for item in inventory.clients} - covered_clients)
     if missing_clients:
         errors.append(f"clients without release cells: {', '.join(missing_clients)}")
-    for label, cells in (
-        ("full", release_cells),
-        ("representative", representative_cells),
-    ):
-        missing = missing_critical_executions(cells)
-        errors.extend(
-            f"{label} release missing critical type64 cell {item}" for item in missing
-        )
     payload = {
         "ok": not errors,
         "counts": {
@@ -105,7 +83,6 @@ def command_doctor(args: argparse.Namespace) -> int:
             }
             for item in inventory.clients
         ],
-        "harbor": harbor_binary(),
         "route_secrets": {
             route.id: bool(os.environ.get(route.token_env or ""))
             if route.token_env
@@ -151,97 +128,23 @@ def command_run(args: argparse.Namespace) -> int:
         "nightly",
         "release",
     }
-    output = Path(args.output)
-    unfinished: str | None = None
-    try:
-        batch_evidence = (
-            prepare_batch_server_evidence(cells) if require_server_evidence else {}
+    for cell in cells:
+        print(f"RUN {cell.id}", file=sys.stderr)
+        result = run_cell(
+            cell,
+            allow_local_tools=args.allow_local_tools,
+            require_server_evidence=require_server_evidence,
         )
-        previous = None
-        for cell in cells:
-            if (
-                batch_evidence
-                and previous is not None
-                and native_window_schedule_gap(previous, cell)
-            ):
-                time.sleep(1)
-            print(f"RUN {cell.id}", file=sys.stderr)
-            result = run_cell(
-                cell,
-                allow_local_tools=args.allow_local_tools,
-                require_server_evidence=require_server_evidence,
-                defer_server_evidence=bool(batch_evidence),
-            )
-            results.append(result)
-            print(
-                f"{result.status.upper()} {cell.id} {result.duration_ms}ms",
-                file=sys.stderr,
-            )
-            _write_run_checkpoint(results, args.tier, cells, output)
-            previous = cell
-            if args.fail_fast and result.status == "fail":
-                break
-        if batch_evidence:
-            finalize_batch_server_evidence(
-                cells[: len(results)], results, batch_evidence
-            )
-        report = _build_run_report(results, args.tier, cells)
-        write_report(report, output)
-        print(json.dumps(report["summary"], indent=2))
-        return 0 if report["classification"] == "passed" else 1
-    except KeyboardInterrupt:
-        unfinished = "interrupted"
-        raise
-    except Exception:
-        unfinished = "run failed before completion"
-        raise
-    finally:
-        if unfinished is not None:
-            report = _build_run_report(results, args.tier, cells, unfinished=unfinished)
-            write_report(report, output)
-
-
-def _build_run_report(
-    results: list,
-    tier: str | None,
-    cells: list,
-    unfinished: str | None = None,
-) -> dict:
-    report = build_report(copy.deepcopy(results), tier=tier, planned_cells=cells)
-    if unfinished:
-        report["unfinished"] = True
-        report["classification"] = "failed"
-        report["detail"] = unfinished
-    secrets = tuple(
-        os.environ.get(cell.route.token_env or "", "")
-        for cell in cells
-        if cell.route.token_env
-    )
-    return _redact_report_tree(report, secrets, _known_request_ids(results))
-
-
-def _redact_report_tree(
-    value: object, secrets: tuple[str, ...], raw_ids: list[str]
-) -> object:
-    if isinstance(value, str):
-        return redact_known_ids(redact(value, secrets), raw_ids)
-    if isinstance(value, list):
-        return [_redact_report_tree(item, secrets, raw_ids) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: _redact_report_tree(item, secrets, raw_ids)
-            for key, item in value.items()
-        }
-    return value
-
-
-def _write_run_checkpoint(
-    results: list, tier: str | None, cells: list, output: Path
-) -> None:
-    write_report(
-        _build_run_report(results, tier, cells, unfinished="checkpoint"),
-        output,
-    )
+        results.append(result)
+        print(
+            f"{result.status.upper()} {cell.id} {result.duration_ms}ms", file=sys.stderr
+        )
+        if args.fail_fast and result.status == "fail":
+            break
+    report = build_report(results)
+    write_report(report, Path(args.output))
+    print(json.dumps(report["summary"], indent=2))
+    return 0 if report["classification"] == "passed" else 1
 
 
 def command_sync_inventory(args: argparse.Namespace) -> int:

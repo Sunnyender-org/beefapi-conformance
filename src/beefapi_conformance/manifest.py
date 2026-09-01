@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar
 
-from .cursor_agent_v1 import validate_completion_references
 from .model import Client, ContractError, Model, Route, Scenario, unique_ids
 
 T = TypeVar("T")
@@ -43,7 +42,6 @@ def load_inventory(root: Path, routes_path: Path, models_path: Path) -> Inventor
     for path in sorted(scenarios_dir.glob("*.json")):
         scenarios.extend(_load(path, "scenarios", Scenario.parse))
     unique_ids(scenarios, scenarios_dir)
-    validate_completion_references({item.id for item in scenarios})
     inventory = Inventory(
         clients=_load(root / "manifests/clients.json", "clients", Client.parse),
         routes=_load(routes_path, "routes", Route.parse),

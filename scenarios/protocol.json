@@ -1,0 +1,105 @@
+{
+  "scenarios": [
+    {
+      "id": "messages-stream",
+      "name": "Anthropic Messages SSE text stream terminates cleanly",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": ["messages", "text", "stream"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "turns": [{"prompt": "Reply exactly BEEFAPI_MESSAGES_STREAM_OK.", "marker": "BEEFAPI_MESSAGES_STREAM_OK", "expected_events": []}]
+    },
+    {
+      "id": "responses-stream",
+      "name": "OpenAI Responses SSE text stream terminates cleanly",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "responses",
+      "http_endpoint": "/v1/responses",
+      "stream": true,
+      "required_capabilities": ["responses", "text", "stream"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "turns": [{"prompt": "Reply exactly BEEFAPI_RESPONSES_STREAM_OK.", "marker": "BEEFAPI_RESPONSES_STREAM_OK", "expected_events": []}]
+    },
+    {
+      "id": "chat-stream",
+      "name": "OpenAI Chat Completions SSE text stream terminates cleanly",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "chat",
+      "http_endpoint": "/v1/chat/completions",
+      "stream": true,
+      "required_capabilities": ["chat", "text", "stream"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "turns": [{"prompt": "Reply exactly BEEFAPI_CHAT_STREAM_OK.", "marker": "BEEFAPI_CHAT_STREAM_OK", "expected_events": []}]
+    },
+    {
+      "id": "messages-tool-call",
+      "name": "Forced client tool call streams tool_use blocks with argument deltas",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": ["messages", "stream", "tool.custom"],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 1024,
+        "messages": [{"role": "user", "content": "{{prompt}}"}],
+        "tools": [
+          {
+            "name": "get_weather",
+            "description": "Get the current weather for a city.",
+            "input_schema": {
+              "type": "object",
+              "properties": {"city": {"type": "string", "description": "City name"}},
+              "required": ["city"]
+            }
+          }
+        ],
+        "tool_choice": {"type": "tool", "name": "get_weather"}
+      },
+      "turns": [
+        {
+          "prompt": "What is the weather in Tokyo right now?",
+          "marker": "",
+          "expected_events": ["tool_use", "input_json_delta"]
+        }
+      ]
+    },
+    {
+      "id": "messages-web-search-tool",
+      "name": "Anthropic server web_search tool is accepted and executed",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": ["messages", "stream", "tool.web"],
+      "timeout_seconds": 300,
+      "requires_local_tools": false,
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 2048,
+        "messages": [{"role": "user", "content": "{{prompt}}"}],
+        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 2}]
+      },
+      "turns": [
+        {
+          "prompt": "Search the web for the title of the page at example.com and answer in one line.",
+          "marker": "",
+          "expected_events": ["server_tool_use"],
+          "expected_any_events": [["web_search_tool_result", "web_search_result"]]
+        }
+      ]
+    }
+  ]
+}

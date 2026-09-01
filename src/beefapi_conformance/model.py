@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -218,12 +217,20 @@ class Turn:
             raise ContractError(
                 "turn.expected_any_events must be an array of string arrays"
             )
+        marker = raw.get("marker", "")
+        if not isinstance(marker, str):
+            raise ContractError("turn.marker must be a string")
+        if not marker and not events and not any_events:
+            raise ContractError("turn needs a marker or expected events")
         return cls(
             _required(raw, "prompt"),
-            _required(raw, "marker"),
+            marker,
             tuple(events),
             tuple(tuple(group) for group in any_events),
         )
+
+
+WIRE_EXPECTATIONS = {"multi_request", "web_search_requested"}
 
 
 @dataclass(frozen=True)
@@ -239,10 +246,8 @@ class Scenario:
     turns: tuple[Turn, ...]
     http_endpoint: str | None = None
     http_payload: dict[str, Any] | None = None
-    retry_offsets_seconds: tuple[int, ...] = ()
-    mcp_mode: str | None = None
-    evidence_requirements: frozenset[str] = frozenset()
-    tool_replay: dict[str, Any] | None = None
+    stream: bool = False
+    expect_wire: tuple[str, ...] = ()
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Scenario:
@@ -269,45 +274,18 @@ class Scenario:
             )
         if http_payload is not None:
             _validate_http_payload_credentials(http_payload)
-        offsets = raw.get("retry_offsets_seconds", [])
-        if offsets and (
-            not isinstance(offsets, list)
-            or not all(isinstance(item, int) and item >= 0 for item in offsets)
+        stream = bool(raw.get("stream", False))
+        if stream and kind != "http":
+            raise ContractError("scenario.stream applies only to HTTP scenarios")
+        expect_wire = raw.get("expect_wire", [])
+        if not isinstance(expect_wire, list) or not set(expect_wire) <= (
+            WIRE_EXPECTATIONS
         ):
             raise ContractError(
-                "scenario.retry_offsets_seconds must be an array of integers"
+                f"scenario.expect_wire entries must be in {sorted(WIRE_EXPECTATIONS)}"
             )
-        mcp_mode = raw.get("mcp_mode")
-        if mcp_mode is not None and mcp_mode not in {"serial", "parallel"}:
-            raise ContractError(f"scenario.mcp_mode invalid: {mcp_mode}")
-        requirements = raw.get("evidence_requirements", [])
-        if requirements and (
-            not isinstance(requirements, list)
-            or not all(isinstance(item, str) and item for item in requirements)
-        ):
-            raise ContractError("scenario.evidence_requirements must be a string array")
-        tool_replay = raw.get("tool_replay")
-        if tool_replay is not None:
-            if not isinstance(tool_replay, dict) or not str(
-                tool_replay.get("mode") or ""
-            ):
-                raise ContractError("scenario.tool_replay must be an object with mode")
-            if tool_replay.get("mode") not in {
-                "retry",
-                "covering",
-                "mixed",
-                "custom",
-                "mcp",
-            }:
-                raise ContractError(
-                    f"scenario.tool_replay.mode invalid: {tool_replay.get('mode')}"
-                )
-        if http_payload is not None and "toolu_conformance_" in json.dumps(
-            http_payload, default=str
-        ):
-            raise ContractError(
-                "scenario.http_payload must not embed static synthetic tool_use ids"
-            )
+        if expect_wire and kind != "client":
+            raise ContractError("scenario.expect_wire applies only to client scenarios")
         return cls(
             id=_required(raw, "id"),
             name=_required(raw, "name"),
@@ -324,10 +302,8 @@ class Scenario:
             turns=tuple(Turn.parse(item) for item in turns_raw),
             http_endpoint=endpoint,
             http_payload=http_payload,
-            retry_offsets_seconds=tuple(offsets or ()),
-            mcp_mode=mcp_mode,
-            evidence_requirements=frozenset(requirements or ()),
-            tool_replay=tool_replay,
+            stream=stream,
+            expect_wire=tuple(expect_wire),
         )
 
 

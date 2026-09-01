@@ -29,43 +29,31 @@ matrix process. Package managers and client installers never inherit it.
 
 ## Evidence
 
-The runner takes one token-log fence before the serialized matrix and one
-bounded final snapshot after it. It accepts only newly created consume logs
-matching the exact model, group, and pinned channel. This avoids the production
-critical-read limit while still keeping old rows outside the run. Release
-evidence requires:
+Each cell takes a token-log fence before it runs and polls a bounded snapshot
+after it. It accepts only newly created consume logs matching the exact model,
+group, and pinned channel. Release evidence requires:
 
 - current `X-New-Api-Commit`;
 - expected channel id and group;
-- completed HTTP request correlation (`http_request_id_hash`);
-- final usage receipt correlation (`receipt.id_hash`), distinct from the HTTP request id;
-- usage quality: type64 `observed_usage` versus `billing_estimate`.
+- completed terminal request id;
+- final usage receipt;
+- prompt/completion/quota/use-time values.
 
-This prevents a recent earlier request from satisfying a new cell.
-Raw HTTP cells additionally bind the response `X-Oneapi-Request-Id` exactly.
-Grok Build's `models.session_summary` is pinned to the tested client model as
-well as `models.default`: title generation is a separate real inference request,
-not proof that the main CLI turn failed and not a request to silently remap at
-the gateway. `scripts/smoke_grok_local.py` uses an intentionally non-built-in
-model and requires an observed title request with no unexpected model ids;
-the assistant marker alone cannot pass this check. The stub is local protocol
-evidence only; paid release acceptance must reconcile title requests separately
-from the main tool loop and must not require every client request to share one
-final receipt (a tool-only title response may remain provisional).
+This prevents a recent earlier request from satisfying a new cell. Raw HTTP
+cells bind the response `X-Oneapi-Request-Id` exactly; native cells bind the
+request ids observed in client output when the route exposes them. Native tool
+loops may legitimately create several requests per turn and must contain at
+least one final receipt per client turn. Provisional rows never substitute for
+a final receipt. The `web-search` scenario additionally requires a positive
+server-side search call count.
 
-Native tool loops may legitimately create several requests per turn, so their
-isolation boundary is the dedicated Key plus serialized workflow concurrency;
-all rows in the fenced window are assigned to that cell, and it must contain at
-least one final receipt per client turn. Intermediate provisional rows are
-counted as evidence but never substitute for a final receipt.
+Wire capture is the second evidence channel: every native cell runs through a
+local recording proxy, and its report carries per-request stream termination,
+timing gaps, and declared tool names alongside the receipt data.
 
 ## WorkBuddy boundary
 
-WorkBuddy CodeBuddy can run on an ordinary `gateway_token` route with the same
-dedicated acceptance Key as other clients. Those cells must use the public
-model id and isolated env/`--setting-sources none`; they must not reuse a
-managed `auto` alias or copy a desktop login.
-
-`managed_session` cells still use a pre-authenticated local host and the
-user's provisioned custom-model route. Hosted production CI does not copy a
+WorkBuddy CodeBuddy uses a managed account/private-model route rather than a
+portable gateway-token config. Its native CLI text/tool/resume checks therefore
+run on a pre-authenticated local host. Hosted production CI does not copy a
 WorkBuddy login or pretend that a built-in `auto` model is a BeefAPI route.

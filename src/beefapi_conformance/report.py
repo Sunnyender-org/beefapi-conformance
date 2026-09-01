@@ -1,56 +1,32 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from xml.etree import ElementTree
 
-from .cursor_agent_v1 import (
-    apply_completion_gates,
-    missing_critical_executions,
-    sanitize_report_value,
-)
-from .model import CellResult, MatrixCell
+from .model import CellResult
 
 
-def build_report(
-    results: list[CellResult],
-    *,
-    tier: str | None = None,
-    planned_cells: list[MatrixCell] | None = None,
-) -> dict[str, object]:
-    gated = apply_completion_gates(results, tier=tier)
-    unexecuted = (
-        missing_critical_executions(planned_cells, gated)
-        if planned_cells is not None
-        else []
-    )
-    classification = classify(gated)
-    if unexecuted:
-        classification = "failed"
+def build_report(results: list[CellResult]) -> dict[str, object]:
     counts = {
-        status: sum(1 for item in gated if item.status == status)
-        for status in ("pass", "fail", "skip", "blocked")
+        status: sum(1 for item in results if item.status == status)
+        for status in ("pass", "fail", "skip")
     }
     return {
-        "schema_version": 2,
+        "schema_version": 1,
         "generated_at": datetime.now(UTC).isoformat(),
-        "classification": classification,
-        "summary": {"total": len(gated), **counts},
-        "gates": {
-            "unexecuted_critical": unexecuted,
-            "critical_skip_fails_release": True,
-        },
-        "results": [sanitize_report_value(asdict(item)) for item in gated],
+        "classification": classify(results),
+        "summary": {"total": len(results), **counts},
+        "results": [asdict(item) for item in results],
     }
 
 
 def classify(results: list[CellResult]) -> str:
     if not results or all(item.status == "skip" for item in results):
         return "not_run"
-    if any(item.status in {"fail", "blocked"} for item in results):
+    if any(item.status == "fail" for item in results):
         return "failed"
     if any(item.status == "skip" for item in results):
         return "partial"
@@ -59,8 +35,9 @@ def classify(results: list[CellResult]) -> str:
 
 def write_report(report: dict[str, object], output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(report, ensure_ascii=False, indent=2) + "\n"
-    _atomic_write_text(output_dir / "conformance.json", payload)
+    (output_dir / "conformance.json").write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     suite = ElementTree.Element("testsuite", name="beefapi-conformance")
     results = report.get("results", [])
     suite.set("tests", str(len(results)))
@@ -71,7 +48,7 @@ def write_report(report: dict[str, object], output_dir: Path) -> None:
             name=str(result["cell_id"]),
             time=str(result["duration_ms"] / 1000),
         )
-        if result["status"] in {"fail", "blocked"}:
+        if result["status"] == "fail":
             failure = ElementTree.SubElement(
                 case,
                 "failure",
@@ -82,22 +59,6 @@ def write_report(report: dict[str, object], output_dir: Path) -> None:
             ElementTree.SubElement(
                 case, "skipped", message=str(result.get("detail", ""))
             )
-    tmp_junit = output_dir / "junit.xml.tmp"
-    if report.get("unfinished"):
-        case = ElementTree.SubElement(
-            suite, "testcase", name="run-completion", time="0"
-        )
-        ElementTree.SubElement(
-            case, "failure", message="conformance run did not complete"
-        )
-    suite.set("tests", str(len(suite.findall("testcase"))))
     ElementTree.ElementTree(suite).write(
-        tmp_junit, encoding="utf-8", xml_declaration=True
+        output_dir / "junit.xml", encoding="utf-8", xml_declaration=True
     )
-    os.replace(tmp_junit, output_dir / "junit.xml")
-
-
-def _atomic_write_text(path: Path, payload: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(payload, encoding="utf-8")
-    os.replace(tmp, path)

@@ -86,11 +86,11 @@ class ClientCommand:
             env["GROK_HOME"] = str(self.root / "client-home")
             if self.token:
                 env["BEEFAPI_CONFORMANCE_TOKEN"] = self.token
-        elif adapter == "workbuddy":
-            # WorkBuddy managed-session acceptance intentionally uses its own
-            # authenticated profile. We isolate workspace/session output but do
-            # not copy, export, or rewrite the profile.
-            pass
+        elif adapter == "workbuddy" and self.cell.route.auth_mode == "gateway_token":
+            # Drop inherited CodeBuddy/WorkBuddy auth and base before inserting
+            # the ephemeral request token. managed_session keeps the user's own
+            # authenticated profile untouched.
+            _apply_workbuddy_gateway_env(self, env)
         return env
 
     def prepare(self) -> None:
@@ -217,6 +217,9 @@ class ClientCommand:
             )
             return args
         if adapter == "workbuddy":
+            gateway = self.cell.route.auth_mode == "gateway_token"
+            if gateway:
+                model = _workbuddy_gateway_model(self.cell)
             args = [
                 self.binary,
                 "--print",
@@ -227,6 +230,10 @@ class ClientCommand:
                 "--permission-mode",
                 "bypassPermissions",
             ]
+            if gateway:
+                # Literal "none" is required: omitting the flag or passing an
+                # empty value reloads user,project,local settings.
+                args += ["--setting-sources", "none"]
             if len(self.cell.scenario.turns) == 1:
                 args.append("--no-session-persistence")
             args += (
@@ -235,7 +242,7 @@ class ClientCommand:
                 else ["--session-id", self.session_id]
             )
             settings = os.environ.get("WORKBUDDY_CONFORMANCE_SETTINGS_JSON")
-            if settings:
+            if settings and not gateway:
                 args += ["--settings", settings]
             return [*args, prompt]
         if adapter == "mock":
@@ -255,6 +262,61 @@ class ClientCommand:
             ):
                 self.resume_id = event["thread_id"]
                 return
+
+
+_WORKBUDDY_INHERITED_ENV_PREFIXES = ("CODEBUDDY_", "WORKBUDDY_")
+_WORKBUDDY_INHERITED_ENV_KEYS = (
+    "ACC_PRODUCT_CONFIG",
+    "ACC_PRODUCT_CONFIG_V2",
+    "ACC_PRODUCT_CONFIG_V3",
+    "ACC_PRODUCT_CONFIG_PATH",
+)
+_WORKBUDDY_UNSAFE_GATEWAY_MODELS = frozenset({"auto", "default"})
+
+
+def _drop_inherited_workbuddy_env(env: dict[str, str]) -> None:
+    for key in list(env):
+        if (
+            key.startswith(_WORKBUDDY_INHERITED_ENV_PREFIXES)
+            or key in _WORKBUDDY_INHERITED_ENV_KEYS
+        ):
+            env.pop(key, None)
+
+
+def _workbuddy_gateway_model(cell: MatrixCell) -> str:
+    model_id = cell.model.id
+    selected = cell.model.client_model(cell.client.id)
+    if (
+        not model_id
+        or selected != model_id
+        or model_id.strip().lower().startswith(("custom:", "custom-local:"))
+        or model_id.strip().lower() in _WORKBUDDY_UNSAFE_GATEWAY_MODELS
+    ):
+        raise RuntimeError(
+            "workbuddy gateway_token requires an ordinary explicit model id; "
+            f"custom alias {selected!r} is not isolated from modelConfig url/key"
+        )
+    return model_id
+
+
+def _apply_workbuddy_gateway_env(command: ClientCommand, env: dict[str, str]) -> None:
+    _drop_inherited_workbuddy_env(env)
+    _workbuddy_gateway_model(command.cell)
+    if not command.token:
+        raise RuntimeError("workbuddy gateway_token is missing the request token")
+    if not command.base_url:
+        raise RuntimeError("workbuddy gateway_token is missing the route base URL")
+    home = command.root / "client-home"
+    home.mkdir(parents=True, exist_ok=True)
+    config_dir = str(home)
+    env.update(
+        {
+            "CODEBUDDY_AUTH_TOKEN": command.token,
+            "CODEBUDDY_BASE_URL": command.base_url + "/v1",
+            "CODEBUDDY_CONFIG_DIR": config_dir,
+            "WORKBUDDY_CONFIG_DIR": config_dir,
+        }
+    )
 
 
 def assistant_text(adapter: str, output: str) -> str:

@@ -33,6 +33,7 @@ Scenarios are organized around the ways routes fail in real use:
 | `messages-web-search-tool` | merge | gateway rejects or swallows the server web_search tool |
 | `messages/responses-concurrent` | merge | 8 simultaneous users: crosstalk between streams, 429/5xx under load, p95 collapse |
 | `concurrent-users` | merge | 3 real client sessions at once through the recording proxy |
+| `concurrent-tool-loop` | nightly | 2 real client sessions running multi-step tool loops simultaneously |
 | `session-resume` | nightly | session continuation across turns |
 
 Concurrent scenarios give every simulated user a unique nonce and fail if any

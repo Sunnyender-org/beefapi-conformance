@@ -150,6 +150,7 @@ class ContractTests(unittest.TestCase):
                 "tool-loop",
                 "web-search",
                 "concurrent-users",
+                "concurrent-tool-loop",
                 "session-resume",
             },
             {item.scenario.id for item in cells},

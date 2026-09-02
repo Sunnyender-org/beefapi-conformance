@@ -82,6 +82,25 @@
       ]
     },
     {
+      "id": "concurrent-tool-loop",
+      "name": "Two real client sessions run multi-step tool loops at once",
+      "tier": "nightly",
+      "kind": "client",
+      "protocol": null,
+      "concurrency": 2,
+      "required_capabilities": ["tool.shell", "stream"],
+      "timeout_seconds": 480,
+      "requires_local_tools": true,
+      "expect_wire": ["multi_request"],
+      "turns": [
+        {
+          "prompt": "Complete these steps in order using your tools, one step at a time: 1) read {{workspace}}/marker.txt, 2) create {{workspace}}/loop.txt containing the marker you read followed by the suffix _{{nonce}}, 3) read {{workspace}}/loop.txt back to verify it. Then reply exactly {{nonce}}.",
+          "marker": "{{nonce}}",
+          "expected_events": ["BEEFAPI_CONFORMANCE_FILE_OK"]
+        }
+      ]
+    },
+    {
       "id": "session-resume",
       "name": "Two-turn native session continuation",
       "tier": "nightly",

@@ -68,6 +68,20 @@
       ]
     },
     {
+      "id": "concurrent-users",
+      "name": "Three real client sessions run at once through the same route",
+      "tier": "merge",
+      "kind": "client",
+      "protocol": null,
+      "concurrency": 3,
+      "required_capabilities": ["text", "stream"],
+      "timeout_seconds": 240,
+      "requires_local_tools": false,
+      "turns": [
+        {"prompt": "Reply exactly {{nonce}} and nothing else.", "marker": "{{nonce}}", "expected_events": []}
+      ]
+    },
+    {
       "id": "session-resume",
       "name": "Two-turn native session continuation",
       "tier": "nightly",

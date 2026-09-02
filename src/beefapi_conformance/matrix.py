@@ -75,7 +75,13 @@ def representative_matrix(cells: list[MatrixCell]) -> list[MatrixCell]:
     route_index = {route.id: index for index, route in enumerate(routes)}
     model_index = {model.id: index for index, model in enumerate(models)}
     client_ids = [client.id for client in native_clients]
-    deep_scenarios = ["tool-loop", "session-resume", "web-search", "long-stream"]
+    deep_scenarios = [
+        "tool-loop",
+        "session-resume",
+        "web-search",
+        "long-stream",
+        "concurrent-users",
+    ]
     selected: dict[str, MatrixCell] = {}
     for cell in cells:
         scenario_id = cell.scenario.id

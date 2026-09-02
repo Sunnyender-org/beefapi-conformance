@@ -248,6 +248,8 @@ class Scenario:
     http_payload: dict[str, Any] | None = None
     stream: bool = False
     expect_wire: tuple[str, ...] = ()
+    concurrency: int = 1
+    max_slowdown: float | None = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Scenario:
@@ -286,6 +288,24 @@ class Scenario:
             )
         if expect_wire and kind != "client":
             raise ContractError("scenario.expect_wire applies only to client scenarios")
+        concurrency = int(raw.get("concurrency", 1))
+        if concurrency < 1:
+            raise ContractError("scenario.concurrency must be >= 1")
+        if concurrency > 1:
+            if len(turns_raw) != 1:
+                raise ContractError("concurrent scenarios must have exactly one turn")
+            if "{{nonce}}" not in str(turns_raw[0].get("prompt", "")):
+                raise ContractError(
+                    "concurrent scenario prompt must embed {{nonce}} so "
+                    "cross-request leakage is detectable"
+                )
+        max_slowdown = raw.get("max_slowdown")
+        if max_slowdown is not None:
+            max_slowdown = float(max_slowdown)
+            if max_slowdown <= 1 or concurrency == 1:
+                raise ContractError(
+                    "scenario.max_slowdown must be > 1 on a concurrent scenario"
+                )
         return cls(
             id=_required(raw, "id"),
             name=_required(raw, "name"),
@@ -304,6 +324,8 @@ class Scenario:
             http_payload=http_payload,
             stream=stream,
             expect_wire=tuple(expect_wire),
+            concurrency=concurrency,
+            max_slowdown=max_slowdown,
         )
 
 

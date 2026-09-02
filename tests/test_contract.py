@@ -3,6 +3,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import re
 import tempfile
 import threading
 import unittest
@@ -34,6 +35,8 @@ from beefapi_conformance.runner import (
 )
 from beefapi_conformance.wire import (
     RecordingProxy,
+    crosstalk,
+    latency_stats,
     parse_sse,
     sse_text,
     termination,
@@ -55,13 +58,46 @@ MESSAGES_SSE_EARLY = (
 )
 
 
-def sse_server(body: str) -> http.server.ThreadingHTTPServer:
-    payload = body.encode()
+def messages_sse(text: str) -> str:
+    return (
+        'event: message_start\ndata: {"type":"message_start"}\n\n'
+        "event: content_block_delta\n"
+        "data: "
+        + json.dumps(
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": text},
+            }
+        )
+        + "\n\n"
+        'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+    )
+
+
+def sse_server(
+    body: str | None = None, *, crosstalk: bool = False
+) -> http.server.ThreadingHTTPServer:
+    """Serve a fixed SSE body, or (when body is None) echo the nonce found in
+    the prompt. crosstalk=True simulates a router that mixes users' streams
+    by appending the previous request's nonce to every answer."""
+    fixed = body.encode() if body is not None else None
+    seen: list[str] = []
+    lock = threading.Lock()
+    nonce_pattern = re.compile(r"BEEFAPI-NONCE-[A-Z0-9]+-\d+")
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("content-length", "0") or 0)
-            self.rfile.read(length)
+            request = self.rfile.read(length)
+            if fixed is not None:
+                payload = fixed
+            else:
+                match = nonce_pattern.search(request.decode("utf-8", "replace"))
+                nonce = match.group(0) if match else "NO-NONCE"
+                with lock:
+                    leaked = seen[-1] if crosstalk and seen else ""
+                    seen.append(nonce)
+                payload = messages_sse(f"{nonce} {leaked}".strip()).encode()
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
             self.send_header("content-length", str(len(payload)))
@@ -108,7 +144,14 @@ class ContractTests(unittest.TestCase):
     def test_nightly_native_scenarios_cover_real_failure_modes(self):
         cells = compile_matrix(self.inventory(), "nightly", clients={"codex-cli"})
         self.assertEqual(
-            {"text-turn", "long-stream", "tool-loop", "web-search", "session-resume"},
+            {
+                "text-turn",
+                "long-stream",
+                "tool-loop",
+                "web-search",
+                "concurrent-users",
+                "session-resume",
+            },
             {item.scenario.id for item in cells},
         )
 
@@ -168,6 +211,21 @@ class ContractTests(unittest.TestCase):
                     "turns": [{"prompt": "p", "marker": "", "expected_events": []}],
                 }
             )
+        with self.assertRaisesRegex(ContractError, "nonce"):
+            Scenario.parse({**base, "concurrency": 4})
+        with self.assertRaisesRegex(ContractError, "exactly one turn"):
+            Scenario.parse(
+                {
+                    **base,
+                    "concurrency": 2,
+                    "turns": [
+                        {"prompt": "{{nonce}}", "marker": "m", "expected_events": []},
+                        {"prompt": "{{nonce}}", "marker": "m", "expected_events": []},
+                    ],
+                }
+            )
+        with self.assertRaisesRegex(ContractError, "max_slowdown"):
+            Scenario.parse({**base, "max_slowdown": 3.0})
 
     def test_redaction_covers_explicit_and_pattern_secrets(self):
         output = redact(
@@ -299,7 +357,13 @@ class ContractTests(unittest.TestCase):
             },
             raw_stream,
         )
-        deep = {"tool-loop", "session-resume", "web-search", "long-stream"}
+        deep = {
+            "tool-loop",
+            "session-resume",
+            "web-search",
+            "long-stream",
+            "concurrent-users",
+        }
         for route in inventory.routes:
             route_cells = [cell for cell in cells if cell.route.id == route.id]
             self.assertEqual(
@@ -347,6 +411,44 @@ class WireTests(unittest.TestCase):
             'event: response.completed\ndata: {"type":"response.completed"}\n\n'
         )
         self.assertEqual("RESP_OK", sse_text("responses", parse_sse(responses)))
+
+    def test_crosstalk_and_latency_helpers(self):
+        clean = {"N-1": "N-1 done", "N-2": "N-2 done"}
+        self.assertEqual([], crosstalk(clean))
+        leaked = crosstalk({"N-1": "N-1 done", "N-2": "N-2 and also N-1"})
+        self.assertEqual(1, len(leaked))
+        self.assertIn("N-2", leaked[0])
+        self.assertIn("N-1", leaked[0])
+        stats = latency_stats([100, 300, 200, 900, 250])
+        self.assertEqual(5, stats["count"])
+        self.assertEqual(250, stats["p50_ms"])
+        self.assertEqual(900, stats["p95_ms"])
+        self.assertEqual({}, latency_stats([]))
+
+    def test_wire_verdict_scales_tool_loop_depth_with_concurrency(self):
+        upstream = sse_server(MESSAGES_SSE_CLEAN)
+        proxy = RecordingProxy(f"http://127.0.0.1:{upstream.server_port}")
+        try:
+            for _ in range(3):
+                request = urllib.request.Request(
+                    proxy.base_url + "/v1/messages",
+                    data=json.dumps({"model": "m", "stream": True}).encode(),
+                    headers={"content-type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=10) as response:
+                    response.read()
+            exchanges = proxy.exchanges()
+            self.assertEqual(
+                "pass", wire_verdict(exchanges, ("multi_request",), 1)["status"]
+            )
+            self.assertEqual(
+                "fail", wire_verdict(exchanges, ("multi_request",), 2)["status"]
+            )
+        finally:
+            proxy.stop()
+            upstream.shutdown()
+            upstream.server_close()
 
     def test_proxy_records_clean_stream_and_request_summary(self):
         upstream = sse_server(MESSAGES_SSE_CLEAN)
@@ -796,6 +898,98 @@ class RunnerTests(unittest.TestCase):
             os.environ.pop("RAW_HTTP_TEST_TOKEN", None)
             server.shutdown()
             server.server_close()
+
+    def concurrent_cell(self, port: int, users: int = 6) -> MatrixCell:
+        base = self.http_cell(port)
+        scenario = replace(
+            base.scenario,
+            id="messages-concurrent",
+            concurrency=users,
+            max_slowdown=50.0,
+            turns=(Turn("Reply exactly {{nonce}}.", "{{nonce}}", ()),),
+        )
+        return MatrixCell(base.client, base.route, base.model, scenario)
+
+    def test_concurrent_http_cell_passes_and_records_load_evidence(self):
+        server = sse_server()
+        os.environ["RAW_HTTP_TEST_TOKEN"] = "plain-test-token"
+        try:
+            result = run_cell(self.concurrent_cell(server.server_port))
+            self.assertEqual("pass", result.status, result)
+            self.assertEqual(6, len(result.turns))
+            self.assertEqual(6, len({turn.marker for turn in result.turns}))
+            load = result.evidence["concurrency"]
+            self.assertEqual(6, load["users"])
+            self.assertEqual(6, load["passed"])
+            self.assertEqual([], load["crosstalk"])
+            self.assertEqual(6, load["latency"]["count"])
+            self.assertEqual(200, load["baseline_status"])
+        finally:
+            os.environ.pop("RAW_HTTP_TEST_TOKEN", None)
+            server.shutdown()
+            server.server_close()
+
+    def test_concurrent_http_cell_fails_on_crosstalk(self):
+        server = sse_server(crosstalk=True)
+        os.environ["RAW_HTTP_TEST_TOKEN"] = "plain-test-token"
+        try:
+            result = run_cell(self.concurrent_cell(server.server_port))
+            self.assertEqual("fail", result.status)
+            self.assertIn("leaked across users", result.detail)
+            self.assertTrue(result.evidence["concurrency"]["crosstalk"])
+        finally:
+            os.environ.pop("RAW_HTTP_TEST_TOKEN", None)
+            server.shutdown()
+            server.server_close()
+
+    def test_concurrent_mock_client_isolates_workspaces_and_nonces(self):
+        binary = str(ROOT / "tests/fixtures/mock_agent.py")
+        client = Client(
+            "mock",
+            "Mock",
+            "mock",
+            (binary,),
+            ("--version",),
+            frozenset({"text", "stream"}),
+            frozenset({"darwin"}),
+        )
+        route = Route(
+            "mock-route",
+            "Mock",
+            "managed_session",
+            None,
+            None,
+            None,
+            frozenset({"mock"}),
+            frozenset({"mock"}),
+            frozenset({"text", "stream"}),
+            None,
+        )
+        model = Model(
+            "mock-model",
+            "Mock",
+            frozenset({"mock-route"}),
+            frozenset({"mock"}),
+            frozenset({"text", "stream"}),
+            {},
+        )
+        scenario = Scenario(
+            "concurrent-users",
+            "Concurrent",
+            "pr",
+            "client",
+            None,
+            frozenset({"text"}),
+            10,
+            False,
+            (Turn("{{nonce}}", "{{nonce}}", ()),),
+            concurrency=3,
+        )
+        result = run_cell(MatrixCell(client, route, model, scenario))
+        self.assertEqual("pass", result.status, result)
+        self.assertEqual(3, len(result.turns))
+        self.assertEqual(3, result.evidence["concurrency"]["passed"])
+        self.assertEqual([], result.evidence["concurrency"]["crosstalk"])
 
     def test_release_tier_fails_closed_without_server_evidence(self):
         server = sse_server(MESSAGES_SSE_CLEAN)

@@ -356,8 +356,39 @@ def wire_summary(exchanges: list[Exchange]) -> dict[str, object]:
     }
 
 
+def crosstalk(answers: dict[str, str]) -> list[str]:
+    """Given nonce -> response text, report any response that leaked another
+    request's nonce. This is the direct detector for stream interleaving."""
+    problems = []
+    for nonce, text in answers.items():
+        leaked = sorted(other for other in answers if other != nonce and other in text)
+        if leaked:
+            problems.append(f"response for {nonce} also contained {', '.join(leaked)}")
+    return problems
+
+
+def latency_stats(durations_ms: list[int]) -> dict[str, int]:
+    if not durations_ms:
+        return {}
+    ordered = sorted(durations_ms)
+
+    def percentile(p: float) -> int:
+        index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * p)))
+        return ordered[index]
+
+    return {
+        "count": len(ordered),
+        "min_ms": ordered[0],
+        "p50_ms": percentile(0.5),
+        "p95_ms": percentile(0.95),
+        "max_ms": ordered[-1],
+    }
+
+
 def wire_verdict(
-    exchanges: list[Exchange], expectations: tuple[str, ...] = ()
+    exchanges: list[Exchange],
+    expectations: tuple[str, ...] = (),
+    concurrency: int = 1,
 ) -> dict[str, object]:
     """Grade captured traffic: streams must terminate cleanly and declared
     expectations (tool loop depth, web search declaration) must hold."""
@@ -373,9 +404,10 @@ def wire_verdict(
             problems.append(f"{label} stream terminated with an error event")
         elif item.terminated == "proxy_error":
             problems.append(f"{label} upstream connection failed: {item.error}")
-    if "multi_request" in expectations and len(completions) < 2:
+    minimum = 2 * max(1, concurrency)
+    if "multi_request" in expectations and len(completions) < minimum:
         problems.append(
-            f"expected a native tool loop with >=2 completion requests, saw {len(completions)}"
+            f"expected a native tool loop with >={minimum} completion requests, saw {len(completions)}"
         )
     if "web_search_requested" in expectations and not any(
         _is_web_search_tool(name)

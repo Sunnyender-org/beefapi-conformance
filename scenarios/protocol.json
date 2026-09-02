@@ -40,6 +40,36 @@
       "turns": [{"prompt": "Reply exactly BEEFAPI_CHAT_STREAM_OK.", "marker": "BEEFAPI_CHAT_STREAM_OK", "expected_events": []}]
     },
     {
+      "id": "messages-concurrent",
+      "name": "Eight users stream Anthropic Messages at once without crosstalk or collapse",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "concurrency": 8,
+      "max_slowdown": 4.0,
+      "required_capabilities": ["messages", "text", "stream"],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "turns": [{"prompt": "Reply exactly {{nonce}} and nothing else.", "marker": "{{nonce}}", "expected_events": []}]
+    },
+    {
+      "id": "responses-concurrent",
+      "name": "Eight users stream OpenAI Responses at once without crosstalk or collapse",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "responses",
+      "http_endpoint": "/v1/responses",
+      "stream": true,
+      "concurrency": 8,
+      "max_slowdown": 4.0,
+      "required_capabilities": ["responses", "text", "stream"],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "turns": [{"prompt": "Reply exactly {{nonce}} and nothing else.", "marker": "{{nonce}}", "expected_events": []}]
+    },
+    {
       "id": "messages-tool-call",
       "name": "Forced client tool call streams tool_use blocks with argument deltas",
       "tier": "merge",

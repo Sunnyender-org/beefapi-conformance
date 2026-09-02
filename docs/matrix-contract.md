@@ -45,6 +45,9 @@ A cell passes only when all of the following hold:
    protocol's terminal event (no early EOF, no error event, no 4xx/5xx);
 3. scenario wire expectations hold (`multi_request` for tool loops,
    `web_search_requested` for web search);
+3a. for `concurrency > 1`, every simulated user passed, no response carried
+   another user's nonce, and p95 latency stayed within `max_slowdown` of the
+   serial baseline;
 4. on nightly/release, the route's server evidence resolves to a final usage
    receipt bound to the pinned channel and observed request ids.
 

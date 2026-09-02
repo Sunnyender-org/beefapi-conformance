@@ -9,17 +9,29 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .clients import ClientCommand, assistant_text, resolve_binary
 from .model import CellResult, MatrixCell, TurnResult
 from .redact import redact
-from .wire import RecordingProxy, parse_sse, sse_text, termination, wire_summary
+from .wire import (
+    RecordingProxy,
+    crosstalk,
+    latency_stats,
+    parse_sse,
+    sse_text,
+    termination,
+    wire_summary,
+)
 from .wire import wire_verdict as _wire_verdict
 
 SERVER_EVIDENCE_FIELDS = {"status", "commit", "route", "terminal", "receipt", "usage"}
 PROXY_ADAPTERS = {"claude-code", "codex", "grok-build"}
+MARKER_BYTES = b"BEEFAPI_CONFORMANCE_FILE_OK\n"
 AGENT_V1_RESPONSE_ID = re.compile(
     r'"id"\s*:\s*"resp_bf_agentv1_u[0-9]+_c[0-9]+_([A-Za-z0-9]+)"'
 )
@@ -27,6 +39,33 @@ AGENT_V1_RESPONSE_ID = re.compile(
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+@dataclass
+class _Worker:
+    """One logical user in a cell: its own nonce, workspace, and outcome."""
+
+    index: int
+    nonce: str
+    turns: list[TurnResult] = field(default_factory=list)
+    answers: list[str] = field(default_factory=list)
+    request_ids: set[str] = field(default_factory=set)
+    duration_ms: int = 0
+
+    @property
+    def passed(self) -> bool:
+        return bool(self.turns) and all(item.status == "pass" for item in self.turns)
+
+
+def _nonce(index: int) -> str:
+    return f"BEEFAPI-NONCE-{uuid.uuid4().hex[:8].upper()}-{index}"
+
+
+def _render(text: str, nonce: str, workspace: Path | None = None) -> str:
+    text = text.replace("{{nonce}}", nonce)
+    if workspace is not None:
+        text = text.replace("{{workspace}}", str(workspace))
+    return text
 
 
 def run_cell(
@@ -96,112 +135,58 @@ def run_cell(
         with tempfile.TemporaryDirectory(
             prefix="beefapi-conformance-", ignore_cleanup_errors=True
         ) as tmp:
-            root = Path(tmp)
-            workspace = root / "workspace"
-            workspace.mkdir()
-            marker_bytes = b"BEEFAPI_CONFORMANCE_FILE_OK\n"
-            (workspace / "marker.txt").write_bytes(marker_bytes)
             token = _request_token(cell, base_token)
             client_base_url = proxy.base_url if proxy else base_url
-            command = ClientCommand(cell, binary, root, token, client_base_url)
-            command.prepare()
-            env = command.environment()
-            turn_results: list[TurnResult] = []
-            observed_request_ids: set[str] = set()
-            for index, turn in enumerate(cell.scenario.turns, 1):
-                turn_started = time.monotonic()
-                try:
-                    prompt = turn.prompt.replace("{{workspace}}", str(workspace))
-                    # stdin must be closed: codex exec (and potentially other
-                    # headless clients) block waiting for piped stdin input.
-                    completed = subprocess.run(
-                        command.command(prompt, index),
-                        cwd=workspace,
-                        env=env,
-                        text=True,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT,
-                        timeout=cell.scenario.timeout_seconds,
-                        check=False,
-                    )
-                    output = redact(completed.stdout or "", (token or "",))
-                    observed_request_ids.update(AGENT_V1_RESPONSE_ID.findall(output))
-                    command.observe_output(output)
-                    missing = [
-                        event for event in turn.expected_events if event not in output
-                    ]
-                    missing.extend(
-                        "any:" + "|".join(group)
-                        for group in turn.expected_any_events
-                        if not any(event in output for event in group)
-                    )
-                    answer = assistant_text(cell.client.adapter, output)
-                    status = (
-                        "pass"
-                        if completed.returncode == 0
-                        and turn.marker in answer
-                        and not missing
-                        else "fail"
-                    )
-                    turn_results.append(
-                        TurnResult(
-                            index=index,
-                            status=status,
-                            duration_ms=int((time.monotonic() - turn_started) * 1000),
-                            returncode=completed.returncode,
-                            marker=turn.marker,
-                            missing_events=missing,
-                            output_tail=output[-4000:],
+            workers = [
+                _Worker(index, _nonce(index))
+                for index in range(1, cell.scenario.concurrency + 1)
+            ]
+            if len(workers) == 1:
+                _run_client_worker(
+                    cell, workers[0], binary, Path(tmp), token, client_base_url
+                )
+            else:
+                with ThreadPoolExecutor(max_workers=len(workers)) as pool:
+                    list(
+                        pool.map(
+                            lambda worker: _run_client_worker(
+                                cell,
+                                worker,
+                                binary,
+                                Path(tmp) / f"user-{worker.index}",
+                                token,
+                                client_base_url,
+                            ),
+                            workers,
                         )
                     )
-                    if status != "pass":
-                        break
-                except subprocess.TimeoutExpired as exc:
-                    raw = exc.stdout if isinstance(exc.stdout, str) else ""
-                    turn_results.append(
-                        TurnResult(
-                            index,
-                            "fail",
-                            int((time.monotonic() - turn_started) * 1000),
-                            None,
-                            turn.marker,
-                            ["terminal"],
-                            redact(raw, (token or "",))[-4000:],
-                        )
-                    )
-                    break
-                except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-                    turn_results.append(
-                        TurnResult(
-                            index,
-                            "fail",
-                            int((time.monotonic() - turn_started) * 1000),
-                            None,
-                            turn.marker,
-                            ["client_execution"],
-                            redact(str(exc), (token or "",))[-4000:],
-                        )
-                    )
-                    break
-            status = (
-                "pass"
-                if len(turn_results) == len(cell.scenario.turns)
-                and all(item.status == "pass" for item in turn_results)
-                else "fail"
-            )
+            turn_results = [turn for worker in workers for turn in worker.turns]
+            observed_request_ids = set().union(*(w.request_ids for w in workers))
+            status = "pass" if all(worker.passed for worker in workers) else "fail"
             detail = ""
             evidence: dict[str, object] = {
-                "workspace_marker_sha256": hashlib.sha256(marker_bytes).hexdigest(),
+                "workspace_marker_sha256": hashlib.sha256(MARKER_BYTES).hexdigest(),
                 "route_auth_mode": cell.route.auth_mode,
             }
+            if len(workers) > 1:
+                problems = crosstalk(
+                    {worker.nonce: "\n".join(worker.answers) for worker in workers}
+                )
+                evidence["concurrency"] = {
+                    "users": len(workers),
+                    "passed": sum(1 for worker in workers if worker.passed),
+                    "latency": latency_stats([w.duration_ms for w in workers]),
+                    "crosstalk": problems,
+                }
+                if problems and status == "pass":
+                    status = "fail"
+                    detail = "concurrent responses leaked across users"
             if proxy:
                 exchanges = proxy.exchanges()
-                verdict = _wire_verdict(exchanges, cell.scenario.expect_wire)
-                evidence["wire"] = {
-                    **wire_summary(exchanges),
-                    "verdict": verdict,
-                }
+                verdict = _wire_verdict(
+                    exchanges, cell.scenario.expect_wire, cell.scenario.concurrency
+                )
+                evidence["wire"] = {**wire_summary(exchanges), "verdict": verdict}
                 if status == "pass" and verdict["status"] != "pass":
                     status = "fail"
                     detail = f"wire evidence failed: {verdict['detail']}"
@@ -233,6 +218,182 @@ def run_cell(
     finally:
         if proxy:
             proxy.stop()
+
+
+def _run_client_worker(
+    cell: MatrixCell,
+    worker: _Worker,
+    binary: str,
+    root: Path,
+    token: str | None,
+    base_url: str | None,
+) -> None:
+    """Drive one real client session through every turn of the scenario."""
+    worker_started = time.monotonic()
+    workspace = root / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "marker.txt").write_bytes(MARKER_BYTES)
+    command = ClientCommand(cell, binary, root, token, base_url)
+    command.prepare()
+    env = command.environment()
+    for index, turn in enumerate(cell.scenario.turns, 1):
+        turn_started = time.monotonic()
+        marker = _render(turn.marker, worker.nonce)
+        try:
+            prompt = _render(turn.prompt, worker.nonce, workspace)
+            # stdin must be closed: codex exec (and potentially other
+            # headless clients) block waiting for piped stdin input.
+            completed = subprocess.run(
+                command.command(prompt, index),
+                cwd=workspace,
+                env=env,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=cell.scenario.timeout_seconds,
+                check=False,
+            )
+            output = redact(completed.stdout or "", (token or "",))
+            worker.request_ids.update(AGENT_V1_RESPONSE_ID.findall(output))
+            command.observe_output(output)
+            missing = [event for event in turn.expected_events if event not in output]
+            missing.extend(
+                "any:" + "|".join(group)
+                for group in turn.expected_any_events
+                if not any(event in output for event in group)
+            )
+            answer = assistant_text(cell.client.adapter, output)
+            worker.answers.append(answer)
+            status = (
+                "pass"
+                if completed.returncode == 0 and marker in answer and not missing
+                else "fail"
+            )
+            worker.turns.append(
+                TurnResult(
+                    index=index,
+                    status=status,
+                    duration_ms=int((time.monotonic() - turn_started) * 1000),
+                    returncode=completed.returncode,
+                    marker=marker,
+                    missing_events=missing,
+                    output_tail=output[-4000:],
+                )
+            )
+            if status != "pass":
+                break
+        except subprocess.TimeoutExpired as exc:
+            raw = exc.stdout if isinstance(exc.stdout, str) else ""
+            worker.turns.append(
+                TurnResult(
+                    index,
+                    "fail",
+                    int((time.monotonic() - turn_started) * 1000),
+                    None,
+                    marker,
+                    ["terminal"],
+                    redact(raw, (token or "",))[-4000:],
+                )
+            )
+            break
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            worker.turns.append(
+                TurnResult(
+                    index,
+                    "fail",
+                    int((time.monotonic() - turn_started) * 1000),
+                    None,
+                    marker,
+                    ["client_execution"],
+                    redact(str(exc), (token or "",))[-4000:],
+                )
+            )
+            break
+    worker.duration_ms = int((time.monotonic() - worker_started) * 1000)
+
+
+@dataclass
+class _HttpOutcome:
+    status_code: int | None
+    request_id: str | None
+    output: str
+    text: str
+    duration_ms: int
+    stream_detail: str
+
+
+def _http_request(cell: MatrixCell, base_url: str, token: str | None, prompt: str):
+    model = cell.model.client_model(cell.client.id)
+    payload = _http_payload(cell, model, prompt)
+    request = urllib.request.Request(
+        base_url.rstrip("/") + cell.scenario.http_endpoint,
+        data=json.dumps(payload).encode(),
+        headers=_http_headers(cell.scenario.protocol, token),
+        method="POST",
+    )
+    started = time.monotonic()
+    status_code: int | None = None
+    request_id: str | None = None
+    try:
+        with urllib.request.urlopen(
+            request, timeout=cell.scenario.timeout_seconds
+        ) as response:
+            status_code = response.status
+            request_id = response.headers.get("X-Oneapi-Request-Id")
+            output = response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        status_code = exc.code
+        request_id = exc.headers.get("X-Oneapi-Request-Id") if exc.headers else None
+        output = exc.read().decode("utf-8", "replace")
+    except (OSError, TimeoutError) as exc:
+        output = str(exc)
+    duration_ms = int((time.monotonic() - started) * 1000)
+    stream_detail = ""
+    if cell.scenario.stream:
+        events = parse_sse(output)
+        text = sse_text(cell.scenario.protocol, events)
+        ended = termination(
+            [name for name, _ in events],
+            any(data == "[DONE]" for _, data in events),
+        )
+        if ended != "clean":
+            stream_detail = f"stream terminated {ended}"
+    else:
+        text = _http_response_text(cell.scenario.protocol, output)
+    return _HttpOutcome(
+        status_code, request_id, output, text, duration_ms, stream_detail
+    )
+
+
+def _grade_http(
+    cell: MatrixCell, outcome: _HttpOutcome, marker: str, token: str | None, index: int
+) -> TurnResult:
+    turn = cell.scenario.turns[0]
+    sanitized = redact(outcome.output, (token or "",))
+    missing = [item for item in turn.expected_events if item not in sanitized]
+    missing.extend(
+        "any:" + "|".join(group)
+        for group in turn.expected_any_events
+        if not any(event in sanitized for event in group)
+    )
+    if outcome.stream_detail:
+        missing.append(outcome.stream_detail)
+    passed = (
+        outcome.status_code is not None
+        and 200 <= outcome.status_code < 300
+        and marker in outcome.text
+        and not missing
+    )
+    return TurnResult(
+        index,
+        "pass" if passed else "fail",
+        outcome.duration_ms,
+        outcome.status_code,
+        marker,
+        missing,
+        sanitized[-4000:],
+    )
 
 
 def _run_http_cell(
@@ -271,98 +432,82 @@ def _run_http_cell(
         )
     turn = cell.scenario.turns[0]
     token = _request_token(cell, base_token)
-    model = cell.model.client_model(cell.client.id)
-    payload = _http_payload(cell, model, turn.prompt)
-    headers = _http_headers(cell.scenario.protocol, token)
-    request = urllib.request.Request(
-        base_url.rstrip("/") + cell.scenario.http_endpoint,
-        data=json.dumps(payload).encode(),
-        headers=headers,
-        method="POST",
-    )
-    turn_started = time.monotonic()
-    status_code: int | None = None
-    response_request_id: str | None = None
-    try:
-        with urllib.request.urlopen(
-            request, timeout=cell.scenario.timeout_seconds
-        ) as response:
-            status_code = response.status
-            response_request_id = response.headers.get("X-Oneapi-Request-Id")
-            output = response.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as exc:
-        status_code = exc.code
-        response_request_id = (
-            exc.headers.get("X-Oneapi-Request-Id") if exc.headers else None
-        )
-        output = exc.read().decode("utf-8", "replace")
-    except (OSError, TimeoutError) as exc:
-        output = str(exc)
-    sanitized = redact(output, (token or "",))
-    stream_detail = ""
-    if cell.scenario.stream:
-        events = parse_sse(output)
-        response_text = sse_text(cell.scenario.protocol, events)
-        ended = termination(
-            [name for name, _ in events],
-            any(data == "[DONE]" for _, data in events),
-        )
-        if ended != "clean":
-            stream_detail = f"stream terminated {ended}"
-    else:
-        response_text = _http_response_text(cell.scenario.protocol, output)
-    missing = [item for item in turn.expected_events if item not in sanitized]
-    missing.extend(
-        "any:" + "|".join(group)
-        for group in turn.expected_any_events
-        if not any(event in sanitized for event in group)
-    )
-    if stream_detail:
-        missing.append(stream_detail)
-    passed = (
-        status_code is not None
-        and 200 <= status_code < 300
-        and turn.marker in response_text
-        and not missing
-    )
-    result = TurnResult(
-        1,
-        "pass" if passed else "fail",
-        int((time.monotonic() - turn_started) * 1000),
-        status_code,
-        turn.marker,
-        missing,
-        sanitized[-4000:],
-    )
-    server_evidence = _server_evidence(
-        cell,
-        base_token,
-        started_epoch,
-        evidence_fence,
-        {response_request_id} if response_request_id else None,
-    )
-    evidence = {
-        "http_status": status_code,
-        "route_auth_mode": cell.route.auth_mode,
-        "server_evidence": server_evidence,
-    }
+    concurrency = cell.scenario.concurrency
+    nonces = [_nonce(index) for index in range(1, concurrency + 1)]
+    evidence: dict[str, object] = {"route_auth_mode": cell.route.auth_mode}
     detail = ""
+
+    if concurrency == 1:
+        outcome = _http_request(cell, base_url, token, _render(turn.prompt, nonces[0]))
+        results = [
+            _grade_http(cell, outcome, _render(turn.marker, nonces[0]), token, 1)
+        ]
+        outcomes = [outcome]
+        evidence["http_status"] = outcome.status_code
+    else:
+        # A serial baseline request first, then the concurrent burst. The
+        # baseline is what one user sees alone; the burst is what they see
+        # when everyone else is online.
+        baseline = _http_request(cell, base_url, token, _render(turn.prompt, _nonce(0)))
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            outcomes = list(
+                pool.map(
+                    lambda nonce: _http_request(
+                        cell, base_url, token, _render(turn.prompt, nonce)
+                    ),
+                    nonces,
+                )
+            )
+        results = [
+            _grade_http(cell, outcome, _render(turn.marker, nonce), token, index)
+            for index, (outcome, nonce) in enumerate(zip(outcomes, nonces), 1)
+        ]
+        stats = latency_stats([item.duration_ms for item in outcomes])
+        slowdown = (
+            round(stats["p95_ms"] / baseline.duration_ms, 2)
+            if baseline.duration_ms
+            else None
+        )
+        problems = crosstalk(dict(zip(nonces, (item.text for item in outcomes))))
+        evidence["concurrency"] = {
+            "users": concurrency,
+            "passed": sum(1 for item in results if item.status == "pass"),
+            "baseline_ms": baseline.duration_ms,
+            "baseline_status": baseline.status_code,
+            "latency": stats,
+            "p95_slowdown": slowdown,
+            "crosstalk": problems,
+            "http_statuses": sorted({str(item.status_code) for item in outcomes}),
+        }
+        if problems:
+            detail = "concurrent responses leaked across users"
+        elif (
+            cell.scenario.max_slowdown
+            and slowdown is not None
+            and slowdown > cell.scenario.max_slowdown
+        ):
+            detail = (
+                f"p95 under load is {slowdown}x the serial baseline "
+                f"(limit {cell.scenario.max_slowdown}x)"
+            )
+    status = "pass" if all(item.status == "pass" for item in results) else "fail"
+    if detail:
+        status = "fail"
+
+    request_ids = {item.request_id for item in outcomes if item.request_id}
+    server_evidence = _server_evidence(
+        cell, base_token, started_epoch, evidence_fence, request_ids or None
+    )
+    evidence["server_evidence"] = server_evidence
     if (
         require_server_evidence
         and cell.route.release_evidence_required
         and server_evidence.get("status") != "pass"
     ):
-        result.status = "fail"
-        detail = "this tier requires passing server evidence"
+        status = "fail"
+        detail = detail or "this tier requires passing server evidence"
     return _result(
-        cell,
-        result.status,
-        started_at,
-        started,
-        "python-urllib",
-        [result],
-        detail,
-        evidence,
+        cell, status, started_at, started, "python-urllib", results, detail, evidence
     )
 
 

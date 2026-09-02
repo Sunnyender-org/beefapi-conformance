@@ -31,7 +31,14 @@ Scenarios are organized around the ways routes fail in real use:
 | `web-search` | merge | web search tool not offered to or not usable by the client |
 | `messages-tool-call` | merge | streamed tool_use blocks and argument deltas |
 | `messages-web-search-tool` | merge | gateway rejects or swallows the server web_search tool |
+| `messages/responses-concurrent` | merge | 8 simultaneous users: crosstalk between streams, 429/5xx under load, p95 collapse |
+| `concurrent-users` | merge | 3 real client sessions at once through the recording proxy |
 | `session-resume` | nightly | session continuation across turns |
+
+Concurrent scenarios give every simulated user a unique nonce and fail if any
+response contains another user's nonce (stream interleaving), if any request
+does not stream to a clean terminal, or if p95 latency under load exceeds
+`max_slowdown` times a serial baseline taken just before the burst.
 
 Native clients keep their default tool surface — the suite must observe the
 request shape a real user session produces, not a stripped-down variant.

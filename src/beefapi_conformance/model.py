@@ -307,6 +307,7 @@ class Scenario:
     concurrency: int = 1
     max_slowdown: float | None = None
     history_source: HistorySource | None = None
+    max_turn_ms: int | None = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Scenario:
@@ -372,6 +373,9 @@ class Scenario:
             history_source = HistorySource.parse(
                 raw["history_source"], raw.get("protocol")
             )
+        max_turn_ms = raw.get("max_turn_ms")
+        if max_turn_ms is not None and int(max_turn_ms) <= 0:
+            raise ContractError("scenario.max_turn_ms must be positive")
         return cls(
             id=_required(raw, "id"),
             name=_required(raw, "name"),
@@ -393,6 +397,7 @@ class Scenario:
             concurrency=concurrency,
             max_slowdown=max_slowdown,
             history_source=history_source,
+            max_turn_ms=int(max_turn_ms) if max_turn_ms is not None else None,
         )
 
 

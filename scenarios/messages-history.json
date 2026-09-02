@@ -930,7 +930,8 @@
           "marker": "BEEFAPI_THINKING_ROUNDTRIP_OK",
           "expected_events": []
         }
-      ]
+      ],
+      "max_turn_ms": 30000
     },
     {
       "id": "history-thinking-cross-model",
@@ -959,7 +960,8 @@
           "marker": "BEEFAPI_THINKING_CROSS_MODEL_OK",
           "expected_events": []
         }
-      ]
+      ],
+      "max_turn_ms": 30000
     },
     {
       "id": "history-thinking-cross-route",
@@ -988,7 +990,8 @@
           "marker": "BEEFAPI_THINKING_CROSS_ROUTE_OK",
           "expected_events": []
         }
-      ]
+      ],
+      "max_turn_ms": 30000
     }
   ]
 }

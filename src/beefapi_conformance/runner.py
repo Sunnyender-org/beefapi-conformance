@@ -574,6 +574,10 @@ def _grade_http(
     )
     if outcome.stream_detail:
         missing.append(outcome.stream_detail)
+    # Hidden upstream retries never show on the wire; they only show as time.
+    limit = cell.scenario.max_turn_ms
+    if limit is not None and outcome.duration_ms > limit:
+        missing.append(f"turn took {outcome.duration_ms}ms, limit {limit}ms")
     passed = (
         outcome.status_code is not None
         and 200 <= outcome.status_code < 300

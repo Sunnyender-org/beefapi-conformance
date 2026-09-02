@@ -483,6 +483,19 @@ def _seed_history(
         evidence["block_types"] = [
             item.get("type") for item in content if isinstance(item, dict)
         ]
+        # A thinking round-trip only proves something if the seed actually
+        # carried a signed thinking block; a text-only seed is a silent no-op.
+        if source.thinking:
+            signed = [
+                item
+                for item in content
+                if isinstance(item, dict)
+                and item.get("type") == "thinking"
+                and item.get("signature")
+            ]
+            evidence["signed_thinking_blocks"] = len(signed)
+            if not signed:
+                return None, evidence, "history seed returned no signed thinking block"
         payload: dict[str, object] = {
             "model": target_model,
             "max_tokens": 2048,
@@ -521,6 +534,11 @@ def _seed_history(
         item.get("type") for item in output_items if isinstance(item, dict)
     ]
     evidence["response_id"] = response_id
+    if source.thinking and not any(
+        isinstance(item, dict) and item.get("type") == "reasoning"
+        for item in output_items
+    ):
+        return None, evidence, "history seed returned no reasoning item"
     if source.mode == "previous_response_id":
         payload = {
             "model": target_model,

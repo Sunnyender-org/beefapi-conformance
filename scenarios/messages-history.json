@@ -867,7 +867,7 @@
     },
     {
       "id": "thinking-stream",
-      "name": "Extended thinking enabled: request accepted and streams cleanly (thinking blocks emitted where the route supports them)",
+      "name": "Extended thinking: signed thinking blocks stream before the answer",
       "tier": "pr",
       "kind": "http",
       "protocol": "messages",
@@ -898,7 +898,10 @@
         {
           "prompt": "Think briefly about why the sky is blue, then reply exactly BEEFAPI_THINKING_OK.",
           "marker": "BEEFAPI_THINKING_OK",
-          "expected_events": []
+          "expected_events": [
+            "\"type\":\"thinking\"",
+            "signature_delta"
+          ]
         }
       ]
     },

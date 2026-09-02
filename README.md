@@ -36,6 +36,40 @@ Scenarios are organized around the ways routes fail in real use:
 | `concurrent-tool-loop` | nightly | 2 real client sessions running multi-step tool loops simultaneously |
 | `session-resume` | nightly | session continuation across turns |
 
+### History shapes (where routes actually break)
+
+Real clients replay long histories, and every content-block type is a separate
+branch in a gateway's history transform. `scenarios/messages-history.json` and
+`scenarios/responses-history.json` exercise each branch on its own so a failure
+names the exact shape: `tool_result` with image blocks, `is_error` results,
+parallel tool calls, system block arrays with `cache_control`, user-pasted
+images, 40-turn tool loops, function_call/output replay, and stateful
+`previous_response_id`.
+
+Two-phase `history_source` scenarios first obtain a **real** response (with
+thinking/reasoning blocks and signatures) from a route or model, then feed it
+back as history — optionally to a *different* route or model. This is what a
+client does when the user switches routing group or model mid-session; set
+`history_route` / `history_model` on a route manifest to enable the
+cross-route and cross-model variants.
+
+### Promoting real traffic into fixtures
+
+```bash
+python -m beefapi_conformance run --tier merge --client claude-code \
+  --scenario tool-loop --allow-local-tools --capture-wire reports/captures ...
+python -m beefapi_conformance promote-capture \
+  reports/captures/<cell>.jsonl --id captured-claude-code-tool-loop \
+  > scenarios/captured-claude-code.json
+```
+
+`--capture-wire` stores the full redacted request/response bodies seen by the
+recording proxy (base64 media collapsed to size placeholders).
+`promote-capture` turns one of them into a pr-tier replay scenario, so the
+suite carries the exact system prompt, tool schemas, cache_control and history
+that a released client version emits — new block types show up here before
+they show up as user-facing 422s.
+
 Concurrent scenarios give every simulated user a unique nonce and fail if any
 response contains another user's nonce (stream interleaving), if any request
 does not stream to a clean terminal, or if p95 latency under load exceeds

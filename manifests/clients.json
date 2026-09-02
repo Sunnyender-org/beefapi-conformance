@@ -4,46 +4,133 @@
       "id": "raw-http",
       "name": "Raw API protocol",
       "adapter": "raw-http",
-      "binary_candidates": ["python3"],
-      "version_args": ["--version"],
-      "platforms": ["darwin", "linux", "windows"],
-      "capabilities": ["text", "stream", "tool.custom", "tool.web", "responses", "messages", "chat"]
+      "binary_candidates": [
+        "python3"
+      ],
+      "version_args": [
+        "--version"
+      ],
+      "platforms": [
+        "darwin",
+        "linux",
+        "windows"
+      ],
+      "capabilities": [
+        "text",
+        "stream",
+        "tool.custom",
+        "tool.web",
+        "responses",
+        "messages",
+        "chat",
+        "thinking",
+        "reasoning",
+        "responses.stateful",
+        "cross_model_history",
+        "cross_route_history"
+      ]
     },
     {
       "id": "claude-code",
       "name": "Claude Code",
       "adapter": "claude-code",
-      "binary_candidates": ["claude"],
-      "version_args": ["--version"],
-      "platforms": ["darwin", "linux", "windows"],
-      "capabilities": ["text", "stream", "tool.shell", "tool.web", "session.resume"]
+      "binary_candidates": [
+        "claude"
+      ],
+      "version_args": [
+        "--version"
+      ],
+      "platforms": [
+        "darwin",
+        "linux",
+        "windows"
+      ],
+      "capabilities": [
+        "text",
+        "stream",
+        "tool.shell",
+        "tool.web",
+        "session.resume"
+      ]
     },
     {
       "id": "codex-cli",
       "name": "Codex CLI",
       "adapter": "codex",
-      "binary_candidates": ["codex"],
-      "version_args": ["--version"],
-      "platforms": ["darwin", "linux", "windows"],
-      "capabilities": ["text", "stream", "tool.shell", "tool.web", "session.resume", "responses"]
+      "binary_candidates": [
+        "codex"
+      ],
+      "version_args": [
+        "--version"
+      ],
+      "platforms": [
+        "darwin",
+        "linux",
+        "windows"
+      ],
+      "capabilities": [
+        "text",
+        "stream",
+        "tool.shell",
+        "tool.web",
+        "session.resume",
+        "responses",
+        "thinking",
+        "reasoning",
+        "responses.stateful"
+      ]
     },
     {
       "id": "grok-build",
       "name": "Grok Build",
       "adapter": "grok-build",
-      "binary_candidates": ["grok"],
-      "version_args": ["--version"],
-      "platforms": ["darwin", "linux", "windows"],
-      "capabilities": ["text", "stream", "tool.shell", "tool.web", "session.resume", "responses"]
+      "binary_candidates": [
+        "grok"
+      ],
+      "version_args": [
+        "--version"
+      ],
+      "platforms": [
+        "darwin",
+        "linux",
+        "windows"
+      ],
+      "capabilities": [
+        "text",
+        "stream",
+        "tool.shell",
+        "tool.web",
+        "session.resume",
+        "responses",
+        "thinking",
+        "reasoning",
+        "responses.stateful"
+      ]
     },
     {
       "id": "workbuddy-cli",
       "name": "WorkBuddy CodeBuddy CLI",
       "adapter": "workbuddy",
-      "binary_candidates": ["codebuddy", "cbc", "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"],
-      "version_args": ["--version"],
-      "platforms": ["darwin", "linux", "windows"],
-      "capabilities": ["text", "stream", "tool.shell", "tool.web", "session.resume"]
+      "binary_candidates": [
+        "codebuddy",
+        "cbc",
+        "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"
+      ],
+      "version_args": [
+        "--version"
+      ],
+      "platforms": [
+        "darwin",
+        "linux",
+        "windows"
+      ],
+      "capabilities": [
+        "text",
+        "stream",
+        "tool.shell",
+        "tool.web",
+        "session.resume"
+      ]
     }
   ]
 }

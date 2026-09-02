@@ -1,0 +1,991 @@
+{
+  "scenarios": [
+    {
+      "id": "history-tool-result-image",
+      "name": "History: tool_result content mixing text and image blocks (Claude Code screenshot)",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": [
+        "messages",
+        "stream",
+        "tool.custom"
+      ],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 256,
+        "tools": [
+          {
+            "name": "take_screenshot",
+            "description": "Capture the current browser viewport.",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "Take a screenshot of the page."
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Capturing the viewport now."
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_hist_img_01",
+                "name": "take_screenshot",
+                "input": {}
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_hist_img_01",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "Screenshot captured (1x1 test pixel)."
+                  },
+                  {
+                    "type": "image",
+                    "source": {
+                      "type": "base64",
+                      "media_type": "image/png",
+                      "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "{{prompt}}"
+          }
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "Reply exactly BEEFAPI_HISTORY_IMAGE_OK.",
+          "marker": "BEEFAPI_HISTORY_IMAGE_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "history-tool-result-error",
+      "name": "History: tool_result with is_error true",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": [
+        "messages",
+        "stream",
+        "tool.custom"
+      ],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 256,
+        "tools": [
+          {
+            "name": "run_command",
+            "description": "Run a shell command.",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "List the directory."
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_hist_err_01",
+                "name": "run_command",
+                "input": {
+                  "command": "ls /nonexistent"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_hist_err_01",
+                "is_error": true,
+                "content": "ls: /nonexistent: No such file or directory"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "{{prompt}}"
+          }
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "Reply exactly BEEFAPI_HISTORY_ERROR_OK.",
+          "marker": "BEEFAPI_HISTORY_ERROR_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "history-parallel-tools",
+      "name": "History: multiple tool_use in one assistant turn with matching tool_results",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": [
+        "messages",
+        "stream",
+        "tool.custom"
+      ],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 256,
+        "tools": [
+          {
+            "name": "read_file",
+            "description": "Read a file.",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "Read a.txt and b.txt."
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Reading both files in parallel."
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_hist_par_01",
+                "name": "read_file",
+                "input": {
+                  "path": "a.txt"
+                }
+              },
+              {
+                "type": "tool_use",
+                "id": "toolu_hist_par_02",
+                "name": "read_file",
+                "input": {
+                  "path": "b.txt"
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_hist_par_01",
+                "content": "alpha"
+              },
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_hist_par_02",
+                "content": "beta"
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": "{{prompt}}"
+          }
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "Reply exactly BEEFAPI_HISTORY_PARALLEL_OK.",
+          "marker": "BEEFAPI_HISTORY_PARALLEL_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "history-system-blocks-cache",
+      "name": "History: system as block array with cache_control on system, tools and messages",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": [
+        "messages",
+        "stream",
+        "tool.custom"
+      ],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 256,
+        "system": [
+          {
+            "type": "text",
+            "text": "You are a coding assistant running inside a CLI. Follow instructions exactly."
+          },
+          {
+            "type": "text",
+            "text": "Workspace context: a small Python project.",
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "tools": [
+          {
+            "name": "noop",
+            "description": "Does nothing.",
+            "input_schema": {
+              "type": "object",
+              "properties": {}
+            },
+            "cache_control": {
+              "type": "ephemeral"
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Hello.",
+                "cache_control": {
+                  "type": "ephemeral"
+                }
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": "Hello! How can I help?"
+          },
+          {
+            "role": "user",
+            "content": "{{prompt}}"
+          }
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "Reply exactly BEEFAPI_HISTORY_CACHE_OK.",
+          "marker": "BEEFAPI_HISTORY_CACHE_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "history-user-image",
+      "name": "History: user message with pasted image block",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": [
+        "messages",
+        "stream"
+      ],
+      "timeout_seconds": 120,
+      "requires_local_tools": false,
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 256,
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "image",
+                "source": {
+                  "type": "base64",
+                  "media_type": "image/png",
+                  "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+                }
+              },
+              {
+                "type": "text",
+                "text": "This is a 1x1 test pixel. Acknowledge it."
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": "Acknowledged: a 1x1 pixel image."
+          },
+          {
+            "role": "user",
+            "content": "{{prompt}}"
+          }
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "Reply exactly BEEFAPI_HISTORY_USER_IMAGE_OK.",
+          "marker": "BEEFAPI_HISTORY_USER_IMAGE_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "history-long-conversation",
+      "name": "History: 40-turn conversation with tool loops replayed in full",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": [
+        "messages",
+        "stream",
+        "tool.custom"
+      ],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 256,
+        "tools": [
+          {
+            "name": "counter",
+            "description": "Increment a counter.",
+            "input_schema": {
+              "type": "object",
+              "properties": {
+                "n": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "n"
+              ]
+            }
+          }
+        ],
+        "messages": [
+          {
+            "role": "user",
+            "content": "Count from 1 to 10 using the counter tool, one call per number."
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_01",
+                "name": "counter",
+                "input": {
+                  "n": 1
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_01",
+                "content": "1"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_02",
+                "name": "counter",
+                "input": {
+                  "n": 2
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_02",
+                "content": "2"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_03",
+                "name": "counter",
+                "input": {
+                  "n": 3
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_03",
+                "content": "3"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_04",
+                "name": "counter",
+                "input": {
+                  "n": 4
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_04",
+                "content": "4"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_05",
+                "name": "counter",
+                "input": {
+                  "n": 5
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_05",
+                "content": "5"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_06",
+                "name": "counter",
+                "input": {
+                  "n": 6
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_06",
+                "content": "6"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_07",
+                "name": "counter",
+                "input": {
+                  "n": 7
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_07",
+                "content": "7"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_08",
+                "name": "counter",
+                "input": {
+                  "n": 8
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_08",
+                "content": "8"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_09",
+                "name": "counter",
+                "input": {
+                  "n": 9
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_09",
+                "content": "9"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_10",
+                "name": "counter",
+                "input": {
+                  "n": 10
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_10",
+                "content": "10"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": "Done counting to 10."
+          },
+          {
+            "role": "user",
+            "content": "Now count 11 to 20 the same way."
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_11",
+                "name": "counter",
+                "input": {
+                  "n": 11
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_11",
+                "content": "11"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_12",
+                "name": "counter",
+                "input": {
+                  "n": 12
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_12",
+                "content": "12"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_13",
+                "name": "counter",
+                "input": {
+                  "n": 13
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_13",
+                "content": "13"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_14",
+                "name": "counter",
+                "input": {
+                  "n": 14
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_14",
+                "content": "14"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_15",
+                "name": "counter",
+                "input": {
+                  "n": 15
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_15",
+                "content": "15"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_16",
+                "name": "counter",
+                "input": {
+                  "n": 16
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_16",
+                "content": "16"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_17",
+                "name": "counter",
+                "input": {
+                  "n": 17
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_17",
+                "content": "17"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "tool_use",
+                "id": "toolu_long_18",
+                "name": "counter",
+                "input": {
+                  "n": 18
+                }
+              }
+            ]
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "tool_result",
+                "tool_use_id": "toolu_long_18",
+                "content": "18"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": "Counted to 18 so far."
+          },
+          {
+            "role": "user",
+            "content": "{{prompt}}"
+          }
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "Stop counting. Reply exactly BEEFAPI_HISTORY_LONG_OK.",
+          "marker": "BEEFAPI_HISTORY_LONG_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "thinking-stream",
+      "name": "Extended thinking enabled: request accepted and streams cleanly (thinking blocks emitted where the route supports them)",
+      "tier": "pr",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": [
+        "messages",
+        "stream",
+        "thinking"
+      ],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "http_payload": {
+        "model": "{{model}}",
+        "max_tokens": 2048,
+        "thinking": {
+          "type": "enabled",
+          "budget_tokens": 1024
+        },
+        "messages": [
+          {
+            "role": "user",
+            "content": "{{prompt}}"
+          }
+        ]
+      },
+      "turns": [
+        {
+          "prompt": "Think briefly about why the sky is blue, then reply exactly BEEFAPI_THINKING_OK.",
+          "marker": "BEEFAPI_THINKING_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "history-thinking-roundtrip",
+      "name": "History: real thinking blocks with signatures from this route replayed to this route",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": [
+        "messages",
+        "stream",
+        "thinking"
+      ],
+      "timeout_seconds": 240,
+      "requires_local_tools": false,
+      "history_source": {
+        "seed_prompt": "Think briefly, then say hello in one short sentence.",
+        "thinking": true
+      },
+      "turns": [
+        {
+          "prompt": "Reply exactly BEEFAPI_THINKING_ROUNDTRIP_OK.",
+          "marker": "BEEFAPI_THINKING_ROUNDTRIP_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "history-thinking-cross-model",
+      "name": "History: thinking blocks produced by a different model replayed to this model (mid-session model switch)",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": [
+        "messages",
+        "stream",
+        "thinking",
+        "cross_model_history"
+      ],
+      "timeout_seconds": 240,
+      "requires_local_tools": false,
+      "history_source": {
+        "seed_prompt": "Think briefly, then say hello in one short sentence.",
+        "thinking": true,
+        "model": "{{history_model}}"
+      },
+      "turns": [
+        {
+          "prompt": "Reply exactly BEEFAPI_THINKING_CROSS_MODEL_OK.",
+          "marker": "BEEFAPI_THINKING_CROSS_MODEL_OK",
+          "expected_events": []
+        }
+      ]
+    },
+    {
+      "id": "history-thinking-cross-route",
+      "name": "History: thinking blocks produced by another route replayed to this route (mid-session group switch)",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "messages",
+      "http_endpoint": "/v1/messages",
+      "stream": true,
+      "required_capabilities": [
+        "messages",
+        "stream",
+        "thinking",
+        "cross_route_history"
+      ],
+      "timeout_seconds": 240,
+      "requires_local_tools": false,
+      "history_source": {
+        "seed_prompt": "Think briefly, then say hello in one short sentence.",
+        "thinking": true,
+        "route": "{{history_route}}"
+      },
+      "turns": [
+        {
+          "prompt": "Reply exactly BEEFAPI_THINKING_CROSS_ROUTE_OK.",
+          "marker": "BEEFAPI_THINKING_CROSS_ROUTE_OK",
+          "expected_events": []
+        }
+      ]
+    }
+  ]
+}

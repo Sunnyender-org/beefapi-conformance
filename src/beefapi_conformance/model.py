@@ -113,6 +113,8 @@ class Route:
     evidence_provider: str | None = None
     test_model: str | None = None
     channel_type: int | None = None
+    history_route: str | None = None
+    history_model: str | None = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Route:
@@ -135,6 +137,19 @@ class Route:
         evidence_provider = raw.get("evidence_provider")
         if evidence_provider not in {None, "beefapi_token_log"}:
             raise ContractError(f"route.evidence_provider invalid: {evidence_provider}")
+        capabilities = frozenset(
+            _strings(raw.get("capabilities"), "route.capabilities")
+        )
+        history_route = raw.get("history_route")
+        history_model = raw.get("history_model")
+        if "cross_route_history" in capabilities and not history_route:
+            raise ContractError(
+                "route.cross_route_history capability requires history_route"
+            )
+        if "cross_model_history" in capabilities and not history_model:
+            raise ContractError(
+                "route.cross_model_history capability requires history_model"
+            )
         return cls(
             id=_required(raw, "id"),
             name=_required(raw, "name"),
@@ -144,9 +159,7 @@ class Route:
             token_env=token_env,
             clients=frozenset(_strings(raw.get("clients"), "route.clients")),
             protocols=frozenset(_strings(raw.get("protocols"), "route.protocols")),
-            capabilities=frozenset(
-                _strings(raw.get("capabilities"), "route.capabilities")
-            ),
+            capabilities=capabilities,
             evidence_command_env=raw.get("evidence_command_env"),
             release_evidence_required=bool(raw.get("release_evidence_required", True)),
             group=raw.get("group"),
@@ -159,6 +172,8 @@ class Route:
                 if raw.get("channel_type") is not None
                 else None
             ),
+            history_route=history_route,
+            history_model=history_model,
         )
 
 
@@ -231,6 +246,47 @@ class Turn:
 
 
 WIRE_EXPECTATIONS = {"multi_request", "web_search_requested"}
+HISTORY_SOURCE_KEYS = {"route", "model", "seed_prompt", "thinking", "mode"}
+HISTORY_MODES = {"replay", "previous_response_id"}
+
+
+@dataclass(frozen=True)
+class HistorySource:
+    """Phase one of a two-phase HTTP scenario: obtain a real response from a
+    (possibly different) route/model and feed it back as conversation history.
+    This reproduces what a client does when the user switches routing groups
+    or models mid-session."""
+
+    seed_prompt: str
+    route: str | None = None
+    model: str | None = None
+    thinking: bool = False
+    mode: str = "replay"
+
+    @classmethod
+    def parse(cls, raw: Any, protocol: str | None) -> HistorySource:
+        if not isinstance(raw, dict) or not set(raw) <= HISTORY_SOURCE_KEYS:
+            raise ContractError(
+                f"scenario.history_source keys must be in {sorted(HISTORY_SOURCE_KEYS)}"
+            )
+        mode = str(raw.get("mode", "replay"))
+        if mode not in HISTORY_MODES:
+            raise ContractError(
+                f"history_source.mode must be in {sorted(HISTORY_MODES)}"
+            )
+        if mode == "previous_response_id" and protocol != "responses":
+            raise ContractError(
+                "previous_response_id mode requires the responses protocol"
+            )
+        if protocol not in {"messages", "responses"}:
+            raise ContractError("history_source supports messages and responses only")
+        return cls(
+            seed_prompt=_required(raw, "seed_prompt"),
+            route=raw.get("route"),
+            model=raw.get("model"),
+            thinking=bool(raw.get("thinking", False)),
+            mode=mode,
+        )
 
 
 @dataclass(frozen=True)
@@ -250,6 +306,7 @@ class Scenario:
     expect_wire: tuple[str, ...] = ()
     concurrency: int = 1
     max_slowdown: float | None = None
+    history_source: HistorySource | None = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Scenario:
@@ -306,6 +363,15 @@ class Scenario:
                 raise ContractError(
                     "scenario.max_slowdown must be > 1 on a concurrent scenario"
                 )
+        history_source = None
+        if raw.get("history_source") is not None:
+            if kind != "http" or concurrency != 1:
+                raise ContractError(
+                    "scenario.history_source requires a single-user HTTP scenario"
+                )
+            history_source = HistorySource.parse(
+                raw["history_source"], raw.get("protocol")
+            )
         return cls(
             id=_required(raw, "id"),
             name=_required(raw, "name"),
@@ -326,6 +392,7 @@ class Scenario:
             expect_wire=tuple(expect_wire),
             concurrency=concurrency,
             max_slowdown=max_slowdown,
+            history_source=history_source,
         )
 
 

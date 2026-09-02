@@ -20,6 +20,9 @@ CURSOR_CAPABILITIES = [
     "responses",
     "messages",
     "chat",
+    "thinking",
+    "reasoning",
+    "responses.stateful",
 ]
 CURSOR_AGENT_V1_CAPABILITIES = [
     "text",
@@ -30,6 +33,9 @@ CURSOR_AGENT_V1_CAPABILITIES = [
     "responses",
     "messages",
     "chat",
+    "thinking",
+    "reasoning",
+    "responses.stateful",
 ]
 
 

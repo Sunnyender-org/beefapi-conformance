@@ -19,6 +19,7 @@ from beefapi_conformance.matrix import compile_matrix
 from beefapi_conformance.model import (
     Client,
     ContractError,
+    HistorySource,
     MatrixCell,
     Model,
     Route,
@@ -31,6 +32,7 @@ from beefapi_conformance.runner import (
     _beefapi_token_log_evidence,
     _request_token,
     _usage_log_payload,
+    _write_capture,
     run_cell,
 )
 from beefapi_conformance.wire import (
@@ -227,6 +229,68 @@ class ContractTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ContractError, "max_slowdown"):
             Scenario.parse({**base, "max_slowdown": 3.0})
+        http = {
+            **base,
+            "kind": "http",
+            "protocol": "messages",
+            "http_endpoint": "/v1/messages",
+        }
+        with self.assertRaisesRegex(ContractError, "single-user HTTP"):
+            Scenario.parse({**base, "history_source": {"seed_prompt": "x"}})
+        with self.assertRaisesRegex(ContractError, "previous_response_id mode"):
+            Scenario.parse(
+                {
+                    **http,
+                    "history_source": {
+                        "seed_prompt": "x",
+                        "mode": "previous_response_id",
+                    },
+                }
+            )
+        with self.assertRaisesRegex(ContractError, "keys must be in"):
+            Scenario.parse({**http, "history_source": {"seed_prompt": "x", "bogus": 1}})
+        parsed = Scenario.parse(
+            {**http, "history_source": {"seed_prompt": "x", "thinking": True}}
+        )
+        self.assertTrue(parsed.history_source.thinking)
+
+    def test_route_history_capabilities_require_targets(self):
+        base = json.loads((ROOT / "manifests/routes.example.json").read_text())[
+            "routes"
+        ][0]
+        with self.assertRaisesRegex(ContractError, "history_route"):
+            Route.parse(
+                {**base, "capabilities": [*base["capabilities"], "cross_route_history"]}
+            )
+        with self.assertRaisesRegex(ContractError, "history_model"):
+            Route.parse(
+                {**base, "capabilities": [*base["capabilities"], "cross_model_history"]}
+            )
+        ok = Route.parse(
+            {
+                **base,
+                "capabilities": [*base["capabilities"], "cross_model_history"],
+                "history_model": "other-model",
+            }
+        )
+        self.assertEqual("other-model", ok.history_model)
+
+    def test_history_scenarios_cover_real_failure_shapes(self):
+        ids = {item.id for item in self.inventory().scenarios}
+        for expected in (
+            "history-tool-result-image",
+            "history-tool-result-error",
+            "history-parallel-tools",
+            "history-system-blocks-cache",
+            "history-user-image",
+            "history-long-conversation",
+            "thinking-stream",
+            "history-thinking-roundtrip",
+            "responses-function-history",
+            "responses-reasoning-roundtrip",
+            "responses-previous-response-id",
+        ):
+            self.assertIn(expected, ids)
 
     def test_redaction_covers_explicit_and_pattern_secrets(self):
         output = redact(
@@ -991,6 +1055,124 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(3, len(result.turns))
         self.assertEqual(3, result.evidence["concurrency"]["passed"])
         self.assertEqual([], result.evidence["concurrency"]["crosstalk"])
+
+    def test_history_source_replays_real_thinking_blocks(self):
+        """Phase one returns a thinking block with a signature; phase two must
+        carry it back verbatim and the answer must still stream cleanly."""
+        received: list[dict] = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("content-length", "0") or 0)
+                request = json.loads(self.rfile.read(length))
+                received.append(request)
+                if not request.get("stream"):
+                    body = json.dumps(
+                        {
+                            "content": [
+                                {
+                                    "type": "thinking",
+                                    "thinking": "hmm",
+                                    "signature": "sig-abc",
+                                },
+                                {"type": "text", "text": "Hello there."},
+                            ]
+                        }
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header("content-type", "application/json")
+                else:
+                    history = request["messages"]
+                    replayed = history[1]["content"]
+                    ok = (
+                        len(history) == 3
+                        and replayed[0]["type"] == "thinking"
+                        and replayed[0]["signature"] == "sig-abc"
+                        and request.get("thinking", {}).get("type") == "enabled"
+                    )
+                    body = messages_sse(
+                        "BEEFAPI_THINKING_ROUNDTRIP_OK" if ok else "BAD"
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header("content-type", "text/event-stream")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                return
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        os.environ["RAW_HTTP_TEST_TOKEN"] = "plain-test-token"
+        try:
+            base = self.http_cell(server.server_port)
+            scenario = replace(
+                base.scenario,
+                id="history-thinking-roundtrip",
+                history_source=HistorySource(seed_prompt="seed", thinking=True),
+                turns=(
+                    Turn(
+                        "Reply exactly BEEFAPI_THINKING_ROUNDTRIP_OK.",
+                        "BEEFAPI_THINKING_ROUNDTRIP_OK",
+                        (),
+                    ),
+                ),
+            )
+            result = run_cell(MatrixCell(base.client, base.route, base.model, scenario))
+            self.assertEqual("pass", result.status, result)
+            self.assertEqual(2, len(received))
+            source = result.evidence["history_source"]
+            self.assertEqual(["thinking", "text"], source["block_types"])
+            self.assertEqual(200, source["seed_status"])
+        finally:
+            os.environ.pop("RAW_HTTP_TEST_TOKEN", None)
+            server.shutdown()
+            server.server_close()
+
+    def test_capture_dir_writes_redacted_full_bodies(self):
+        upstream = sse_server(MESSAGES_SSE_CLEAN)
+        proxy = RecordingProxy(
+            f"http://127.0.0.1:{upstream.server_port}", capture_bodies=True
+        )
+        try:
+            big = "A" * 400
+            request = urllib.request.Request(
+                proxy.base_url + "/v1/messages",
+                data=json.dumps(
+                    {
+                        "model": "m",
+                        "stream": True,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image", "source": {"data": big}},
+                                    {"type": "text", "text": "sk-secret123456 hi"},
+                                ],
+                            }
+                        ],
+                    }
+                ).encode(),
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                response.read()
+            exchange = proxy.exchanges()[0]
+            self.assertIn("<base64 400 chars>", json.dumps(exchange.request_body))
+            self.assertIn("message_stop", exchange.response_body)
+            with tempfile.TemporaryDirectory() as tmp:
+                cell = CommandTests().cell("codex")
+                path = _write_capture(cell, proxy.exchanges(), Path(tmp), None)
+                text = path.read_text()
+                self.assertNotIn("sk-secret123456", text)
+                self.assertIn("<base64 400 chars>", text)
+                self.assertIn("message_stop", text)
+        finally:
+            proxy.stop()
+            upstream.shutdown()
+            upstream.server_close()
 
     def test_release_tier_fails_closed_without_server_evidence(self):
         server = sse_server(MESSAGES_SSE_CLEAN)

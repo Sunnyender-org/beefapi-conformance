@@ -101,6 +101,25 @@ def _tool_names(tools: object) -> list[str]:
     return names
 
 
+_BASE64_MIN = 256
+
+
+def compact_media(value: object) -> object:
+    """Replace long base64-looking strings with a size placeholder so captured
+    fixtures stay reviewable and never embed screenshots or documents."""
+    if isinstance(value, dict):
+        return {key: compact_media(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [compact_media(item) for item in value]
+    if (
+        isinstance(value, str)
+        and len(value) >= _BASE64_MIN
+        and re.fullmatch(r"[A-Za-z0-9+/=\s]+", value)
+    ):
+        return f"<base64 {len(value)} chars>"
+    return value
+
+
 def summarize_request(body: bytes) -> dict[str, object]:
     try:
         payload = json.loads(body)
@@ -133,6 +152,8 @@ class Exchange:
     max_gap_ms: int = 0
     response_bytes: int = 0
     error: str = ""
+    request_body: object | None = None
+    response_body: str | None = None
 
     @property
     def is_completion(self) -> bool:
@@ -195,9 +216,12 @@ class RecordingProxy:
     """Local reverse proxy that forwards to the real route and records wire
     behavior without altering payloads."""
 
-    def __init__(self, upstream: str, timeout_seconds: int = 600) -> None:
+    def __init__(
+        self, upstream: str, timeout_seconds: int = 600, capture_bodies: bool = False
+    ) -> None:
         self.upstream = upstream.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.capture_bodies = capture_bodies
         self._exchanges: list[Exchange] = []
         self._lock = threading.Lock()
         proxy = self
@@ -252,6 +276,11 @@ class RecordingProxy:
             request=summarize_request(body),
             sse=False,
         )
+        if self.capture_bodies and body:
+            try:
+                exchange.request_body = compact_media(json.loads(body))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                exchange.request_body = f"<non-json {len(body)} bytes>"
         headers = {
             key: value
             for key, value in handler.headers.items()
@@ -305,6 +334,8 @@ class RecordingProxy:
         if not exchange.sse:
             data = response.read()
             exchange.response_bytes = len(data)
+            if self.capture_bodies:
+                exchange.response_body = data.decode("utf-8", "replace")[:65536]
             handler.send_header("content-length", str(len(data)))
             handler.end_headers()
             try:
@@ -315,6 +346,7 @@ class RecordingProxy:
         handler.send_header("transfer-encoding", "chunked")
         handler.end_headers()
         capture = _SseCapture()
+        raw: list[bytes] = []
         last_read = time.monotonic()
         try:
             while True:
@@ -330,6 +362,8 @@ class RecordingProxy:
                     break
                 exchange.response_bytes += len(chunk)
                 capture.feed(chunk)
+                if self.capture_bodies and sum(map(len, raw)) < 262144:
+                    raw.append(chunk)
                 handler.wfile.write(f"{len(chunk):x}\r\n".encode())
                 handler.wfile.write(chunk)
                 handler.wfile.write(b"\r\n")
@@ -340,6 +374,8 @@ class RecordingProxy:
         exchange.event_names = capture.event_names
         exchange.saw_done = capture.saw_done
         exchange.terminated = termination(capture.event_names, capture.saw_done)
+        if self.capture_bodies:
+            exchange.response_body = b"".join(raw).decode("utf-8", "replace")
 
 
 def _is_web_search_tool(name: str) -> bool:

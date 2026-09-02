@@ -3,6 +3,14 @@ from __future__ import annotations
 from .manifest import Inventory
 from .model import TIERS, MatrixCell
 
+PER_MODEL_HTTP_SCENARIOS = {
+    "responses-stream",
+    "messages-stream",
+    "messages-tool-call",
+    "history-tool-result-image",
+    "responses-function-history",
+}
+
 
 def compile_matrix(
     inventory: Inventory,
@@ -86,8 +94,11 @@ def representative_matrix(cells: list[MatrixCell]) -> list[MatrixCell]:
     for cell in cells:
         scenario_id = cell.scenario.id
         if cell.client.adapter == "raw-http":
+            # Every route/model pair gets the cheap protocol probes so a model
+            # missing from a channel's ability table (404) or a per-model
+            # history-transform regression is caught, not just the test model.
             if (
-                scenario_id == "responses-stream"
+                scenario_id in PER_MODEL_HTTP_SCENARIOS
                 or cell.model.id == cell.route.test_model
             ):
                 selected[cell.id] = cell

@@ -11,12 +11,12 @@ import urllib.error
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .clients import ClientCommand, assistant_text, resolve_binary
-from .model import CellResult, MatrixCell, TurnResult
+from .model import CellResult, MatrixCell, Route, TurnResult
 from .redact import redact
 from .wire import (
     RecordingProxy,
@@ -72,6 +72,8 @@ def run_cell(
     cell: MatrixCell,
     allow_local_tools: bool = False,
     require_server_evidence: bool = False,
+    routes: dict[str, Route] | None = None,
+    capture_dir: Path | None = None,
 ) -> CellResult:
     started = time.monotonic()
     started_epoch = int(time.time())
@@ -89,6 +91,7 @@ def run_cell(
             base_token,
             evidence_fence,
             require_server_evidence,
+            routes,
         )
     binary = resolve_binary(cell.client)
     if not binary:
@@ -128,7 +131,11 @@ def run_cell(
 
     proxy: RecordingProxy | None = None
     if base_url and cell.client.adapter in PROXY_ADAPTERS:
-        proxy = RecordingProxy(base_url, timeout_seconds=cell.scenario.timeout_seconds)
+        proxy = RecordingProxy(
+            base_url,
+            timeout_seconds=cell.scenario.timeout_seconds,
+            capture_bodies=capture_dir is not None,
+        )
     try:
         # Clients can leave background children writing into their isolated
         # home (codex clones plugins there); never fail a cell on cleanup.
@@ -190,6 +197,10 @@ def run_cell(
                 if status == "pass" and verdict["status"] != "pass":
                     status = "fail"
                     detail = f"wire evidence failed: {verdict['detail']}"
+                if capture_dir is not None:
+                    evidence["wire"]["capture"] = str(
+                        _write_capture(cell, exchanges, capture_dir, token)
+                    )
             server_evidence = _server_evidence(
                 cell,
                 base_token,
@@ -218,6 +229,25 @@ def run_cell(
     finally:
         if proxy:
             proxy.stop()
+
+
+def _write_capture(
+    cell: MatrixCell, exchanges: list, capture_dir: Path, token: str | None
+) -> Path:
+    """Persist the full redacted wire exchanges of a native cell as JSONL so
+    real client request shapes can be promoted into replay fixtures."""
+    capture_dir.mkdir(parents=True, exist_ok=True)
+    path = capture_dir / (cell.id.replace("/", "__") + ".jsonl")
+    with path.open("w", encoding="utf-8") as handle:
+        for exchange in exchanges:
+            record = {
+                **exchange.summary(),
+                "request_body": exchange.request_body,
+                "response_body": exchange.response_body,
+            }
+            handle.write(redact(json.dumps(record, ensure_ascii=False), (token or "",)))
+            handle.write("\n")
+    return path
 
 
 def _run_client_worker(
@@ -323,13 +353,25 @@ class _HttpOutcome:
     stream_detail: str
 
 
-def _http_request(cell: MatrixCell, base_url: str, token: str | None, prompt: str):
-    model = cell.model.client_model(cell.client.id)
-    payload = _http_payload(cell, model, prompt)
+def _http_request(
+    cell: MatrixCell,
+    base_url: str,
+    token: str | None,
+    prompt: str,
+    payload: object | None = None,
+    *,
+    stream: bool | None = None,
+    protocol: str | None = None,
+    endpoint: str | None = None,
+) -> _HttpOutcome:
+    protocol = protocol or cell.scenario.protocol
+    stream = cell.scenario.stream if stream is None else stream
+    if payload is None:
+        payload = _http_payload(cell, cell.model.client_model(cell.client.id), prompt)
     request = urllib.request.Request(
-        base_url.rstrip("/") + cell.scenario.http_endpoint,
+        base_url.rstrip("/") + (endpoint or cell.scenario.http_endpoint or ""),
         data=json.dumps(payload).encode(),
-        headers=_http_headers(cell.scenario.protocol, token),
+        headers=_http_headers(protocol, token),
         method="POST",
     )
     started = time.monotonic()
@@ -350,9 +392,9 @@ def _http_request(cell: MatrixCell, base_url: str, token: str | None, prompt: st
         output = str(exc)
     duration_ms = int((time.monotonic() - started) * 1000)
     stream_detail = ""
-    if cell.scenario.stream:
+    if stream:
         events = parse_sse(output)
-        text = sse_text(cell.scenario.protocol, events)
+        text = sse_text(protocol, events)
         ended = termination(
             [name for name, _ in events],
             any(data == "[DONE]" for _, data in events),
@@ -360,10 +402,145 @@ def _http_request(cell: MatrixCell, base_url: str, token: str | None, prompt: st
         if ended != "clean":
             stream_detail = f"stream terminated {ended}"
     else:
-        text = _http_response_text(cell.scenario.protocol, output)
+        text = _http_response_text(protocol, output)
     return _HttpOutcome(
         status_code, request_id, output, text, duration_ms, stream_detail
     )
+
+
+def _route_endpoint(route: Route) -> tuple[str | None, str | None]:
+    """Resolve (base_url, token) for a route from its manifest/environment."""
+    base_url = (
+        os.environ.get(route.base_url_env or "")
+        if route.base_url_env
+        else route.base_url
+    )
+    token = os.environ.get(route.token_env or "") if route.token_env else None
+    return base_url, token
+
+
+def _seed_history(
+    cell: MatrixCell,
+    base_url: str,
+    token: str | None,
+    routes: dict[str, Route] | None,
+) -> tuple[object | None, dict[str, object], str]:
+    """Run phase one of a history scenario against the source route/model and
+    return the phase-two payload, evidence, and an error detail if it failed."""
+    source = cell.scenario.history_source
+    assert source is not None
+    protocol = cell.scenario.protocol
+    # Placeholders let a committed scenario stay route-agnostic; the local
+    # route manifest names the actual "other" route/model to switch from.
+    source_route = (source.route or "").replace(
+        "{{history_route}}", cell.route.history_route or ""
+    ) or None
+    source_model = (source.model or "").replace(
+        "{{history_model}}", cell.route.history_model or ""
+    ) or None
+    source = replace(source, route=source_route, model=source_model)
+    seed_base_url, seed_token = base_url, token
+    if source.route and source.route != cell.route.id:
+        seed_route = (routes or {}).get(source.route)
+        if seed_route is None:
+            return None, {}, f"history_source route {source.route!r} is not loaded"
+        seed_base_url, seed_token = _route_endpoint(seed_route)
+        if not seed_base_url or (
+            seed_route.auth_mode == "gateway_token" and not seed_token
+        ):
+            return None, {}, f"history_source route {source.route!r} lacks URL or token"
+        seed_token = _request_token(
+            MatrixCell(cell.client, seed_route, cell.model, cell.scenario), seed_token
+        )
+    seed_model = source.model or cell.model.client_model(cell.client.id)
+    target_model = cell.model.client_model(cell.client.id)
+    evidence: dict[str, object] = {
+        "route": source.route or cell.route.id,
+        "model": seed_model,
+        "mode": source.mode,
+    }
+
+    if protocol == "messages":
+        seed_payload: dict[str, object] = {
+            "model": seed_model,
+            "max_tokens": 2048,
+            "messages": [{"role": "user", "content": source.seed_prompt}],
+            "stream": False,
+        }
+        if source.thinking:
+            seed_payload["thinking"] = {"type": "enabled", "budget_tokens": 1024}
+        seed = _http_request(
+            cell, seed_base_url, seed_token, "", seed_payload, stream=False
+        )
+        evidence["seed_status"] = seed.status_code
+        try:
+            body = json.loads(seed.output)
+        except json.JSONDecodeError:
+            body = {}
+        content = body.get("content") if isinstance(body, dict) else None
+        if not (seed.status_code and 200 <= seed.status_code < 300 and content):
+            return None, evidence, f"history seed failed with HTTP {seed.status_code}"
+        evidence["block_types"] = [
+            item.get("type") for item in content if isinstance(item, dict)
+        ]
+        payload: dict[str, object] = {
+            "model": target_model,
+            "max_tokens": 2048,
+            "messages": [
+                {"role": "user", "content": source.seed_prompt},
+                {"role": "assistant", "content": content},
+                {"role": "user", "content": "{{prompt}}"},
+            ],
+        }
+        if source.thinking:
+            payload["thinking"] = {"type": "enabled", "budget_tokens": 1024}
+        return payload, evidence, ""
+
+    seed_payload = {
+        "model": seed_model,
+        "input": source.seed_prompt,
+        "stream": False,
+        "store": source.mode == "previous_response_id",
+    }
+    if source.thinking:
+        seed_payload["reasoning"] = {"effort": "low"}
+        seed_payload["include"] = ["reasoning.encrypted_content"]
+    seed = _http_request(
+        cell, seed_base_url, seed_token, "", seed_payload, stream=False
+    )
+    evidence["seed_status"] = seed.status_code
+    try:
+        body = json.loads(seed.output)
+    except json.JSONDecodeError:
+        body = {}
+    output_items = body.get("output") if isinstance(body, dict) else None
+    response_id = body.get("id") if isinstance(body, dict) else None
+    if not (seed.status_code and 200 <= seed.status_code < 300 and output_items):
+        return None, evidence, f"history seed failed with HTTP {seed.status_code}"
+    evidence["block_types"] = [
+        item.get("type") for item in output_items if isinstance(item, dict)
+    ]
+    evidence["response_id"] = response_id
+    if source.mode == "previous_response_id":
+        payload = {
+            "model": target_model,
+            "previous_response_id": response_id,
+            "input": "{{prompt}}",
+        }
+    else:
+        payload = {
+            "model": target_model,
+            "input": [
+                {"role": "user", "content": source.seed_prompt},
+                *output_items,
+                {"role": "user", "content": "{{prompt}}"},
+            ],
+            "store": False,
+        }
+    if source.thinking:
+        payload["reasoning"] = {"effort": "low"}
+        payload["include"] = ["reasoning.encrypted_content"]
+    return payload, evidence, ""
 
 
 def _grade_http(
@@ -404,6 +581,7 @@ def _run_http_cell(
     base_token: str | None,
     evidence_fence: set[str] | None,
     require_server_evidence: bool,
+    routes: dict[str, Route] | None = None,
 ) -> CellResult:
     base_url = (
         os.environ.get(cell.route.base_url_env or "")
@@ -437,7 +615,35 @@ def _run_http_cell(
     evidence: dict[str, object] = {"route_auth_mode": cell.route.auth_mode}
     detail = ""
 
-    if concurrency == 1:
+    if cell.scenario.history_source is not None:
+        template, seed_evidence, seed_detail = _seed_history(
+            cell, base_url, token, routes
+        )
+        evidence["history_source"] = seed_evidence
+        if template is None:
+            return _result(
+                cell,
+                "fail",
+                started_at,
+                started,
+                "python-urllib",
+                [],
+                seed_detail,
+                evidence,
+            )
+        prompt = _render(turn.prompt, nonces[0])
+        payload = _render_http_payload(
+            template, cell.model.client_model(cell.client.id), prompt
+        )
+        if isinstance(payload, dict):
+            payload["stream"] = cell.scenario.stream
+        outcome = _http_request(cell, base_url, token, prompt, payload)
+        results = [
+            _grade_http(cell, outcome, _render(turn.marker, nonces[0]), token, 1)
+        ]
+        outcomes = [outcome]
+        evidence["http_status"] = outcome.status_code
+    elif concurrency == 1:
         outcome = _http_request(cell, base_url, token, _render(turn.prompt, nonces[0]))
         results = [
             _grade_http(cell, outcome, _render(turn.marker, nonces[0]), token, 1)

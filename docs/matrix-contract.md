@@ -79,3 +79,10 @@ survive representative sampling for every compatible route/model pair.
 Expected rejection scenarios use a correlated error log (type 5, zero quota)
 instead of a final consumption receipt. A consumption record for the same
 rejected request is a failure. Missing rejection evidence stays a failure.
+
+A verified type64 tool roundtrip can include a handoff response explicitly marked
+`cursor_agent_v1_usage_pending=true`. That HTTP phase is not a finalized bill:
+the following, call-id-bound tool-result continuation funds/finalizes the Run.
+The structured tool contracts retain those handoff request IDs as wire evidence
+and require the final continuation's server receipt; ordinary responses and
+unverified/failed loops cannot use this exception.

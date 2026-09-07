@@ -117,3 +117,27 @@ evidence means the release handoff is unverified, even when all ordinary
 protocol cells passed. A legacy runtime without the drain capability must be
 reported as the one-time restart-recovery migration, never as an active-handoff
 pass.
+
+## Independent runtime release gates
+
+Gateway and runtime version evidence must be recorded separately. For the
+independent runtime lifecycle introduced in [BeefAPI PR185](https://github.com/Sunnyender-org/beefapi/pull/185), extend the operator-owned gates above:
+
+| Gate | Required observation |
+|---|---|
+| Gateway-only release | The public gateway build advances while compatible CPA and SDK container IDs, PIDs and start times remain unchanged; an existing session continues to a clean terminal. |
+| Changed runtime input or configuration | A changed runtime fingerprint, credential configuration or state mount rejects reuse and selects a free independent runtime slot. Never replace a slot referenced by another serving app. |
+| Third deployment | Runtime A is reused by the second gateway release; a third release with changed runtime inputs creates B without Compose replacing A. This must use real Compose project/service ownership, not container-name mocks alone. |
+| Finite Sand tool batch | With no release drain, a complete persisted batch releases its owner; another manager restores the same checkpoint, call IDs and billing Run. Duplicate continuation returns the saved answer without a new positive charge. |
+| Runtime rollback | Admission is restored before traffic returns to the retained runtime; SDK process identity remains unchanged when resume is supported. |
+| Bounded state storage | Repeated runtime updates use the two fixed state slots; reuse preserves the same volume binding. No state is deleted to obtain a pass. |
+
+White-box executable references also include
+`scripts/deploy/runtime_reuse_test.sh`,
+`scripts/deploy/runtime_reuse_docker_test.sh`,
+`scripts/runtime/identity.test.mjs`, and SDK `server.test.mjs`.
+Report exact tested commits and distinguish local fixtures, real Compose,
+real client execution, and production receipt evidence. This table specifies
+required evidence; it does not claim these checks run automatically in the
+black-box CLI. Active inference remains on its original process until a safe
+boundary; these gates do not claim live socket or GPU-state migration.

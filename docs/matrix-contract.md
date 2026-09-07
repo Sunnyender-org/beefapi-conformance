@@ -86,3 +86,34 @@ the following, call-id-bound tool-result continuation funds/finalizes the Run.
 The structured tool contracts retain those handoff request IDs as wire evidence
 and require the final continuation's server receipt; ordinary responses and
 unverified/failed loops cannot use this exception.
+
+## Cursor release handoff evidence
+
+A type64 release also requires deployment-lifecycle evidence. Ordinary
+`namespace` / `tool-loop` / `session-resume` passes do not certify a cutover.
+These are external release gates, not additional runnable scenario IDs or
+coverage automatically emitted by this CLI:
+
+| Gate | Required observation |
+|---|---|
+| Parked owner handoff | Return a tool call on runtime A; keep process A alive; drain A; submit the same call ID to runtime B sharing its state directory; preserve checkpoint and billing Run. |
+| Duplicate continuation | Replay the completed tool result; return the saved answer without another model execution or positive charge. |
+| Active inference | Drain during generation; allow the reply to reach its normal terminal or persisted tool boundary. |
+| Failed handoff | Keep the engine alive past the drain deadline; retain its lock and snapshot, refuse traffic cutover, restore normal parking on the still-serving instance. |
+| Concurrent continuation | Race drain with a tool result on the original runtime; complete exactly once without returning an internal ownership race to the user. |
+| Failed cutover / rollback | Restore the serving runtime's normal admission using authenticated undrain; preserve ongoing and recoverable sessions. |
+
+The executable white-box references live in BeefAPI, rather than being copied
+into this repository: `cpa_runtime_sidecar/internal/cursoragentv1/drain*_test.go`,
+`cpa_runtime_sidecar/internal/cparuntime/drain_test.go`, and
+`scripts/deploy/blue_green_deploy_test.sh` (introduced by
+[BeefAPI PR180](https://github.com/Sunnyender-org/beefapi/pull/180)). Run the Go
+cases with `-race`. Attach their results alongside the exact deployed commit,
+route-bound live tool continuation and final receipt read-back.
+
+The black-box CLI must never call privileged drain/undrain endpoints itself.
+A release operator owns that action and its evidence. Missing lifecycle
+evidence means the release handoff is unverified, even when all ordinary
+protocol cells passed. A legacy runtime without the drain capability must be
+reported as the one-time restart-recovery migration, never as an active-handoff
+pass.

@@ -195,3 +195,24 @@ class RejectionEvidenceTests(unittest.TestCase):
         self.assertEqual(
             _usage_log_payload(cell, dict(error, quota=1), "commit")["status"], "fail"
         )
+
+
+class DeferredHandoffTests(unittest.TestCase):
+    def test_only_explicit_pending_tool_output_is_deferred(self):
+        from beefapi_conformance.runner import _cursor_deferred_tool_handoff
+
+        raw = {
+            "type": "response.completed",
+            "response": {
+                "status": "completed",
+                "output": [{"type": "function_call"}],
+                "usage": {"cursor_agent_v1_usage_pending": True},
+            },
+        }
+        pending = outcome(
+            "event: response.completed\ndata: " + json.dumps(raw) + "\n\n"
+        )
+        self.assertTrue(_cursor_deferred_tool_handoff(pending))
+        raw["response"]["usage"]["cursor_agent_v1_usage_pending"] = False
+        final = outcome("event: response.completed\ndata: " + json.dumps(raw) + "\n\n")
+        self.assertFalse(_cursor_deferred_tool_handoff(final))

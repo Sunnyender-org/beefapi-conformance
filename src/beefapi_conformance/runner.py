@@ -748,7 +748,23 @@ def _run_http_cell(
     if detail:
         status = "fail"
 
-    request_ids = {item.request_id for item in outcomes if item.request_id}
+    deferred_ids = set()
+    if (
+        cell.route.channel_type == 64
+        and cell.scenario.responses_contract in {"namespace", "custom", "apply_patch"}
+        and status == "pass"
+    ):
+        deferred_ids = {
+            item.request_id
+            for item in outcomes[:-1]
+            if item.request_id and _cursor_deferred_tool_handoff(item)
+        }
+    evidence["deferred_tool_handoff_request_ids"] = sorted(deferred_ids)
+    request_ids = {
+        item.request_id
+        for item in outcomes
+        if item.request_id and item.request_id not in deferred_ids
+    }
     server_evidence = _server_evidence(
         cell, base_token, started_epoch, evidence_fence, request_ids or None
     )
@@ -763,6 +779,21 @@ def _run_http_cell(
     return _result(
         cell, status, started_at, started, "python-urllib", results, detail, evidence
     )
+
+
+def _cursor_deferred_tool_handoff(outcome: _HttpOutcome) -> bool:
+    from .responses_contract import response
+
+    try:
+        result = response(outcome)
+        return result.get("usage", {}).get(
+            "cursor_agent_v1_usage_pending"
+        ) is True and any(
+            item.get("type") in {"function_call", "custom_tool_call"}
+            for item in result.get("output", [])
+        )
+    except (ValueError, KeyError, TypeError):
+        return False
 
 
 def _http_payload(cell: MatrixCell, model: str, prompt: str) -> object:

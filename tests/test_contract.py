@@ -154,6 +154,7 @@ class ContractTests(unittest.TestCase):
                 "concurrent-users",
                 "concurrent-tool-loop",
                 "session-resume",
+                "codex-auto-compact-tools",
             },
             {item.scenario.id for item in cells},
         )

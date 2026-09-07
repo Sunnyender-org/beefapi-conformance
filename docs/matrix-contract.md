@@ -66,3 +66,16 @@ decoration.
 
 HTTP success, a local unit test, push, deployment, or one clean text turn
 cannot substitute for this set.
+
+## Codex required contracts
+
+`scenarios/codex-contract.json` and `codex-auto-compact-tools` are the Codex
+compatibility gates described in [Codex acceptance](codex-acceptance.md).
+Raw `responses_contract` cases validate structured output and actual follow-up
+requests; marker substrings alone cannot pass them. Required Codex contracts
+survive representative sampling for every compatible route/model pair.
+`compare` treats lost coverage and pass-to-skip transitions as regressions.
+
+Expected rejection scenarios use a correlated error log (type 5, zero quota)
+instead of a final consumption receipt. A consumption record for the same
+rejected request is a failure. Missing rejection evidence stays a failure.

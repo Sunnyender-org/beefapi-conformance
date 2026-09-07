@@ -637,7 +637,33 @@ def _run_http_cell(
     evidence: dict[str, object] = {"route_auth_mode": cell.route.auth_mode}
     detail = ""
 
-    if cell.scenario.history_source is not None:
+    if cell.scenario.responses_contract:
+        from .responses_contract import exercise
+
+        outcomes, problems = exercise(
+            cell.scenario.responses_contract,
+            cell.model.client_model(cell.client.id),
+            lambda payload, endpoint, stream: _http_request(
+                cell, base_url, token, "", payload, endpoint=endpoint, stream=stream
+            ),
+        )
+        results = [
+            TurnResult(
+                1,
+                "fail" if problems else "pass",
+                sum(o.duration_ms for o in outcomes),
+                None,
+                "",
+                problems,
+                "",
+            )
+        ]
+        evidence["responses_contract"] = {
+            "name": cell.scenario.responses_contract,
+            "requests": len(outcomes),
+            "problems": problems,
+        }
+    elif cell.scenario.history_source is not None:
         template, seed_evidence, seed_detail = _seed_history(
             cell, base_url, token, routes
         )
@@ -925,6 +951,16 @@ def _beefapi_token_log_evidence(
     for attempt in range(8):
         try:
             logs, commit = _fetch_token_logs(cell.route.base_url, token)
+            if cell.scenario.responses_contract == "foreign-compaction" and any(
+                str(log.get("request_id", "")) in (expected_request_ids or set())
+                and int(log.get("type", 0) or 0) == 2
+                for log in logs
+                if isinstance(log, dict)
+            ):
+                return {
+                    "status": "fail",
+                    "detail": "rejected context also produced a consumption record",
+                }
             matches = _matching_usage_logs(
                 cell,
                 logs,
@@ -977,7 +1013,10 @@ def _matching_usage_logs(
             continue
         if expected_request_ids and request_id not in expected_request_ids:
             continue
-        if int(log.get("type", 0) or 0) != 2:
+        expected_type = (
+            5 if cell.scenario.responses_contract == "foreign-compaction" else 2
+        )
+        if int(log.get("type", 0) or 0) != expected_type:
             continue
         if str(log.get("model_name", "")) not in model_names:
             continue
@@ -1037,6 +1076,26 @@ def _usage_log_payload(
         other = {}
     if not isinstance(other, dict):
         other = {}
+    if cell.scenario.responses_contract == "foreign-compaction":
+        valid = bool(
+            commit
+            and log.get("request_id")
+            and int(log.get("type", 0) or 0) == 5
+            and int(log.get("quota", 0) or 0) == 0
+        )
+        return {
+            "status": "pass" if valid else "fail",
+            "commit": commit,
+            "route": {
+                "id": cell.route.id,
+                "channel_id": log.get("channel"),
+                "group": log.get("group"),
+            },
+            "terminal": {"status": "rejected", "request_id": log.get("request_id")},
+            "receipt": {"state": "rejected", "quota": log.get("quota")},
+            "usage": {"quota": log.get("quota"), "web_search_call_count": 0},
+            "detail": "" if valid else "expected a correlated unbilled rejection log",
+        }
     receipt_id = other.get("usage_receipt_id")
     receipt_state = other.get("usage_receipt_state")
     if cell.route.channel_type == 64:

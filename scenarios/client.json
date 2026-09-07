@@ -6,11 +6,17 @@
       "tier": "pr",
       "kind": "client",
       "protocol": null,
-      "required_capabilities": ["text"],
+      "required_capabilities": [
+        "text"
+      ],
       "timeout_seconds": 120,
       "requires_local_tools": false,
       "turns": [
-        {"prompt": "Reply exactly BEEFAPI_CONFORMANCE_TEXT_OK.", "marker": "BEEFAPI_CONFORMANCE_TEXT_OK", "expected_events": []}
+        {
+          "prompt": "Reply exactly BEEFAPI_CONFORMANCE_TEXT_OK.",
+          "marker": "BEEFAPI_CONFORMANCE_TEXT_OK",
+          "expected_events": []
+        }
       ]
     },
     {
@@ -19,7 +25,10 @@
       "tier": "merge",
       "kind": "client",
       "protocol": null,
-      "required_capabilities": ["text", "stream"],
+      "required_capabilities": [
+        "text",
+        "stream"
+      ],
       "timeout_seconds": 420,
       "requires_local_tools": false,
       "turns": [
@@ -36,15 +45,21 @@
       "tier": "merge",
       "kind": "client",
       "protocol": null,
-      "required_capabilities": ["tool.shell"],
+      "required_capabilities": [
+        "tool.shell"
+      ],
       "timeout_seconds": 420,
       "requires_local_tools": true,
-      "expect_wire": ["multi_request"],
+      "expect_wire": [
+        "multi_request"
+      ],
       "turns": [
         {
           "prompt": "Complete these steps in order using your tools, one step at a time: 1) read {{workspace}}/marker.txt, 2) create {{workspace}}/loop.txt containing the marker you read followed by the suffix _LOOPED, 3) read {{workspace}}/loop.txt back to verify it. Then reply exactly BEEFAPI_TOOL_LOOP_OK.",
           "marker": "BEEFAPI_TOOL_LOOP_OK",
-          "expected_events": ["BEEFAPI_CONFORMANCE_FILE_OK"]
+          "expected_events": [
+            "BEEFAPI_CONFORMANCE_FILE_OK"
+          ]
         }
       ]
     },
@@ -54,16 +69,28 @@
       "tier": "merge",
       "kind": "client",
       "protocol": null,
-      "required_capabilities": ["tool.web"],
+      "required_capabilities": [
+        "tool.web"
+      ],
       "timeout_seconds": 300,
       "requires_local_tools": false,
-      "expect_wire": ["web_search_requested"],
+      "expect_wire": [
+        "web_search_requested"
+      ],
       "turns": [
         {
           "prompt": "You must run your web search tool before answering, even if you already know the answer. Search the web for the title of the page at example.com, then reply with the title and end with BEEFAPI_CONFORMANCE_WEB_OK.",
           "marker": "BEEFAPI_CONFORMANCE_WEB_OK",
           "expected_events": [],
-          "expected_any_events": [["\"name\":\"WebSearch\"", "\"name\":\"web_search\"", "\"type\":\"web_search\"", "web_search_call", "server_tool_use"]]
+          "expected_any_events": [
+            [
+              "\"name\":\"WebSearch\"",
+              "\"name\":\"web_search\"",
+              "\"type\":\"web_search\"",
+              "web_search_call",
+              "server_tool_use"
+            ]
+          ]
         }
       ]
     },
@@ -74,11 +101,18 @@
       "kind": "client",
       "protocol": null,
       "concurrency": 3,
-      "required_capabilities": ["text", "stream"],
+      "required_capabilities": [
+        "text",
+        "stream"
+      ],
       "timeout_seconds": 240,
       "requires_local_tools": false,
       "turns": [
-        {"prompt": "Reply exactly {{nonce}} and nothing else.", "marker": "{{nonce}}", "expected_events": []}
+        {
+          "prompt": "Reply exactly {{nonce}} and nothing else.",
+          "marker": "{{nonce}}",
+          "expected_events": []
+        }
       ]
     },
     {
@@ -88,15 +122,22 @@
       "kind": "client",
       "protocol": null,
       "concurrency": 2,
-      "required_capabilities": ["tool.shell", "stream"],
+      "required_capabilities": [
+        "tool.shell",
+        "stream"
+      ],
       "timeout_seconds": 480,
       "requires_local_tools": true,
-      "expect_wire": ["multi_request"],
+      "expect_wire": [
+        "multi_request"
+      ],
       "turns": [
         {
           "prompt": "Complete these steps in order using your tools, one step at a time: 1) read {{workspace}}/marker.txt, 2) create {{workspace}}/loop.txt containing the marker you read followed by the suffix _{{nonce}}, 3) read {{workspace}}/loop.txt back to verify it. Then reply exactly {{nonce}}.",
           "marker": "{{nonce}}",
-          "expected_events": ["BEEFAPI_CONFORMANCE_FILE_OK"]
+          "expected_events": [
+            "BEEFAPI_CONFORMANCE_FILE_OK"
+          ]
         }
       ]
     },
@@ -106,12 +147,55 @@
       "tier": "nightly",
       "kind": "client",
       "protocol": null,
-      "required_capabilities": ["session.resume"],
+      "required_capabilities": [
+        "session.resume"
+      ],
       "timeout_seconds": 180,
       "requires_local_tools": false,
       "turns": [
-        {"prompt": "Remember nonce BLUE-CATTLE-742 and reply exactly BEEFAPI_CONFORMANCE_RESUME_1_OK.", "marker": "BEEFAPI_CONFORMANCE_RESUME_1_OK", "expected_events": []},
-        {"prompt": "Reply with the nonce from the previous turn followed by BEEFAPI_CONFORMANCE_RESUME_2_OK.", "marker": "BEEFAPI_CONFORMANCE_RESUME_2_OK", "expected_events": ["BLUE-CATTLE-742"]}
+        {
+          "prompt": "Remember nonce BLUE-CATTLE-742 and reply exactly BEEFAPI_CONFORMANCE_RESUME_1_OK.",
+          "marker": "BEEFAPI_CONFORMANCE_RESUME_1_OK",
+          "expected_events": []
+        },
+        {
+          "prompt": "Reply with the nonce from the previous turn followed by BEEFAPI_CONFORMANCE_RESUME_2_OK.",
+          "marker": "BEEFAPI_CONFORMANCE_RESUME_2_OK",
+          "expected_events": [
+            "BLUE-CATTLE-742"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "codex-auto-compact-tools",
+      "name": "Codex real CLI: tool work, automatic compaction, resume",
+      "tier": "nightly",
+      "kind": "client",
+      "required_capabilities": [
+        "responses",
+        "stream",
+        "tool.shell",
+        "session.resume"
+      ],
+      "timeout_seconds": 300,
+      "requires_local_tools": true,
+      "codex_auto_compact_limit": 20000,
+      "expect_wire": [
+        "multi_request",
+        "compaction_roundtrip"
+      ],
+      "turns": [
+        {
+          "prompt": "In the isolated workspace create a file marker.txt containing {{nonce}}. Generate a 120000-character varied text fixture and read it in twelve separate 10000-character chunks using your command tool, retaining the results in this conversation. Then read marker.txt and report its exact content. Do not substitute a description of commands for actually running them.",
+          "marker": "{{nonce}}",
+          "expected_events": []
+        },
+        {
+          "prompt": "Read marker.txt using a tool and report its exact content again.",
+          "marker": "{{nonce}}",
+          "expected_events": []
+        }
       ]
     }
   ]

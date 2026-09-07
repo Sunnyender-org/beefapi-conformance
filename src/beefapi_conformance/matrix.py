@@ -47,6 +47,11 @@ def compile_matrix(
                         continue
                     if scenario.kind == "http" and client.adapter != "raw-http":
                         continue
+                    if (
+                        scenario.codex_auto_compact_limit is not None
+                        and client.adapter != "codex"
+                    ):
+                        continue
                     if scenario.kind == "client" and client.adapter == "raw-http":
                         continue
                     if scenario.protocol and scenario.protocol not in route.protocols:
@@ -98,12 +103,16 @@ def representative_matrix(cells: list[MatrixCell]) -> list[MatrixCell]:
             # missing from a channel's ability table (404) or a per-model
             # history-transform regression is caught, not just the test model.
             if (
-                scenario_id in PER_MODEL_HTTP_SCENARIOS
+                cell.scenario.responses_contract is not None
+                or scenario_id in PER_MODEL_HTTP_SCENARIOS
                 or cell.model.id == cell.route.test_model
             ):
                 selected[cell.id] = cell
             continue
         if not client_ids:
+            continue
+        if scenario_id.startswith("codex-") and cell.client.adapter == "codex":
+            selected[cell.id] = cell
             continue
         if scenario_id == "text-turn":
             assigned_client = client_ids[model_index[cell.model.id] % len(client_ids)]

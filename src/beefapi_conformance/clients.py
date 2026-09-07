@@ -130,11 +130,15 @@ class ClientCommand:
                 f"model = {json.dumps(model)}",
                 "disable_response_storage = true",
             ]
+            if self.cell.scenario.codex_auto_compact_limit is not None:
+                lines += [
+                    f"model_auto_compact_token_limit = {self.cell.scenario.codex_auto_compact_limit}"
+                ]
             if "tool.web" in self.cell.scenario.required_capabilities:
                 lines += ["[tools]", "web_search = true"]
             lines += [
                 "[model_providers.beefapi_conformance]",
-                'name = "BeefAPI conformance"',
+                'name = "OpenAI"',
                 f"base_url = {json.dumps(self.base_url + '/v1')}",
                 'wire_api = "responses"',
                 'env_key = "BEEFAPI_CONFORMANCE_TOKEN"',

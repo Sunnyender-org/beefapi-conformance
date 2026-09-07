@@ -1,0 +1,139 @@
+{
+  "scenarios": [
+    {
+      "id": "codex-namespace",
+      "name": "Codex Responses contract: namespace",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "responses",
+      "http_endpoint": "/v1/responses",
+      "stream": true,
+      "required_capabilities": [
+        "responses",
+        "stream",
+        "tool.custom"
+      ],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "responses_contract": "namespace",
+      "turns": [
+        {
+          "prompt": "Run the structured contract",
+          "marker": "CONTRACT_OK"
+        }
+      ]
+    },
+    {
+      "id": "codex-custom",
+      "name": "Codex Responses contract: custom",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "responses",
+      "http_endpoint": "/v1/responses",
+      "stream": true,
+      "required_capabilities": [
+        "responses",
+        "stream",
+        "tool.custom"
+      ],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "responses_contract": "custom",
+      "turns": [
+        {
+          "prompt": "Run the structured contract",
+          "marker": "CONTRACT_OK"
+        }
+      ]
+    },
+    {
+      "id": "codex-apply_patch",
+      "name": "Codex Responses contract: apply_patch",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "responses",
+      "http_endpoint": "/v1/responses",
+      "stream": true,
+      "required_capabilities": [
+        "responses",
+        "stream",
+        "tool.custom"
+      ],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "responses_contract": "apply_patch",
+      "turns": [
+        {
+          "prompt": "Run the structured contract",
+          "marker": "CONTRACT_OK"
+        }
+      ]
+    },
+    {
+      "id": "codex-compact-json",
+      "name": "Codex Responses contract: compact-json",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "responses",
+      "http_endpoint": "/v1/responses",
+      "stream": true,
+      "required_capabilities": [
+        "responses",
+        "stream"
+      ],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "responses_contract": "compact-json",
+      "turns": [
+        {
+          "prompt": "Run the structured contract",
+          "marker": "CONTRACT_OK"
+        }
+      ]
+    },
+    {
+      "id": "codex-compact-stream",
+      "name": "Codex Responses contract: compact-stream",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "responses",
+      "http_endpoint": "/v1/responses",
+      "stream": true,
+      "required_capabilities": [
+        "responses",
+        "stream"
+      ],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "responses_contract": "compact-stream",
+      "turns": [
+        {
+          "prompt": "Run the structured contract",
+          "marker": "CONTRACT_OK"
+        }
+      ]
+    },
+    {
+      "id": "codex-foreign-compaction",
+      "name": "Codex Responses contract: foreign-compaction",
+      "tier": "merge",
+      "kind": "http",
+      "protocol": "responses",
+      "http_endpoint": "/v1/responses",
+      "stream": true,
+      "required_capabilities": [
+        "responses",
+        "stream"
+      ],
+      "timeout_seconds": 180,
+      "requires_local_tools": false,
+      "responses_contract": "foreign-compaction",
+      "turns": [
+        {
+          "prompt": "Run the structured contract",
+          "marker": "CONTRACT_OK"
+        }
+      ]
+    }
+  ]
+}

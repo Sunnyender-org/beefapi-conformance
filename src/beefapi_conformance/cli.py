@@ -12,7 +12,7 @@ from .inventory import sync_live_inventory
 from .manifest import load_inventory
 from .matrix import compile_matrix
 from .model import ContractError
-from .report import build_report, write_report
+from .report import build_report, compare_reports, write_report
 from .runner import run_cell
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +46,14 @@ def _matrix(args: argparse.Namespace):
         set(args.scenario or []) or None,
         args.coverage,
     )
+
+
+def command_compare(args: argparse.Namespace) -> int:
+    baseline = json.loads(Path(args.baseline).read_text())
+    current = json.loads(Path(args.current).read_text())
+    comparison = compare_reports(baseline, current)
+    print(json.dumps(comparison, indent=2))
+    return 1 if comparison["regressions"] or not comparison["comparable_cells"] else 0
 
 
 def command_validate(args: argparse.Namespace) -> int:
@@ -250,6 +258,10 @@ def parser() -> argparse.ArgumentParser:
     common.add_argument("--routes", default=str(ROOT / "manifests/routes.example.json"))
     common.add_argument("--models", default=str(ROOT / "manifests/models.example.json"))
     sub = result.add_subparsers(dest="command", required=True)
+    compare = sub.add_parser("compare")
+    compare.add_argument("baseline")
+    compare.add_argument("current")
+    compare.set_defaults(func=command_compare)
     validate = sub.add_parser("validate", parents=[common])
     validate.set_defaults(func=command_validate)
     doctor = sub.add_parser("doctor", parents=[common])

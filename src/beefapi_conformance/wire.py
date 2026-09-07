@@ -129,6 +129,12 @@ def summarize_request(body: bytes) -> dict[str, object]:
         return {}
     turns = payload.get("messages", payload.get("input"))
     return {
+        "compaction_trigger": isinstance(turns, list)
+        and any(
+            isinstance(i, dict) and i.get("type") == "compaction_trigger" for i in turns
+        ),
+        "compaction_state": isinstance(turns, list)
+        and any(isinstance(i, dict) and i.get("type") == "compaction" for i in turns),
         "model": payload.get("model"),
         "stream": bool(payload.get("stream")),
         "tool_names": _tool_names(payload.get("tools")),
@@ -452,6 +458,22 @@ def wire_verdict(
         if isinstance(name, str)
     ):
         problems.append("no completion request declared a web search tool")
+    if "compaction_roundtrip" in expectations:
+        trigger = next(
+            (
+                i
+                for i, e in enumerate(exchanges)
+                if e.request.get("compaction_trigger")
+                or e.path.split("?", 1)[0].endswith("/responses/compact")
+            ),
+            None,
+        )
+        if trigger is None or not any(
+            e.request.get("compaction_state") for e in exchanges[trigger + 1 :]
+        ):
+            problems.append(
+                "no observed compaction followed by opaque-state continuation"
+            )
     return {
         "status": "fail" if problems else "pass",
         "detail": "; ".join(problems),

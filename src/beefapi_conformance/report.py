@@ -62,3 +62,31 @@ def write_report(report: dict[str, object], output_dir: Path) -> None:
     ElementTree.ElementTree(suite).write(
         output_dir / "junit.xml", encoding="utf-8", xml_declaration=True
     )
+
+
+def compare_reports(baseline: dict, current: dict) -> dict:
+    """A disappeared/skipped previously passing cell is a coverage regression."""
+    before = {r["cell_id"]: r for r in baseline.get("results", [])}
+    after = {r["cell_id"]: r for r in current.get("results", [])}
+    regressions, improvements, changed_versions = [], [], []
+    for cell_id, old in before.items():
+        new = after.get(cell_id)
+        if old.get("status") == "pass" and (new is None or new.get("status") != "pass"):
+            regressions.append(
+                {
+                    "cell_id": cell_id,
+                    "before": "pass",
+                    "after": new.get("status") if new else "missing",
+                }
+            )
+        if new and old.get("status") != "pass" and new.get("status") == "pass":
+            improvements.append(cell_id)
+        if new and old.get("client_version") != new.get("client_version"):
+            changed_versions.append(cell_id)
+    return {
+        "regressions": regressions,
+        "improvements": improvements,
+        "added": sorted(set(after) - set(before)),
+        "client_version_changed": changed_versions,
+        "comparable_cells": len(set(before) & set(after)),
+    }

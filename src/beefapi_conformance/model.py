@@ -245,7 +245,7 @@ class Turn:
         )
 
 
-WIRE_EXPECTATIONS = {"multi_request", "web_search_requested"}
+WIRE_EXPECTATIONS = {"multi_request", "web_search_requested", "compaction_roundtrip"}
 HISTORY_SOURCE_KEYS = {"route", "model", "seed_prompt", "thinking", "mode"}
 HISTORY_MODES = {"replay", "previous_response_id"}
 
@@ -308,6 +308,8 @@ class Scenario:
     max_slowdown: float | None = None
     history_source: HistorySource | None = None
     max_turn_ms: int | None = None
+    responses_contract: str | None = None
+    codex_auto_compact_limit: int | None = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Scenario:
@@ -373,6 +375,32 @@ class Scenario:
             history_source = HistorySource.parse(
                 raw["history_source"], raw.get("protocol")
             )
+        compact_limit = raw.get("codex_auto_compact_limit")
+        if compact_limit is not None and (
+            kind != "client"
+            or not isinstance(compact_limit, int)
+            or compact_limit < 1000
+        ):
+            raise ContractError(
+                "codex_auto_compact_limit requires a client scenario and >=1000 tokens"
+            )
+        contract = raw.get("responses_contract")
+        if contract is not None and (
+            contract
+            not in {
+                "namespace",
+                "custom",
+                "apply_patch",
+                "compact-json",
+                "compact-stream",
+                "foreign-compaction",
+            }
+            or kind != "http"
+            or raw.get("protocol") != "responses"
+            or concurrency != 1
+            or history_source is not None
+        ):
+            raise ContractError("invalid responses_contract or incompatible scenario")
         max_turn_ms = raw.get("max_turn_ms")
         if max_turn_ms is not None and int(max_turn_ms) <= 0:
             raise ContractError("scenario.max_turn_ms must be positive")
@@ -398,6 +426,8 @@ class Scenario:
             max_slowdown=max_slowdown,
             history_source=history_source,
             max_turn_ms=int(max_turn_ms) if max_turn_ms is not None else None,
+            responses_contract=contract,
+            codex_auto_compact_limit=compact_limit,
         )
 
 

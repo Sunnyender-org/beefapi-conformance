@@ -97,15 +97,7 @@ def exercise(contract, model, send):
                         errors.append(e.get("response", {}).get("error", {}))
                 except ValueError:
                     pass
-            if not any(
-                e.get("code")
-                in {
-                    "invalid_compaction",
-                    "invalid_request_error",
-                    "context_length_exceeded",
-                }
-                for e in errors
-            ):
+            if not any(e.get("code") == "invalid_compaction" for e in errors):
                 raise ValueError(
                     "foreign opaque state was not explicitly rejected with a protocol error"
                 )

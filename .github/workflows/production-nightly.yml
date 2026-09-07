@@ -74,8 +74,8 @@ jobs:
         env:
           BEEFAPI_CONFORMANCE_TOKEN: ${{ secrets.BEEFAPI_CONFORMANCE_TOKEN }}
         run: |
-          max_cells=150
-          if [[ "$COVERAGE" == "full" ]]; then max_cells=500; fi
+          max_cells=600
+          if [[ "$COVERAGE" == "full" ]]; then max_cells=1500; fi
           python -m beefapi_conformance run \
             --routes .tmp/live-inventory/routes.live.json \
             --models .tmp/live-inventory/models.live.json \

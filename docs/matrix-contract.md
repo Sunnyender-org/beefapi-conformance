@@ -45,6 +45,11 @@ A cell passes only when all of the following hold:
    protocol's terminal event (no early EOF, no error event, no 4xx/5xx);
 3. scenario wire expectations hold (`multi_request` for tool loops,
    `web_search_requested` for web search);
+   `shell_poll` additionally requires an observed native `write_stdin` call.
+   A zero-output empty completion or a client tool-argument parse failure is
+   not a successful wire exchange. The offline Codex image-skill scenario also
+   checks exact PNG bytes, one generation invocation, and a final reply after
+   the last command; commentary and command success alone cannot pass it.
 3a. for `concurrency > 1`, every simulated user passed, no response carried
    another user's nonce, and p95 latency stayed within `max_slowdown` of the
    serial baseline;

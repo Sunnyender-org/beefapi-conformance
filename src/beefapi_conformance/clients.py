@@ -337,6 +337,33 @@ def assistant_text(adapter: str, output: str) -> str:
     return "\n".join(values)
 
 
+def codex_final_text(output: str) -> str:
+    """A tool log or commentary before the last command is not a final reply."""
+    answer = ""
+    completed = False
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        item = event.get("item") or {}
+        if not isinstance(item, dict):
+            item = {}
+        if event.get("type") in {"item.started", "item.completed"} and item.get(
+            "type"
+        ) in {"command_execution", "mcp_tool_call"}:
+            answer = ""
+        elif (
+            event.get("type") == "item.completed"
+            and item.get("type") == "agent_message"
+        ):
+            answer = item.get("text", "")
+        completed = event.get("type") == "turn.completed"
+    return answer if completed else ""
+
+
 def _assistant_values(value: object, values: list[str], trusted: bool = False) -> None:
     if isinstance(value, str):
         if trusted:

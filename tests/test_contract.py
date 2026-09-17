@@ -155,6 +155,7 @@ class ContractTests(unittest.TestCase):
                 "concurrent-tool-loop",
                 "session-resume",
                 "codex-auto-compact-tools",
+                "codex-image-skill-continuation",
             },
             {item.scenario.id for item in cells},
         )

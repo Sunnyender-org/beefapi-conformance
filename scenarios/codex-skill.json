@@ -1,0 +1,20 @@
+{
+  "scenarios": [
+    {
+      "id": "codex-image-skill-continuation",
+      "name": "Codex skill: background generation, same-session polling, artifact and final reply",
+      "tier": "merge",
+      "kind": "client",
+      "required_capabilities": ["tool.shell", "stream"],
+      "timeout_seconds": 240,
+      "requires_local_tools": true,
+      "codex_skill_fixture": "delayed-image",
+      "expect_wire": ["multi_request", "shell_poll"],
+      "turns": [{
+        "prompt": "Use the conformance-image skill to generate its local test image. Read its SKILL.md first, execute its generator once, poll the same session until it completes, and verify result.png. This is an offline fixture: do not call external image APIs. End your final reply with BEEFAPI_IMAGE_SKILL_OK only after verification.",
+        "marker": "BEEFAPI_IMAGE_SKILL_OK",
+        "expected_events": ["Wrote result.png"]
+      }]
+    }
+  ]
+}

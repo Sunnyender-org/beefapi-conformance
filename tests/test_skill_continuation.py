@@ -22,6 +22,22 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class SkillContinuationTests(unittest.TestCase):
+    def test_unsupported_tool_call_fails_even_after_clean_terminal(self):
+        for kind, expected in [("function_call_output", "fail"), ("message", "pass")]:
+            with self.subTest(kind=kind):
+                body = json.dumps(
+                    {"input": [{"type": kind, "output": "unsupported call: read"}]}
+                ).encode()
+                exchange = Exchange(
+                    "POST",
+                    "/v1/responses",
+                    200,
+                    summarize_request(body),
+                    True,
+                    terminated="clean",
+                )
+                self.assertEqual(wire_verdict([exchange])["status"], expected)
+
     def test_empty_completed_is_not_wire_success(self):
         capture = _SseCapture()
         raw = b'data: {"type":"response.completed","response":{"output":[],"usage":{"output_tokens":0}}}\n\n'

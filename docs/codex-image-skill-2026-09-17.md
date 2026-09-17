@@ -34,3 +34,22 @@ The companion BeefAPI branch is `codex/fix-image2-codex-continuation`; its repor
 request IDs and remaining upstream limitations. Neither branch was deployed
 as part of this local validation. Do not promote either model from a generic
 HTTP 200 or an image file alone.
+
+
+## Chat diagnostic follow-up
+
+A separate local experiment explicitly disabled Codex native web search and
+used the existing BeefAPI Responses-to-Chat converter. It is narrower than the
+default-client matrix and must not be promoted as a default capability pass.
+The model emitted undeclared read/shell/exec calls and invented skill paths;
+the offline diagnostic was interrupted after 53 seconds and recorded failure.
+The independent actual Image2 trial reached generation but launched a duplicate
+generate command instead of polling the original process. These are separate
+failures from empty Responses completion. Wire grading now rejects observed
+client `unsupported call:` tool outputs even if later inference recovers.
+Validation: 62 unit tests and targeted ruff checks pass. No production changes.
+
+The later actual Image2 run finished naturally in 213 seconds with a valid PNG
+and a final reply, but launched two generate commands (one success, one timeout).
+Therefore Chat is end-to-end reachable but still fails exactly-once acceptance.
+The default native-search matrix was not rerun or relabeled as passing.

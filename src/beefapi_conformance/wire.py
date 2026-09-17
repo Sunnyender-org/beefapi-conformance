@@ -147,6 +147,13 @@ def summarize_request(body: bytes) -> dict[str, object]:
             and item.get("type") == "function_call_output"
             and "failed to parse function arguments" in str(item.get("output", ""))
         ),
+        "tool_dispatch_errors": sum(
+            1
+            for item in (turns if isinstance(turns, list) else [])
+            if isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and str(item.get("output", "")).startswith("unsupported call:")
+        ),
     }
 
 
@@ -493,6 +500,8 @@ def wire_verdict(
             problems.append(f"{label} completed without output")
         if item.request.get("tool_argument_errors"):
             problems.append(f"{label} contains a client tool argument parse failure")
+        if item.request.get("tool_dispatch_errors"):
+            problems.append(f"{label} contains a client unsupported tool call")
         if item.status is not None and item.status >= 400:
             problems.append(f"{label} returned HTTP {item.status}")
         elif item.terminated == "early":

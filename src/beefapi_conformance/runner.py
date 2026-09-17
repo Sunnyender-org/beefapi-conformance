@@ -15,9 +15,10 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .clients import ClientCommand, assistant_text, resolve_binary
+from .clients import ClientCommand, assistant_text, codex_final_text, resolve_binary
 from .model import CellResult, MatrixCell, Route, TurnResult
 from .redact import redact
+from .skill_fixture import image_skill_problems, install_image_skill
 from .wire import (
     RecordingProxy,
     crosstalk,
@@ -265,6 +266,8 @@ def _run_client_worker(
     (workspace / "marker.txt").write_bytes(MARKER_BYTES)
     command = ClientCommand(cell, binary, root, token, base_url)
     command.prepare()
+    if cell.scenario.codex_skill_fixture:
+        install_image_skill(root / "client-home")
     env = command.environment()
     for index, turn in enumerate(cell.scenario.turns, 1):
         turn_started = time.monotonic()
@@ -294,6 +297,9 @@ def _run_client_worker(
                 if not any(event in output for event in group)
             )
             answer = assistant_text(cell.client.adapter, output)
+            if cell.scenario.codex_skill_fixture:
+                missing.extend(image_skill_problems(workspace))
+                answer = codex_final_text(output)
             worker.answers.append(answer)
             status = (
                 "pass"

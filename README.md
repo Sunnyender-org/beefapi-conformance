@@ -28,6 +28,7 @@ Scenarios are organized around the ways routes fail in real use:
 | `messages/responses/chat-stream` | pr | SSE transform broken per protocol |
 | `long-stream` | merge | mid-stream disconnects and truncation on long answers |
 | `tool-loop` | merge | multi-step tool loops: history replay, tool_result serialization |
+| `codex-image-skill-continuation` | merge | isolated skill loading, background shell polling, exactly one generated fixture, nonempty final reply |
 | `web-search` | merge | web search tool not offered to or not usable by the client |
 | `messages-tool-call` | merge | streamed tool_use blocks and argument deltas |
 | `messages-web-search-tool` | merge | gateway rejects or swallows the server web_search tool |
@@ -77,6 +78,15 @@ does not stream to a clean terminal, or if p95 latency under load exceeds
 
 Native clients keep their default tool surface — the suite must observe the
 request shape a real user session produces, not a stripped-down variant.
+
+The Codex image-skill scenario installs an offline fixture skill in the isolated
+`CODEX_HOME`. It waits 12 seconds before writing a known PNG. Passing requires a
+native `write_stdin` call, the exact artifact bytes, one generator invocation,
+and a final reply after the last command. It exercises the lifecycle that broke
+with Image2; it does not certify a real image provider, image permissions, or
+paid billing. Run real Image2 generation separately with an approved image key.
+Empty `response.completed` events and client tool-argument parse errors fail
+wire grading even if the client later recovers or prints an earlier marker.
 
 ## Quick start
 

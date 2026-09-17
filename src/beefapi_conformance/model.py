@@ -245,7 +245,12 @@ class Turn:
         )
 
 
-WIRE_EXPECTATIONS = {"multi_request", "web_search_requested", "compaction_roundtrip"}
+WIRE_EXPECTATIONS = {
+    "multi_request",
+    "web_search_requested",
+    "compaction_roundtrip",
+    "shell_poll",
+}
 HISTORY_SOURCE_KEYS = {"route", "model", "seed_prompt", "thinking", "mode"}
 HISTORY_MODES = {"replay", "previous_response_id"}
 
@@ -310,6 +315,7 @@ class Scenario:
     max_turn_ms: int | None = None
     responses_contract: str | None = None
     codex_auto_compact_limit: int | None = None
+    codex_skill_fixture: str | None = None
 
     @classmethod
     def parse(cls, raw: dict[str, Any]) -> Scenario:
@@ -375,6 +381,15 @@ class Scenario:
             history_source = HistorySource.parse(
                 raw["history_source"], raw.get("protocol")
             )
+        skill_fixture = raw.get("codex_skill_fixture")
+        if skill_fixture is not None and (
+            skill_fixture != "delayed-image"
+            or kind != "client"
+            or not raw.get("requires_local_tools")
+        ):
+            raise ContractError(
+                "codex_skill_fixture requires delayed-image and local client tools"
+            )
         compact_limit = raw.get("codex_auto_compact_limit")
         if compact_limit is not None and (
             kind != "client"
@@ -428,6 +443,7 @@ class Scenario:
             max_turn_ms=int(max_turn_ms) if max_turn_ms is not None else None,
             responses_contract=contract,
             codex_auto_compact_limit=compact_limit,
+            codex_skill_fixture=skill_fixture,
         )
 
 

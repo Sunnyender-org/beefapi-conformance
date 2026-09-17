@@ -140,6 +140,13 @@ def summarize_request(body: bytes) -> dict[str, object]:
         "tool_names": _tool_names(payload.get("tools")),
         "message_count": len(turns) if isinstance(turns, list) else None,
         "has_system": bool(payload.get("system") or payload.get("instructions")),
+        "tool_argument_errors": sum(
+            1
+            for item in (turns if isinstance(turns, list) else [])
+            if isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and "failed to parse function arguments" in str(item.get("output", ""))
+        ),
     }
 
 
@@ -160,6 +167,8 @@ class Exchange:
     error: str = ""
     request_body: object | None = None
     response_body: str | None = None
+    empty_completed: bool = False
+    called_tools: list[str] = field(default_factory=list)
 
     @property
     def is_completion(self) -> bool:
@@ -183,6 +192,8 @@ class Exchange:
             "max_gap_ms": self.max_gap_ms,
             "response_bytes": self.response_bytes,
             "error": self.error,
+            "empty_completed": self.empty_completed,
+            "called_tools": self.called_tools,
         }
 
 
@@ -193,6 +204,9 @@ class _SseCapture:
         self.event_names: list[str] = []
         self.saw_done = False
         self._buffer = b""
+        self.seen_output = False
+        self.empty_completed = False
+        self.called_tools: list[str] = []
 
     def feed(self, chunk: bytes) -> None:
         self._buffer += chunk
@@ -209,11 +223,46 @@ class _SseCapture:
 
     def _block(self, block: bytes) -> None:
         name = ""
+        data = []
         for line in block.splitlines():
             if line.startswith(b"event:"):
                 name = line[len(b"event:") :].strip().decode("utf-8", "replace")
             elif line.startswith(b"data:") and b"[DONE]" in line:
                 self.saw_done = True
+            elif line.startswith(b"data:"):
+                data.append(line[5:].strip())
+        try:
+            payload = json.loads(b"\n".join(data))
+        except (ValueError, UnicodeDecodeError):
+            payload = {}
+        if isinstance(payload, dict):
+            payload_type = payload.get("type")
+            name = name or (payload_type if isinstance(payload_type, str) else "")
+            if payload.get("item") or (
+                name == "response.output_text.delta" and payload.get("delta")
+            ):
+                self.seen_output = True
+            if name == "response.output_item.done":
+                item = payload.get("item") or {}
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "function_call"
+                    and isinstance(item.get("name"), str)
+                    and len(self.called_tools) < MAX_RECORDED_EVENTS
+                ):
+                    self.called_tools.append(item["name"])
+            if name == "response.completed":
+                response = payload.get("response") or {}
+                if not isinstance(response, dict):
+                    response = {}
+                usage = response.get("usage") or {}
+                if (
+                    not self.seen_output
+                    and not response.get("output")
+                    and isinstance(usage, dict)
+                    and usage.get("output_tokens") == 0
+                ):
+                    self.empty_completed = True
         if name and len(self.event_names) < MAX_RECORDED_EVENTS:
             self.event_names.append(name)
 
@@ -379,6 +428,8 @@ class RecordingProxy:
             exchange.error = str(exc)
         exchange.event_names = capture.event_names
         exchange.saw_done = capture.saw_done
+        exchange.empty_completed = capture.empty_completed
+        exchange.called_tools = capture.called_tools
         exchange.terminated = termination(capture.event_names, capture.saw_done)
         if self.capture_bodies:
             exchange.response_body = b"".join(raw).decode("utf-8", "replace")
@@ -438,6 +489,10 @@ def wire_verdict(
     completions = [item for item in exchanges if item.is_completion]
     for item in completions:
         label = f"{item.method} {item.path}"
+        if item.empty_completed:
+            problems.append(f"{label} completed without output")
+        if item.request.get("tool_argument_errors"):
+            problems.append(f"{label} contains a client tool argument parse failure")
         if item.status is not None and item.status >= 400:
             problems.append(f"{label} returned HTTP {item.status}")
         elif item.terminated == "early":
@@ -447,6 +502,12 @@ def wire_verdict(
         elif item.terminated == "proxy_error":
             problems.append(f"{label} upstream connection failed: {item.error}")
     minimum = 2 * max(1, concurrency)
+    if "shell_poll" in expectations and not any(
+        name in {"write_stdin", "functions.write_stdin"}
+        for item in completions
+        for name in item.called_tools
+    ):
+        problems.append("no native shell session polling was observed")
     if "multi_request" in expectations and len(completions) < minimum:
         problems.append(
             f"expected a native tool loop with >={minimum} completion requests, saw {len(completions)}"

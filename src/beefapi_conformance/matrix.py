@@ -54,6 +54,8 @@ def compile_matrix(
                         continue
                     if scenario.kind == "client" and client.adapter == "raw-http":
                         continue
+                    if scenario.codex_skill_fixture and client.adapter != "codex":
+                        continue
                     if scenario.protocol and scenario.protocol not in route.protocols:
                         continue
                     if not scenario.required_capabilities.issubset(capabilities):

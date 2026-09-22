@@ -100,7 +100,9 @@ caller-tool run must keep both proto names on `x-cursor-agent-allowed-tools`
 `RequestContext.mcp_meta_tool_options` (field 34) enabled, with the caller
 tools on server `beefapi`. `ToolCall` field 44 is the server-executed discovery
 call and must be ignored. Interaction notices 18, 19, 20, 21, 22, 23, 24, and
-26 must not abort the turn. Unknown exec, interaction field 42, and other
+26 must not abort the turn. A length-delimited interaction update newer than
+this desktop pin is the same kind of notice; field 27 showed up on a live
+grok-4.7 tool run. Unknown exec, interaction field 42, and other
 unmodelled tool variants stay fail-closed.
 
 The executable contract is `contracts/cursor-agent-mcp-meta.json`, graded by

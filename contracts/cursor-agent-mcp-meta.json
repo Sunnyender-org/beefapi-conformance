@@ -10,6 +10,7 @@
   "mcp_meta_descriptors_field": 2,
   "ignored_tool_call_fields": [44, 54, 57, 59, 60],
   "advisory_interaction_fields": [18, 19, 20, 21, 22, 23, 24, 26],
+  "ignore_unknown_length_delimited_interaction_updates_except": [42],
   "fail_closed": {
     "unknown_tool_call_field": 88,
     "unknown_interaction_field": 42,

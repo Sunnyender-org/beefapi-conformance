@@ -46,7 +46,9 @@ class CursorAgentProtocolContractTest(unittest.TestCase):
                 "request_context_fields": [4, 7, 16, 34],
                 "mcp_meta_enabled": True,
                 "ignored_tool_call_fields": self.contract["ignored_tool_call_fields"],
-                "advisory_interaction_fields": self.contract["advisory_interaction_fields"],
+                "advisory_interaction_fields": self.contract[
+                    "advisory_interaction_fields"
+                ],
                 "caller_tool_server": "beefapi",
             },
         )
@@ -54,7 +56,9 @@ class CursorAgentProtocolContractTest(unittest.TestCase):
 
     def test_field_42_stays_fail_closed(self) -> None:
         contract = dict(self.contract)
-        contract["advisory_interaction_fields"] = list(contract["advisory_interaction_fields"]) + [42]
+        contract["advisory_interaction_fields"] = list(
+            contract["advisory_interaction_fields"]
+        ) + [42]
         problems = grade_caller_tool_wire(
             contract,
             {
@@ -66,7 +70,13 @@ class CursorAgentProtocolContractTest(unittest.TestCase):
         )
         self.assertTrue(any("field 42" in problem for problem in problems))
 
-    def test_unmodelled_inventory_does_not_include_the_required_discovery_tool(self) -> None:
-        unmodelled = set(self.contract["not_required_for_a_caller_tool_run"]["tool_call_variants_still_fail_closed"])
+    def test_unmodelled_inventory_does_not_include_the_required_discovery_tool(
+        self,
+    ) -> None:
+        unmodelled = set(
+            self.contract["not_required_for_a_caller_tool_run"][
+                "tool_call_variants_still_fail_closed"
+            ]
+        )
         self.assertNotIn(44, unmodelled)
         self.assertIn(41, unmodelled)

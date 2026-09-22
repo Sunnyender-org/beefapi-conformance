@@ -3,7 +3,10 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from beefapi_conformance.cursor_agent_protocol import grade_caller_tool_wire, load_contract
+from beefapi_conformance.cursor_agent_protocol import (
+    grade_caller_tool_wire,
+    load_contract,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 

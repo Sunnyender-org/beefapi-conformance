@@ -19,7 +19,7 @@ def contract_path(root: Path) -> Path:
 def load_contract(root: Path) -> dict[str, Any]:
     data = json.loads(contract_path(root).read_text())
     if not isinstance(data, dict):
-        raise ValueError("cursor agent protocol contract must be an object")
+        raise TypeError("cursor agent protocol contract must be an object")
     return data
 
 

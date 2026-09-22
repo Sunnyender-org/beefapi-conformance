@@ -13,6 +13,7 @@ credentials, deploy code, or certify a route from HTTP success alone.
 - `manifests/routes*.json`: route capabilities and authentication mode.
 - `manifests/models*.json`: model availability and capability declarations.
 - `scenarios/*.json`: reusable behavioral cases and expected evidence.
+- `contracts/cursor-agent-mcp-meta.json`: Cursor Agent caller-tool wire that the black-box tool loop does not observe.
 - `docs/matrix-contract.md`: classification and tier policy.
 - current client binaries and live server evidence outrank committed examples.
 

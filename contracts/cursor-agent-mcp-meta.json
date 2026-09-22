@@ -1,0 +1,25 @@
+{
+  "observed_against": "Cursor.app agent host descriptors, 2026-09-22",
+  "caller_tool_server": "beefapi",
+  "caller_tool_allowlist": ["mcp_tool_call", "get_mcp_tools_tool_call"],
+  "hosted_search_tool": "web_search_tool_call",
+  "hosted_fetch_tool": "web_fetch_tool_call",
+  "request_context_mcp_tools_field": 7,
+  "request_context_mcp_meta_tool_options_field": 34,
+  "mcp_meta_enabled_field": 1,
+  "mcp_meta_descriptors_field": 2,
+  "ignored_tool_call_fields": [44, 54, 57, 59, 60],
+  "advisory_interaction_fields": [18, 19, 20, 21, 22, 23, 24, 26],
+  "fail_closed": {
+    "unknown_tool_call_field": 88,
+    "unknown_interaction_field": 42,
+    "unknown_exec_field": 99
+  },
+  "not_required_for_a_caller_tool_run": {
+    "reason": "These current Cursor fields are absent from the pinned Agent v1 proto. They are IDE, cloud-agent, or subagent context. A gateway caller-tool run does not send them, and an unknown exec or unmodelled tool variant still fails closed.",
+    "agent_run_request": [10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33],
+    "request_context_besides_mcp_meta": [20, 25, 26, 27, 28, 29, 30, 31, 32, 33, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53],
+    "tool_call_variants_still_fail_closed": [38, 39, 40, 41, 42, 43, 45, 46, 48, 49, 50, 51, 52, 53, 55, 56, 58, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80],
+    "exec_server_still_fail_closed": [56, 57]
+  }
+}
